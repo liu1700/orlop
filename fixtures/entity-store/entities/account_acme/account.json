@@ -1,0 +1,9 @@
+{
+  "entity_type": "account",
+  "entity_id": "account_acme",
+  "name": "Acme Corp",
+  "plan": "Enterprise",
+  "renewal_date": "2026-06-30",
+  "billing_owner": "user_123",
+  "open_ticket": "ticket_999"
+}

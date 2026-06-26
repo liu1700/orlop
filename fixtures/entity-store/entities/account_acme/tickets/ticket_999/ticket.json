@@ -1,0 +1,9 @@
+{
+  "entity_type": "ticket",
+  "entity_id": "ticket_999",
+  "account_id": "account_acme",
+  "title": "Billing renewal discrepancy",
+  "status": "open",
+  "priority": "high",
+  "summary": "Acme reported that the renewal quote does not match the expected billing terms."
+}

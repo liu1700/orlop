@@ -1,0 +1,10 @@
+mountpoint: /tmp/orlop
+audit_log: ./audit.log
+cache:
+  max_entries: 128
+  ttl_seconds: 300
+policy:
+  readonly: true
+  deny:
+    - "**/internal/**"
+    - "**/.env*"

@@ -1,0 +1,19 @@
+name: shellcheck
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y shellcheck
+      - run: |
+          # -S warning: don't fail CI on style/info nits (e.g. SC2012
+          # "use find instead of ls" on shell scripts where the glob already
+          # rules out the cases find would help with). Anything warning+ still
+          # fails — that's where real bugs live.
+          git ls-files '*.sh' | xargs shellcheck -S warning

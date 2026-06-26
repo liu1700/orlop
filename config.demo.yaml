@@ -1,0 +1,19 @@
+mountpoint: /tmp/orlop-demo/mnt
+audit_log: /tmp/orlop-demo/audit.log
+cache:
+  max_entries: 128
+  ttl_seconds: 300
+store:
+  type: local
+  root: ./fixtures/entity-store
+routes:
+  type: sqlite
+  path: /tmp/orlop-demo/orlop.db
+tenant:
+  id: tenant-demo
+policy:
+  readonly: true
+  deny:
+    - "**/secrets"
+    - "**/secrets/**"
+    - "**/.env*"

@@ -1,0 +1,9 @@
+{
+  "entity_type": "user",
+  "entity_id": "user_123",
+  "name": "Alice Chen",
+  "role": "Finance operations lead",
+  "account_id": "account_acme",
+  "status": "active",
+  "summary": "Alice owns billing approvals and renewal coordination for Acme."
+}

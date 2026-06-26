@@ -1,0 +1,87 @@
+# Security
+
+This subsystem gives untrusted AI agents a durable, per-agent POSIX disk. Its
+whole reason to exist is the **isolation boundary**: an agent runs arbitrary
+code, yet must only ever reach its own data and never the credentials of the
+storage underneath. This document is the operator-facing summary of that model,
+what you must configure, what is hardened, and what is not. The deep design is
+in [`docs/design-auth.md`](docs/design-auth.md) and
+[`docs/design-data-plane.md`](docs/design-data-plane.md).
+
+## Model in one paragraph
+
+Each agent receives a short-lived mTLS client certificate whose SPIFFE SAN
+encodes its tenant and agent id. The data-plane server is the trust boundary: it
+binds every connection to that certificate, confines all operations to the
+agent's own path prefix (canonicalized, traversal-proof), and never reads a
+tenant or path from the request body. Storage credentials (object store, Redis,
+JuiceFS) live behind the data plane and are never handed to the agent.
+
+## What is guaranteed
+
+- **Tenant isolation.** Agent A cannot read, write, stat, list, rename, or
+  symlink-escape into agent B's data. Path traversal is blocked by a
+  canonicalization gate; the tenant is taken from the verified certificate, not
+  the request; a leaf is rejected if its SAN tenant does not match the tenant of
+  the intermediate that signed it.
+- **Credential confinement.** The agent only ever holds its own short-lived,
+  path-scoped client certificate. It never holds an intermediate key or the
+  storage backend credentials.
+
+## What the operator must do
+
+These are not optional for a production deployment:
+
+- **Encrypt the CA at rest.** With `ORLOP_SECRETS_BACKEND=postgres`, set
+  `ORLOP_SECRETS_ENC_KEY` (a hex-encoded 32-byte AES key). The control plane
+  refuses to boot otherwise (or set `ORLOP_SECRETS_ALLOW_PLAINTEXT=1` to
+  consciously accept plaintext, which is not recommended).
+- **Enforce a per-tenant disk quota.** Run with `quota.enforce: true` and an
+  ext4 project quota or a JuiceFS directory quota. With enforcement off there is
+  **no** per-tenant disk cap and one agent can fill the host disk for all
+  tenants; the server logs a loud warning at boot in that state.
+- **Protect the service token.** `ORLOP_CONTROL_PLANE_TOKEN` gates provisioning,
+  server-cert signing, and enroll-token minting. Treat it as a high-value
+  secret.
+- **Front the control plane with a trusted proxy.** Rate limiters key on the
+  client IP via `X-Forwarded-For`; only expose the control plane behind a proxy
+  that sets that header. Never expose its port directly.
+- **Configure a real mailer.** Set `RESEND_API_KEY`; otherwise OTP delivery is
+  skipped and codes are only logged when `ORLOP_DEV_LOG_OTP=1` (dev only).
+- **Consider an API-token TTL.** Set `ORLOP_API_TOKEN_TTL` (e.g. `2160h`) so
+  `orlop_` tokens expire; the default is no expiry.
+
+## Hardening in place
+
+The data plane bounds untrusted input and load: msgpack decoding is guarded
+against pre-allocation bombs, each request handler is panic-isolated (one bad
+request can't crash the server), and concurrent connections, in-flight requests,
+and per-chunk size are all capped. Email OTPs lock out after a small budget of
+wrong guesses; API tokens can expire; cert issuance derives every SAN
+server-side and pins client/server usage.
+
+## Known limitations
+
+Honest gaps a deployment should account for:
+
+- **Rate limiters are per-process and in-memory.** They reset on restart and are
+  not shared across replicas. Running more than one control-plane replica, or a
+  crash loop, weakens every rate-limit-dependent control (OTP, device-code,
+  enroll). Use a shared store (Redis is already in the stack) for multi-replica.
+- **Disk accounting when quota enforcement is off.** There is no in-process
+  per-tenant byte accountant; the per-tenant cap depends entirely on the
+  filesystem/JuiceFS quota (see "what the operator must do").
+- **Intermediate-key blast radius.** Tenant intermediates have no X.509
+  NameConstraints; the cross-check above mitigates a leaked intermediate key at
+  the data plane, but the control plane must still guard intermediate keys
+  carefully.
+- **Device user_code entropy.** The device-flow user code is short; approval
+  requires an authenticated admin session, but widening it is a tracked
+  hardening item.
+
+## Reporting a vulnerability
+
+Please report security issues privately by opening a private security advisory
+on the repository rather than a public issue. Include a description, affected
+component (control plane / data plane / mount client), and a reproduction if you
+have one. Do not include live secrets in the report.

@@ -1,0 +1,17 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "internal/db/migrations"
+    queries: "internal/db/queries"
+    gen:
+      go:
+        package: "sqlcdb"
+        out: "internal/db/sqlcdb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+        rename:
+          sessions_anonymou: "AnonymousSession"

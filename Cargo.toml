@@ -1,0 +1,56 @@
+[workspace]
+members = ["bench"]
+resolver = "2"
+
+[package]
+name = "orlop"
+version = "1.0.0-rc.17"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "orlop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+globset = "0.4"
+libc = "0.2"
+lru = "0.12"
+moka = { version = "0.12", features = ["sync"] }
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rmp-serde = "1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "sync", "time", "macros", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+rusqlite = { version = "0.31", features = ["bundled"] }
+time = "0.3"
+x509-parser = "0.16"
+tempfile = "3"
+serde_bytes = "0.11.19"
+fastcdc = "3"
+uuid = "1"
+nfsserve = "0.11"
+async-trait = "0.1"
+daemonize = "0.5"
+os_pipe = "1.2"
+
+# fuser is gated to Linux so darwin can cross-compile from Linux runners via
+# cargo-zigbuild — its build.rs calls pkg-config for libfuse3 / macFUSE which
+# isn't available outside a true macOS host with macFUSE installed. macOS
+# uses the in-process NFSv3 path in src/nfs.rs and never needs fuser at all.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.14", features = ["abi-7-31"] }
+
+[dev-dependencies]
+hex = "0.4"
+rand = "0.8"

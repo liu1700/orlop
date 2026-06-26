@@ -1,0 +1,45 @@
+name: orlop-cli
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/orlop-cli.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - "config.example.yaml"
+      - "config.local.yaml"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/orlop-cli.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fuse3 dev headers
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --locked
+
+      - run: cargo test --locked
+
+# Note: macOS CI lives in release.yml (runs on tag push only) — it installs
+# macFUSE via brew so the `fuser` crate's pkg-config probe succeeds. Adding
+# a macos-latest job here burned ~12 billing-minutes per push (10x macOS
+# multiplier × ~70s failed compile) without producing signal: the job
+# failed 100% of runs because macFUSE wasn't installed.

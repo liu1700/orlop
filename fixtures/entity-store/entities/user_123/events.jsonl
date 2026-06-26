@@ -1,0 +1,3 @@
+{"ts":"2026-04-20T09:15:00Z","event":"login","detail":"Alice reviewed the Acme renewal dashboard."}
+{"ts":"2026-04-21T14:30:00Z","event":"comment","detail":"Asked support to connect ticket_999 to the billing renewal."}
+{"ts":"2026-04-22T16:45:00Z","event":"approval","detail":"Approved draft invoice for the Acme renewal."}
