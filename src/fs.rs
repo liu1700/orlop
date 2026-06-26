@@ -2246,6 +2246,10 @@ mod fh_tests {
             kind: FileType::RegularFile,
             size: 0,
             mode: 0,
+            uid: 0,
+            gid: 0,
+            atime_ns: 0,
+            rdev: 0,
         };
         state.by_path.insert("/a/b.txt".to_string(), ino);
         state.by_ino.insert(ino, node);
@@ -2269,6 +2273,10 @@ mod fh_tests {
             kind: FileType::RegularFile,
             size: 0,
             mode: 0,
+            uid: 0,
+            gid: 0,
+            atime_ns: 0,
+            rdev: 0,
         };
         state.by_path.insert("/probe.txt".to_string(), ino);
         state.by_ino.insert(ino, node);
@@ -2302,6 +2310,10 @@ mod fh_tests {
             kind: FileType::RegularFile,
             size: 0,
             mode: 0,
+            uid: 0,
+            gid: 0,
+            atime_ns: 0,
+            rdev: 0,
         };
         state.by_path.insert("/a/b.txt".to_string(), ino);
         state.by_ino.insert(ino, node);
