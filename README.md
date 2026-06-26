@@ -47,6 +47,25 @@ exfiltrate to reach the store directly.
 | `cmd/orlop-server`  | Go | data plane: chunk store, manifests, journal/pub-sub, GC, lease sweep, mTLS |
 | `src/` (`orlop` binary)   | Rust | FUSE/NFS mount client (`orlop mount`, lease refresh, `orlop doctor`) |
 
+### Why Go *and* Rust
+
+Each layer uses the language that's strongest for its job, and a clean network
+boundary (mTLS + QUIC + msgpack — no cgo, no FFI) makes that split essentially
+free:
+
+- **Rust for the mount client** because it runs *inside the untrusted agent
+  sandbox*, on the hot path of every filesystem syscall. No GC pauses to stall
+  I/O, a small static binary, low memory footprint, and a mature FUSE/NFS/QUIC
+  ecosystem (`fuser`, `nfsserve`, `quinn`).
+- **Go for the control and data planes** because they're network services where
+  Go's ecosystem and velocity shine (HTTP router, Postgres, migrations, metrics)
+  — and the public [client SDK](client) is Go too, which is what host
+  integrators orchestrating sandboxes actually want.
+
+The two halves are separate binaries that only share a wire protocol, so they
+build and ship independently. **Contributing to one side almost never requires
+the other's toolchain** — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 ## Quickstart
 
 A complete single-node stack (Postgres + control + server + one mounted disk)
