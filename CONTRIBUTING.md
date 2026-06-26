@@ -25,7 +25,23 @@ its job, and the clean network boundary keeps that essentially free.)
 
 ## Setup
 
-Install only what you need from the table above.
+The fastest path is the **dev container**: open the repo in VS Code (or any
+devcontainer-aware editor) and "Reopen in Container". It provisions both
+toolchains, the Linux FUSE headers, and pre-fetched deps from
+[`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json) — nothing
+to install on your host.
+
+Otherwise, install only the toolchain(s) you need from the table above and let
+the Makefile do the rest. It checks each toolchain is present, installs the
+Linux FUSE headers, and pre-fetches dependencies:
+
+```bash
+make setup        # both sides
+make setup-go     # Go side only
+make setup-rust   # Rust side only (installs libfuse3-dev on Linux)
+```
+
+The exact build/test commands per side are below.
 
 ### Go side (`cmd/`, `client/`)
 

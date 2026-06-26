@@ -1,4 +1,36 @@
-.PHONY: control-dev bench bench-clean
+.PHONY: setup setup-go setup-rust control-dev bench bench-clean
+
+# One-shot dev environment setup. Installs OS deps and pre-fetches each side's
+# dependencies. Most contributors only touch one side — run `make setup-go` or
+# `make setup-rust` for just that half (see CONTRIBUTING.md). `make setup` does
+# both.
+setup: setup-go setup-rust
+	@echo "✓ setup complete — see CONTRIBUTING.md for build/test commands"
+
+setup-go:
+	@command -v go >/dev/null 2>&1 || { \
+		echo "✗ Go not found. Install the version in go.mod (https://go.dev/dl/)"; exit 1; }
+	@echo "→ Go $$(go version | awk '{print $$3}') detected; fetching modules"
+	@GOWORK=off go mod download
+	@echo "✓ Go side ready: GOWORK=off go build ./... && go test ./..."
+
+setup-rust:
+	@command -v cargo >/dev/null 2>&1 || { \
+		echo "✗ Rust not found. Install via https://rustup.rs"; exit 1; }
+	@echo "→ $$(cargo --version) detected"
+	@if [ "$$(uname -s)" = "Linux" ]; then \
+		if ! pkg-config --exists fuse3 2>/dev/null; then \
+			echo "→ installing libfuse3-dev + pkg-config (Linux mount client links libfuse3)"; \
+			if command -v apt-get >/dev/null 2>&1; then \
+				sudo apt-get update || echo "  (apt-get update had errors — continuing; unrelated repos may be broken)"; \
+				sudo apt-get install -y libfuse3-dev pkg-config; \
+			else \
+				echo "✗ install libfuse3 dev headers + pkg-config with your package manager, then re-run"; exit 1; \
+			fi; \
+		else echo "→ libfuse3 already present"; fi; \
+	else echo "→ non-Linux host: mount client uses the in-process NFS path, no FUSE headers needed"; fi
+	@cargo fetch --locked
+	@echo "✓ Rust side ready: cargo build --locked && cargo test --locked"
 
 control-dev:
 	@set -a; \
