@@ -16,6 +16,31 @@ connection to that agent's own path prefix. A compromised agent cannot read
 another tenant's bytes, cannot widen its own path, and has no key it could
 exfiltrate to reach the store directly.
 
+## Why this matters for agent memory
+
+An agent's working state — scratch files, tool outputs, datasets, and the raw
+transcripts a memory layer later indexes — needs a home that is durable, cheap
+to update, and safe under multi-tenancy. Orlop is the storage plane for exactly
+that:
+
+- **Survives the sandbox.** Memory lives in the remote chunk store, so it
+  outlives the process and the next run re-mounts the same disk with zero idle
+  compute.
+- **Keeps the raw trace cheaply.** Bytes are stored verbatim and deduped by
+  content hash, so keeping the full, uncompressed history to filter at read time
+  is nearly free — no forced lossy summarization to save space.
+- **Updates incrementally.** A single-byte edit ships one ~4 MiB chunk, not the
+  whole file; a persistent client cache makes re-reads run at local-disk speed.
+- **Overwrites in place.** Versioned, compare-and-swap manifests let a memory
+  layer atomically replace a stale fact instead of appending and hoping
+  retrieval picks the latest.
+- **Isolates every tenant.** Per-agent mTLS identity means one agent's memory
+  can't be read, widened into, or exfiltrated by another.
+
+Orlop is the substrate, not the memory system — it does no extraction, ranking,
+or semantic consolidation; the layer above does. See
+[`docs/agent-memory.md`](docs/agent-memory.md).
+
 ## How it works
 
 ```
@@ -88,6 +113,7 @@ A `client.Fake` in-memory implementation is provided for consumer tests.
 - [`docs/control-plane.md`](docs/control-plane.md) — control-plane API
 - [`docs/control-plane-runbook.md`](docs/control-plane-runbook.md) — operator workflows (CA, admin seeding)
 - [`docs/design.md`](docs/design.md) — system overview and filesystem layout
+- [`docs/agent-memory.md`](docs/agent-memory.md) — what orlop gives an agent-memory stack, and where it stops
 - [`docs/design-data-plane.md`](docs/design-data-plane.md) — chunk store / journal design
 - [`docs/design-auth.md`](docs/design-auth.md) — certificate / tenant isolation model
 - [`docs/audit-events.md`](docs/audit-events.md) — audit event schema
