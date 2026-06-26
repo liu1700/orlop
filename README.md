@@ -65,6 +65,23 @@ cargo build --release       # Rust mount client (the `orlop` binary)
 The Go side is a single module; the Rust side is a Cargo workspace
 (`orlop` + `orlop-bench`).
 
+## Go client SDK
+
+[`github.com/liu1700/orlop/client`](client) is a small, standard-library-only
+Go SDK for the control-plane API: allocate an agent's disk, set quotas, mint the
+short-lived per-agent enroll token, and read usage. A host integrates orlop by
+calling this SDK and invoking the `orlop` binary in the sandbox.
+
+```go
+import "github.com/liu1700/orlop/client"
+
+c := client.New("https://orlop-control.example", serviceToken)
+disk, err := c.AllocateDisk(ctx, agentID, ownerID, 1<<30)
+token, err := c.MintEnrollToken(ctx, agentID) // hand this to the sandbox
+```
+
+A `client.Fake` in-memory implementation is provided for consumer tests.
+
 ## Design and reference docs
 
 - [`docs/standalone-quickstart.md`](docs/standalone-quickstart.md) — run the whole thing on one host
