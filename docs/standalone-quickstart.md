@@ -37,29 +37,26 @@ orlop doctor            # confirms this host can mount
 
 ## 1. Database + schema
 
-Pick **one** backend. The rest of the guide is identical either way — only
-`DATABASE_URL` and the CA-secrets backend in step 2 differ.
+Pick **one** backend — SQLite needs nothing external and is the shortest path;
+Postgres is the production backend. The rest of the guide is identical either
+way; only `DATABASE_URL` and the CA-secrets backend (step 2) differ. See
+[`database-backends.md`](database-backends.md) for the full comparison and the
+trade-offs.
 
-**Option A — Postgres:**
+**SQLite (zero external dependencies):**
+
+```bash
+export DATABASE_URL="sqlite:./orlop.db"   # also: sqlite::memory:, sqlite:///abs/path.db
+orlop-control migrate up                  # creates ./orlop.db and applies the schema
+```
+
+**Postgres:**
 
 ```bash
 docker run -d --name dg-pg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=dg -p 5432:5432 postgres:16-alpine
 export DATABASE_URL="postgres://postgres:pw@localhost:5432/dg?sslmode=disable"
-
 orlop-control migrate up
 ```
-
-**Option B — SQLite (zero external dependencies):**
-
-```bash
-export DATABASE_URL="sqlite:./orlop.db"   # also: sqlite::memory:, sqlite:///abs/path.db
-
-orlop-control migrate up                  # creates ./orlop.db and applies the schema
-```
-
-The embedded SQLite backend is pure Go (no cgo, no server). It's meant for a
-single node — local dev, a self-hosted box, a CI fixture — not multi-replica
-production.
 
 ## 2. Start the control plane
 
