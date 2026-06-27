@@ -133,6 +133,7 @@ A `client.Fake` in-memory implementation is provided for consumer tests.
 | Doc | What's inside |
 |---|---|
 | [`standalone-quickstart.md`](docs/standalone-quickstart.md) | Run the whole thing on one host |
+| [`database-backends.md`](docs/database-backends.md) | Postgres vs embedded SQLite — which to use and how |
 | [`design.md`](docs/design.md) | System overview and filesystem layout |
 | [`design-data-plane.md`](docs/design-data-plane.md) | Chunk store / journal design |
 | [`design-auth.md`](docs/design-auth.md) | Certificate / tenant isolation model |

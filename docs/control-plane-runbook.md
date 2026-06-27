@@ -196,7 +196,7 @@ the control-plane database. The command is idempotent on tenant + user; each
 run mints a fresh session token (~30d TTL).
 
 ```sh
-export DATABASE_URL=postgres://control-plane/...
+export DATABASE_URL=postgres://control-plane/...   # or sqlite:./orlop.db — see database-backends.md
 
 orlop-control user seed \
     --tenant acme \
