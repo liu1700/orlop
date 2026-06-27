@@ -63,13 +63,13 @@ extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
 /// Kills its child on drop unless [`ChildGuard::stop`] already claimed it, so an
 /// early `?` return never leaks a half-started stack.
 struct ChildGuard {
-    name: String,
+    name: &'static str,
     child: Option<Child>,
 }
 
 impl ChildGuard {
-    fn new(name: &str, child: Child) -> Self {
-        Self { name: name.to_string(), child: Some(child) }
+    fn new(name: &'static str, child: Child) -> Self {
+        Self { name, child: Some(child) }
     }
 
     fn id(&self) -> u32 {
@@ -179,12 +179,16 @@ pub fn run_dev_up(opts: DevUpOpts) -> Result<()> {
             &work_dir.join("control.log"),
         )?,
     );
-    wait_healthz(&format!("{control_url}/healthz"), control.child_mut(), READY_TIMEOUT)
-        .context("control plane did not become healthy (see control.log)")?;
+    let http = crate::util::http_client(Duration::from_secs(2))?;
+    let health_url = format!("{control_url}/healthz");
+    wait_for(control.child_mut(), READY_TIMEOUT, "control plane health", || {
+        http.get(&health_url).send().map(|r| r.status().is_success()).unwrap_or(false)
+    })
+    .context("control plane did not become healthy (see control.log)")?;
 
     // 2. Register the data-plane server in the placement pool (DB-direct).
     eprintln!("[2/5] registering data-plane server");
-    run_to_completion(
+    capture(
         &control_bin,
         &[
             "server", "register",
@@ -209,7 +213,7 @@ pub fn run_dev_up(opts: DevUpOpts) -> Result<()> {
             &work_dir.join("server.log"),
         )?,
     );
-    wait_port(opts.data_port, server.child_mut(), READY_TIMEOUT)
+    wait_for(server.child_mut(), READY_TIMEOUT, "data-plane server", || port_in_use(opts.data_port))
         .context("data-plane server did not start listening (see server.log)")?;
 
     // 4. Mint an enroll token (DB-direct) and capture it.
@@ -241,8 +245,10 @@ pub fn run_dev_up(opts: DevUpOpts) -> Result<()> {
             &work_dir.join("mount.log"),
         )?,
     );
-    wait_mounted(&mountpoint, mount.child_mut(), READY_TIMEOUT)
-        .context("mount did not come up (see mount.log)")?;
+    wait_for(mount.child_mut(), READY_TIMEOUT, "agent disk mount", || {
+        crate::daemon::is_mountpoint_active(&mountpoint)
+    })
+    .context("mount did not come up (see mount.log)")?;
 
     // Persist state for `orlop status`.
     let state = DevState {
@@ -260,7 +266,7 @@ pub fn run_dev_up(opts: DevUpOpts) -> Result<()> {
     fs::write(&state_path, serde_json::to_vec_pretty(&state)?)
         .with_context(|| format!("write {}", state_path.display()))?;
 
-    print_ready_banner(&state, &mountpoint);
+    print_ready_banner(&state);
 
     // Supervise until Ctrl-C / SIGTERM, or until a child dies on its own.
     install_signal_handlers();
@@ -303,14 +309,15 @@ fn install_signal_handlers() {
     }
 }
 
-fn print_ready_banner(state: &DevState, mountpoint: &Path) {
+fn print_ready_banner(state: &DevState) {
+    let mp = state.mountpoint.display();
     eprintln!();
     eprintln!("orlop dev stack is up:");
     eprintln!("  control plane  {}", state.control_plane_url);
     eprintln!("  data plane     ops {}  data {}", state.ops_addr, state.data_addr);
-    eprintln!("  disk mounted   {}  (agent {})", mountpoint.display(), state.agent_id);
+    eprintln!("  disk mounted   {}  (agent {})", mp, state.agent_id);
     eprintln!();
-    eprintln!("  try it:   echo hi > {}/hello.txt", mountpoint.display());
+    eprintln!("  try it:   echo hi > {}/hello.txt", mp);
     eprintln!("  status:   orlop status");
     eprintln!("  stop:     Ctrl-C (tears the stack down and releases the lease)");
 }
@@ -329,27 +336,15 @@ fn spawn(bin: &Path, args: &[&str], cwd: &Path, env: &[(&str, &str)], log: &Path
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err)
-        .process_group(0);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
+        .process_group(0)
+        .envs(env.iter().copied());
     cmd.spawn().with_context(|| format!("spawn {}", bin.display()))
-}
-
-/// Run a short-lived command to completion, bailing on a non-zero exit with its
-/// captured output for context.
-fn run_to_completion(bin: &Path, args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Result<()> {
-    let _ = capture(bin, args, cwd, env)?;
-    Ok(())
 }
 
 /// Run a short-lived command and return its stdout, bailing on non-zero exit.
 fn capture(bin: &Path, args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Result<String> {
     let mut cmd = Command::new(bin);
-    cmd.args(args).current_dir(cwd);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
+    cmd.args(args).current_dir(cwd).envs(env.iter().copied());
     let out = cmd.output().with_context(|| format!("run {} {:?}", bin.display(), args))?;
     if !out.status.success() {
         bail!(
@@ -363,54 +358,20 @@ fn capture(bin: &Path, args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Resul
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn wait_healthz(url: &str, child: &mut Child, timeout: Duration) -> Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()?;
+/// Poll until `ready()` returns true, the supervised `child` exits early, or the
+/// timeout elapses. Shared by the control-plane / data-plane / mount bring-up
+/// steps; `what` names the step in error messages.
+fn wait_for(child: &mut Child, timeout: Duration, what: &str, ready: impl Fn() -> bool) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
-            bail!("process exited early with {status}");
+            bail!("{what}: process exited early with {status}");
         }
-        if let Ok(resp) = client.get(url).send() {
-            if resp.status().is_success() {
-                return Ok(());
-            }
-        }
-        if Instant::now() >= deadline {
-            bail!("not healthy within {timeout:?}");
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn wait_port(port: u16, child: &mut Child, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            bail!("process exited early with {status}");
-        }
-        if port_in_use(port) {
+        if ready() {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!("port {port} not listening within {timeout:?}");
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn wait_mounted(mountpoint: &Path, child: &mut Child, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            bail!("mount process exited early with {status}");
-        }
-        if crate::daemon::is_mountpoint_active(mountpoint) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("mountpoint {} not active within {timeout:?}", mountpoint.display());
+            bail!("{what}: not ready within {timeout:?}");
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -583,8 +544,8 @@ fn load_dev_state() -> Option<DevState> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn yesno(b: bool, yes: &str, no: &str) -> String {
-    if b { yes.to_string() } else { no.to_string() }
+fn yesno(b: bool, yes: &'static str, no: &'static str) -> &'static str {
+    if b { yes } else { no }
 }
 
 fn render_status(r: &StatusReport) -> String {

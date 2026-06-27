@@ -248,9 +248,15 @@ const (
 	actionUnknown                     // unrecognized command/flag: error out
 )
 
-// knownSubcommands are the verbs dispatched by runSubcommand.
-var knownSubcommands = map[string]struct{}{
-	"ca": {}, "migrate": {}, "user": {}, "token": {}, "server": {},
+// subcommands is the single source of truth for the recognized verbs: both
+// classifyArgs (membership) and runSubcommand (dispatch) read it, so a verb
+// can't be classified as known without also having a handler.
+var subcommands = map[string]func(context.Context, io.Writer, []string) error{
+	"ca":      runCA,
+	"migrate": runMigrate,
+	"user":    runUser,
+	"token":   runToken,
+	"server":  runServer,
 }
 
 // classifyArgs decides what the process should do from its arguments
@@ -270,7 +276,7 @@ func classifyArgs(args []string) (cliAction, string) {
 	case "help", "-help", "--help", "-h":
 		return actionHelp, ""
 	}
-	if _, ok := knownSubcommands[args[0]]; ok {
+	if _, ok := subcommands[args[0]]; ok {
 		return actionSubcommand, args[0]
 	}
 	return actionUnknown, args[0]
@@ -293,23 +299,10 @@ Run any subcommand with -h for its own flags.
 `)
 }
 
-// runSubcommand dispatches a recognized verb, mirroring the original
-// per-subcommand error/exit handling.
+// runSubcommand dispatches a recognized verb via the subcommands table. It is
+// only reached for names classifyArgs already confirmed are present.
 func runSubcommand(name string) {
-	var err error
-	switch name {
-	case "ca":
-		err = runCA(context.Background(), os.Stdout, os.Args[2:])
-	case "migrate":
-		err = runMigrate(context.Background(), os.Stdout, os.Args[2:])
-	case "user":
-		err = runUser(context.Background(), os.Stdout, os.Args[2:])
-	case "token":
-		err = runToken(context.Background(), os.Stdout, os.Args[2:])
-	case "server":
-		err = runServer(context.Background(), os.Stdout, os.Args[2:])
-	}
-	if err != nil {
+	if err := subcommands[name](context.Background(), os.Stdout, os.Args[2:]); err != nil {
 		fmt.Fprintf(os.Stderr, "orlop-control %s: %v\n", name, err)
 		os.Exit(1)
 	}
