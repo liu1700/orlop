@@ -17,10 +17,11 @@
 //   - Errors are domain sentinels (ErrNotFound, …); adapters map their driver's
 //     equivalents onto these so callers never import a driver to read a result.
 //
-// Transactions (for multi-statement flows like token issuance and lease
-// acquisition) will be exposed here as `WithTx(ctx, func(s Store) error) error`
-// once the first transactional slice is migrated; the Postgres adapter backs it
-// with pgx.BeginFunc + Queries.WithTx.
+// Multi-statement flows (token issuance, lease acquisition) run in a
+// transaction: a role interface that embeds `beginner` exposes
+// `Begin(ctx) (Tx, error)`, and the returned [Tx] carries every subdomain's
+// operations plus Commit/Rollback (see tx.go). The Postgres adapter backs Begin
+// with pgx.Begin + Queries.WithTx.
 package storage
 
 import (

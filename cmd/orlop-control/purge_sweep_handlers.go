@@ -9,8 +9,8 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 const (
@@ -21,7 +21,7 @@ const (
 // purgePendingLister is the one query the sweep needs; an interface so the
 // handler tests can stub it.
 type purgePendingLister interface {
-	ListPurgePendingAllocations(ctx context.Context, limit int32) ([]sqlcdb.ListPurgePendingAllocationsRow, error)
+	ListPurgePendingAllocations(ctx context.Context, limit int32) ([]storage.PurgePendingAllocation, error)
 }
 
 // purgeSweepHandlers serves POST /v1/admin/purge-sweep — the on-demand sweeper
@@ -88,11 +88,11 @@ func (h *purgeSweepHandlers) handleSweep(w http.ResponseWriter, r *http.Request)
 		if r.Context().Err() != nil {
 			break
 		}
-		if err := h.purge.PurgeAllocation(r.Context(), h.api, row.AllocationID); err != nil {
+		if err := h.purge.PurgeAllocation(r.Context(), h.api, fromUUID(row.AllocationID)); err != nil {
 			resp.Failed++
 			h.logger.Error("purge_sweep_allocation_failed",
-				"allocation_id", uuidString(row.AllocationID),
-				"agent_id", row.AgentID.String,
+				"allocation_id", row.AllocationID.String(),
+				"agent_id", row.AgentID,
 				"error", err)
 			continue
 		}
@@ -106,6 +106,6 @@ func (h *purgeSweepHandlers) handleSweep(w http.ResponseWriter, r *http.Request)
 
 // ensure the production types satisfy the handler interfaces.
 var (
-	_ purgePendingLister = (db.Store)(nil)
+	_ purgePendingLister = (*postgres.Store)(nil)
 	_ allocationPurger   = (*allocations.Service)(nil)
 )

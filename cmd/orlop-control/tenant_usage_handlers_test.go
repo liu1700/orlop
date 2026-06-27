@@ -11,11 +11,10 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
 
 const tenantUsageOwner = "99999999-9999-9999-9999-999999999999"
@@ -23,29 +22,29 @@ const tenantUsageOwner = "99999999-9999-9999-9999-999999999999"
 // stubTenantUsageQuerier injects fixed rows (or errors) for the owner→tenant→
 // server resolution so the handler is testable without a live DB.
 type stubTenantUsageQuerier struct {
-	user     sqlcdb.User
+	user     storage.User
 	userErr  error
-	allocs   []sqlcdb.DiskAllocation
+	allocs   []storage.Allocation
 	allocErr error
-	vm       sqlcdb.ServerVm
+	vm       storage.ServerVM
 	vmErr    error
-	pool     sqlcdb.ServerPool
+	pool     storage.Server
 	poolErr  error
 }
 
-func (s stubTenantUsageQuerier) GetUser(context.Context, pgtype.UUID) (sqlcdb.User, error) {
+func (s stubTenantUsageQuerier) GetUser(context.Context, uuid.UUID) (storage.User, error) {
 	return s.user, s.userErr
 }
 
-func (s stubTenantUsageQuerier) ListAllocationsForUser(context.Context, pgtype.UUID) ([]sqlcdb.DiskAllocation, error) {
+func (s stubTenantUsageQuerier) ListAllocationsForUser(context.Context, uuid.UUID) ([]storage.Allocation, error) {
 	return s.allocs, s.allocErr
 }
 
-func (s stubTenantUsageQuerier) GetServerVMByTenant(context.Context, string) (sqlcdb.ServerVm, error) {
+func (s stubTenantUsageQuerier) GetServerVMByTenant(context.Context, string) (storage.ServerVM, error) {
 	return s.vm, s.vmErr
 }
 
-func (s stubTenantUsageQuerier) GetServerPoolByDataAddr(context.Context, string) (sqlcdb.ServerPool, error) {
+func (s stubTenantUsageQuerier) GetServerPoolByDataAddr(context.Context, string) (storage.Server, error) {
 	return s.pool, s.poolErr
 }
 
@@ -69,10 +68,10 @@ func doTenantUsage(t *testing.T, h http.Handler, owner, auth string) *httptest.R
 
 func TestTenantUsage_HappyPath(t *testing.T) {
 	q := stubTenantUsageQuerier{
-		user:   sqlcdb.User{TenantID: "u_" + tenantUsageOwner},
-		allocs: []sqlcdb.DiskAllocation{{}}, // one allocation (no per-agent tenant → owner tenant)
-		vm:     sqlcdb.ServerVm{DataAddr: "data-srv-1:6363"},
-		pool:   sqlcdb.ServerPool{OpsAddr: "ops-srv-1:6443"},
+		user:   storage.User{TenantID: "u_" + tenantUsageOwner},
+		allocs: []storage.Allocation{{}}, // one allocation (no per-agent tenant → owner tenant)
+		vm:     storage.ServerVM{DataAddr: "data-srv-1:6363"},
+		pool:   storage.Server{OpsAddr: "ops-srv-1:6443"},
 	}
 	usage := &fakeUsage{resp: serverapi.TenantUsage{UsedBytes: 4096}}
 	rec := doTenantUsage(t, tenantUsageRouter(q, usage, "svc"), tenantUsageOwner, "Bearer svc")
@@ -93,7 +92,7 @@ func TestTenantUsage_HappyPath(t *testing.T) {
 }
 
 func TestTenantUsage_NoUserReportsZero(t *testing.T) {
-	q := stubTenantUsageQuerier{userErr: pgx.ErrNoRows}
+	q := stubTenantUsageQuerier{userErr: storage.ErrNotFound}
 	usage := &fakeUsage{}
 	rec := doTenantUsage(t, tenantUsageRouter(q, usage, "svc"), tenantUsageOwner, "Bearer svc")
 
@@ -112,9 +111,9 @@ func TestTenantUsage_NoUserReportsZero(t *testing.T) {
 
 func TestTenantUsage_NeverPlacedReportsZero(t *testing.T) {
 	q := stubTenantUsageQuerier{
-		user:   sqlcdb.User{TenantID: "u_" + tenantUsageOwner},
-		allocs: []sqlcdb.DiskAllocation{{}},
-		vmErr:  pgx.ErrNoRows, // tenant has no server_vms row yet (no mount)
+		user:   storage.User{TenantID: "u_" + tenantUsageOwner},
+		allocs: []storage.Allocation{{}},
+		vmErr:  storage.ErrNotFound, // tenant has no server_vms row yet (no mount)
 	}
 	usage := &fakeUsage{}
 	rec := doTenantUsage(t, tenantUsageRouter(q, usage, "svc"), tenantUsageOwner, "Bearer svc")
@@ -133,7 +132,7 @@ func TestTenantUsage_NeverPlacedReportsZero(t *testing.T) {
 }
 
 func TestTenantUsage_RequiresServiceToken(t *testing.T) {
-	q := stubTenantUsageQuerier{user: sqlcdb.User{TenantID: "u_" + tenantUsageOwner}}
+	q := stubTenantUsageQuerier{user: storage.User{TenantID: "u_" + tenantUsageOwner}}
 	h := tenantUsageRouter(q, &fakeUsage{}, "svc")
 
 	if rec := doTenantUsage(t, h, tenantUsageOwner, "Bearer wrong"); rec.Code != http.StatusUnauthorized {
@@ -146,10 +145,10 @@ func TestTenantUsage_RequiresServiceToken(t *testing.T) {
 
 func TestTenantUsage_RemoteFailureReturns502(t *testing.T) {
 	q := stubTenantUsageQuerier{
-		user:   sqlcdb.User{TenantID: "u_" + tenantUsageOwner},
-		allocs: []sqlcdb.DiskAllocation{{}},
-		vm:     sqlcdb.ServerVm{DataAddr: "data-srv-1:6363"},
-		pool:   sqlcdb.ServerPool{OpsAddr: "ops-srv-1:6443"},
+		user:   storage.User{TenantID: "u_" + tenantUsageOwner},
+		allocs: []storage.Allocation{{}},
+		vm:     storage.ServerVM{DataAddr: "data-srv-1:6363"},
+		pool:   storage.Server{OpsAddr: "ops-srv-1:6443"},
 	}
 	usage := &fakeUsage{err: errors.New("boom")}
 	rec := doTenantUsage(t, tenantUsageRouter(q, usage, "svc"), tenantUsageOwner, "Bearer svc")
@@ -159,7 +158,7 @@ func TestTenantUsage_RemoteFailureReturns502(t *testing.T) {
 }
 
 func TestTenantUsage_NoUsageClientReturns503(t *testing.T) {
-	q := stubTenantUsageQuerier{user: sqlcdb.User{TenantID: "u_" + tenantUsageOwner}}
+	q := stubTenantUsageQuerier{user: storage.User{TenantID: "u_" + tenantUsageOwner}}
 	rec := doTenantUsage(t, tenantUsageRouter(q, nil, "svc"), tenantUsageOwner, "Bearer svc")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)

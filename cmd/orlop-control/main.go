@@ -465,8 +465,8 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 		mountDeviceFlow(router, newDevAuthHandlers(logger, deps.devAuth, deps.allocations, deps.cookieDomain))
 	}
 	if deps.devAuth != nil && deps.queries != nil && deps.allocations != nil {
-		mountDashboard(router, newDashboardHandlers(logger, deps.devAuth, deps.queries, deps.allocations, deps.serverUsage, deps.mountLeaseFencer))
-		mountLeaseRoutes(router, newMountLeaseHandlers(logger, deps.allocations, deps.queries, deps.devAuth, deps.mountLeaseFencer))
+		mountDashboard(router, newDashboardHandlers(logger, deps.devAuth, deps.store, deps.allocations, deps.serverUsage, deps.mountLeaseFencer))
+		mountLeaseRoutes(router, newMountLeaseHandlers(logger, deps.allocations, deps.store, deps.devAuth, deps.mountLeaseFencer))
 	}
 	if deps.devAuth != nil && deps.queries != nil {
 		mountAPITokens(router, newAPITokenHandlers(logger, deps.devAuth, deps.store, cfg.APITokenTTL))
@@ -483,20 +483,20 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	// allocations' backend data. Same service-token gate as /v1/entities.
 	if deps.queries != nil && deps.allocations != nil {
 		mountPurgeSweep(router, RequireServiceToken(cfg.ControlPlaneToken),
-			newPurgeSweepHandlers(logger, deps.queries, deps.allocations, deps.agentPurger))
+			newPurgeSweepHandlers(logger, deps.store, deps.allocations, deps.agentPurger))
 	}
 	// GET /v1/tenants/{owner}/usage: per-user disk usage for the control-plane's
 	// storage meter, same static-token gate as /v1/entities. serverUsage may be
 	// nil (no SecretsDir) — the handler then 503s rather than crashing.
 	if deps.queries != nil {
 		mountControlTenantUsage(router, RequireServiceToken(cfg.ControlPlaneToken),
-			newControlTenantUsageHandlers(logger, deps.queries, deps.serverUsage))
+			newControlTenantUsageHandlers(logger, deps.store, deps.serverUsage))
 	}
 	if deps.devAuth != nil && deps.allocations != nil && deps.queries != nil && deps.journalQuerier != nil {
 		mountJournal(router, newJournalHandlers(deps.devAuth, deps.allocations, deps.queries, deps.journalQuerier))
 	}
 	if deps.devAuth != nil && deps.queries != nil && deps.agentCA != nil {
-		mountAgentEnroll(router, RequireEnrollBearer(deps.devAuth, deps.store), newAgentEnrollHandlers(logger, deps.queries, deps.devAuth, deps.agentCA, deps.enrollLimit, deps.allocations, deps.serverAdmin))
+		mountAgentEnroll(router, RequireEnrollBearer(deps.devAuth, deps.store), newAgentEnrollHandlers(logger, deps.store, deps.devAuth, deps.agentCA, deps.enrollLimit, deps.allocations, deps.serverAdmin))
 	}
 	// POST /control/sign-server-cert: orlop-server self-provisions its TLS
 	// cert at boot by sending a CSR here (private key stays in its pod). Same

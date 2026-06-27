@@ -47,9 +47,10 @@ type entityQuerier interface {
 	// resize primitive (allocationResizer), not a direct size write here.
 	RevokeAllocation(ctx context.Context, arg sqlcdb.RevokeAllocationParams) (sqlcdb.DiskAllocation, error)
 	// Account-budget path (the buy/upgrade): list a user's allocations to re-stamp the
-	// new account budget on each, and resolve where they're placed to resize the live
-	// shared owner quota. The two placement getters let entityQuerier satisfy
-	// tenantPlacementQuerier for resolveTenantOpsAddr.
+	// new account budget on each, and resolve where they're placed (the two placement
+	// getters below) to resize the live shared owner quota. This handler still resolves
+	// placement inline against these sqlc getters; it migrates onto the storage layer in
+	// a later stage.
 	ListAllocationsForUser(ctx context.Context, userID pgtype.UUID) ([]sqlcdb.DiskAllocation, error)
 	UpdateAllocationSize(ctx context.Context, arg sqlcdb.UpdateAllocationSizeParams) (sqlcdb.DiskAllocation, error)
 	GetServerVMByTenant(ctx context.Context, tenantID string) (sqlcdb.ServerVm, error)
@@ -609,11 +610,19 @@ func (h *entityHandlers) handleSetAccountBudget(w http.ResponseWriter, r *http.R
 			if a.TenantID.Valid && a.TenantID.String != "" {
 				tenant = a.TenantID.String
 			}
-			opsAddr, placed, err := resolveTenantOpsAddr(r.Context(), h.queries, tenant)
-			if err != nil || !placed {
+			// Resolve the tenant's ops addr (server_vms → server_pools), skipping any
+			// tenant not yet placed or whose lookup errors — a best-effort live resize.
+			// (Inline rather than the storage-backed resolveTenantOpsAddr until this
+			// handler migrates off sqlcdb.)
+			vm, vmErr := h.queries.GetServerVMByTenant(r.Context(), tenant)
+			if vmErr != nil {
 				continue
 			}
-			servers[opsAddr] = struct{}{}
+			pool, poolErr := h.queries.GetServerPoolByDataAddr(r.Context(), vm.DataAddr)
+			if poolErr != nil {
+				continue
+			}
+			servers[pool.OpsAddr] = struct{}{}
 		}
 		for opsAddr := range servers {
 			if _, err := setter.SetAccountQuota(r.Context(), opsAddr, ownerTenant, req.DiskBytes); err != nil {

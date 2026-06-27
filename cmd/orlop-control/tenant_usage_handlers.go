@@ -8,24 +8,24 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 // tenantPlacementQuerier resolves where a tenant's data plane lives (server_vms →
-// server_pools). db.Store satisfies it; see [resolveTenantOpsAddr].
+// server_pools). *postgres.Store satisfies it; see [resolveTenantOpsAddr].
 type tenantPlacementQuerier interface {
-	GetServerVMByTenant(ctx context.Context, tenantID string) (sqlcdb.ServerVm, error)
-	GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (sqlcdb.ServerPool, error)
+	GetServerVMByTenant(ctx context.Context, tenantID string) (storage.ServerVM, error)
+	GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (storage.Server, error)
 }
 
-// controlTenantUsageQuerier is the slice of db.Store the per-user usage
+// controlTenantUsageQuerier is the slice of the storage layer the per-user usage
 // route needs. An interface so the unit tests inject a stub without a live DB.
 type controlTenantUsageQuerier interface {
-	GetUser(ctx context.Context, id pgtype.UUID) (sqlcdb.User, error)
-	ListAllocationsForUser(ctx context.Context, userID pgtype.UUID) ([]sqlcdb.DiskAllocation, error)
+	GetUser(ctx context.Context, id uuid.UUID) (storage.User, error)
+	ListAllocationsForUser(ctx context.Context, userID uuid.UUID) ([]storage.Allocation, error)
 	tenantPlacementQuerier
 }
 
@@ -36,7 +36,7 @@ type controlTenantUsageQuerier interface {
 // adapters walk; a future cleanup could converge those onto this helper.
 func resolveTenantOpsAddr(ctx context.Context, q tenantPlacementQuerier, tenantID string) (opsAddr string, placed bool, err error) {
 	vm, err := q.GetServerVMByTenant(ctx, tenantID)
-	if errors.Is(err, db.ErrNotFound) {
+	if errors.Is(err, storage.ErrNotFound) {
 		return "", false, nil
 	}
 	if err != nil {
@@ -100,9 +100,9 @@ func (h *controlTenantUsageHandlers) handleTenantUsage(w http.ResponseWriter, r 
 	}
 	zero := tenantUsageDTO{OwnerID: uuidString(ownerID), UsedBytes: 0}
 
-	user, err := h.queries.GetUser(r.Context(), ownerID)
+	user, err := h.queries.GetUser(r.Context(), toUUID(ownerID))
 	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) {
 			// Owner has never provisioned a disk → no dg user → zero usage.
 			writeJSON(w, http.StatusOK, zero)
 			return
@@ -115,7 +115,7 @@ func (h *controlTenantUsageHandlers) handleTenantUsage(w http.ResponseWriter, r 
 	// Each of the owner's agents now has its OWN storage tenant; their used bytes sum
 	// to the owner's total (docs/design/per-agent-tenant.md). A legacy non-agent
 	// allocation with no per-agent tenant falls back to the owner's tenant.
-	allocs, err := h.queries.ListAllocationsForUser(r.Context(), ownerID)
+	allocs, err := h.queries.ListAllocationsForUser(r.Context(), toUUID(ownerID))
 	if err != nil {
 		h.logger.Error("control_usage_list_allocations_failed", "error", err, "owner_id", uuidString(ownerID))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
@@ -124,8 +124,8 @@ func (h *controlTenantUsageHandlers) handleTenantUsage(w http.ResponseWriter, r 
 	tenants := make(map[string]struct{}, len(allocs))
 	for _, a := range allocs {
 		t := user.TenantID
-		if a.TenantID.Valid && a.TenantID.String != "" {
-			t = a.TenantID.String
+		if a.TenantID != "" {
+			t = a.TenantID
 		}
 		tenants[t] = struct{}{}
 	}
@@ -153,5 +153,5 @@ func (h *controlTenantUsageHandlers) handleTenantUsage(w http.ResponseWriter, r 
 	writeJSON(w, http.StatusOK, tenantUsageDTO{OwnerID: uuidString(ownerID), UsedBytes: total})
 }
 
-// ensure db.Store satisfies controlTenantUsageQuerier at compile time.
-var _ controlTenantUsageQuerier = (db.Store)(nil)
+// ensure *postgres.Store satisfies controlTenantUsageQuerier at compile time.
+var _ controlTenantUsageQuerier = (*postgres.Store)(nil)

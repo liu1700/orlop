@@ -116,6 +116,21 @@ func (s *Store) CountActiveAllocationsForUser(ctx context.Context, userID uuid.U
 	return n, mapErr(err)
 }
 
+func (s *Store) ListPurgePendingAllocations(ctx context.Context, limit int32) ([]storage.PurgePendingAllocation, error) {
+	rows, err := s.q.ListPurgePendingAllocations(ctx, limit)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	out := make([]storage.PurgePendingAllocation, len(rows))
+	for i, r := range rows {
+		out[i] = storage.PurgePendingAllocation{
+			AllocationID: domainUUID(r.AllocationID),
+			AgentID:      r.AgentID.String,
+		}
+	}
+	return out, nil
+}
+
 // --- mount leases ---
 
 func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (storage.Allocation, error) {
@@ -165,12 +180,7 @@ func (s *Store) GetAgentEnrollment(ctx context.Context, id uuid.UUID) (storage.A
 	if err != nil {
 		return storage.AgentEnrollment{}, mapErr(err)
 	}
-	return storage.AgentEnrollment{
-		ID:           domainUUID(e.ID),
-		UserID:       domainUUID(e.UserID),
-		CertSerial:   e.CertSerial,
-		CertNotAfter: timeOrZero(e.CertNotAfter),
-	}, nil
+	return enrollment(e), nil
 }
 
 func (s *Store) GetUserForUpdate(ctx context.Context, id uuid.UUID) (storage.User, error) {
