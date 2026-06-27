@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
 )
 
@@ -27,13 +27,13 @@ type certRevocationPusher interface {
 // repopulating any that restarted. Best-effort per server — a push failure is
 // logged and retried on the next tick.
 type certRevocationReconciler struct {
-	q        *sqlcdb.Queries
+	q        db.Store
 	pusher   certRevocationPusher
 	logger   *slog.Logger
 	interval time.Duration
 }
 
-func newCertRevocationReconciler(q *sqlcdb.Queries, pusher certRevocationPusher, logger *slog.Logger) *certRevocationReconciler {
+func newCertRevocationReconciler(q db.Store, pusher certRevocationPusher, logger *slog.Logger) *certRevocationReconciler {
 	return &certRevocationReconciler{
 		q:        q,
 		pusher:   pusher,

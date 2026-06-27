@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/tokens"
@@ -28,13 +29,13 @@ const apiTokenNameMaxLen = 50
 type apiTokenHandlers struct {
 	logger  *slog.Logger
 	devAuth *devauth.Service
-	queries *sqlcdb.Queries
+	queries db.Store
 	// ttl, when > 0, sets an expiry on newly minted tokens. 0 = never expires
 	// (the historical default). Configured via ORLOP_API_TOKEN_TTL.
 	ttl time.Duration
 }
 
-func newAPITokenHandlers(logger *slog.Logger, svc *devauth.Service, q *sqlcdb.Queries, ttl time.Duration) *apiTokenHandlers {
+func newAPITokenHandlers(logger *slog.Logger, svc *devauth.Service, q db.Store, ttl time.Duration) *apiTokenHandlers {
 	return &apiTokenHandlers{logger: logger, devAuth: svc, queries: q, ttl: ttl}
 }
 

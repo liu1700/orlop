@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/time/rate"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 )
@@ -27,7 +27,7 @@ const (
 
 type agentEnrollHandlers struct {
 	logger      *slog.Logger
-	q           *sqlcdb.Queries
+	q           db.Store
 	devAuth     *devauth.Service
 	ca          *ca.CA
 	limit       *agentEnrollLimiter
@@ -37,7 +37,7 @@ type agentEnrollHandlers struct {
 
 func newAgentEnrollHandlers(
 	logger *slog.Logger,
-	q *sqlcdb.Queries,
+	q db.Store,
 	devAuth *devauth.Service,
 	agentCA *ca.CA,
 	limit *agentEnrollLimiter,
@@ -100,7 +100,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 	}
 
 	tenant, err := h.q.GetTenant(r.Context(), ident.TenantID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		writeOAuthError(w, http.StatusForbidden, "access_denied", "tenant_not_found")
 		return
 	}
@@ -147,7 +147,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			serverAddr = vm.DataAddr
-		} else if !errors.Is(vmErr, pgx.ErrNoRows) {
+		} else if !errors.Is(vmErr, db.ErrNotFound) {
 			h.logger.Error("agent_enroll_server_vm_lookup_failed", "error", vmErr, "tenant_id", ident.TenantID)
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 			return

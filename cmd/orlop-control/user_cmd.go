@@ -9,9 +9,9 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 )
@@ -76,7 +76,7 @@ func runUserSeed(ctx context.Context, out io.Writer, args []string) error {
 
 	// Tenant: idempotent create.
 	if _, err := q.GetTenant(ctx, *tenantID); err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
+		if !errors.Is(err, db.ErrNotFound) {
 			return fmt.Errorf("get tenant: %w", err)
 		}
 		if _, err := q.CreateTenant(ctx, sqlcdb.CreateTenantParams{ID: *tenantID, Name: *tenantName}); err != nil {
@@ -88,7 +88,7 @@ func runUserSeed(ctx context.Context, out io.Writer, args []string) error {
 	// User: idempotent create. CreateUser relies on the SQL DEFAULT
 	// 'admin' role; admin is the only role under MVP.
 	user, err := q.GetUserByEmail(ctx, *email)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		user, err = q.CreateUser(ctx, sqlcdb.CreateUserParams{Email: *email, TenantID: *tenantID})
 		if err != nil {
 			return fmt.Errorf("create user: %w", err)

@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 )
 
@@ -105,6 +106,6 @@ func (h *purgeSweepHandlers) handleSweep(w http.ResponseWriter, r *http.Request)
 
 // ensure the production types satisfy the handler interfaces.
 var (
-	_ purgePendingLister = (*sqlcdb.Queries)(nil)
+	_ purgePendingLister = (db.Store)(nil)
 	_ allocationPurger   = (*allocations.Service)(nil)
 )

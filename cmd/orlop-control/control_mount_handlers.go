@@ -11,23 +11,22 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 )
 
 type mountLeaseHandlers struct {
 	logger  *slog.Logger
 	alloc   *allocations.Service
-	q       *sqlcdb.Queries
+	q       db.Store
 	devAuth *devauth.Service
 	fencer  mountLeaseFencer
 }
 
-func newMountLeaseHandlers(logger *slog.Logger, alloc *allocations.Service, q *sqlcdb.Queries, dev *devauth.Service, fencer mountLeaseFencer) *mountLeaseHandlers {
+func newMountLeaseHandlers(logger *slog.Logger, alloc *allocations.Service, q db.Store, dev *devauth.Service, fencer mountLeaseFencer) *mountLeaseHandlers {
 	return &mountLeaseHandlers{logger: logger, alloc: alloc, q: q, devAuth: dev, fencer: fencer}
 }
 
@@ -157,7 +156,7 @@ func (h *mountLeaseHandlers) resolveMountRequest(w http.ResponseWriter, r *http.
 		return pgtype.UUID{}, pgtype.UUID{}, false
 	}
 	agent, err := h.q.GetActiveEnrollmentByFingerprint(r.Context(), fingerprint)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "")
 		return pgtype.UUID{}, pgtype.UUID{}, false
 	}
@@ -171,7 +170,7 @@ func (h *mountLeaseHandlers) resolveMountRequest(w http.ResponseWriter, r *http.
 	// an agent (only bound disks are mountable). A revoked allocation is NOT rejected
 	// here — it flows to the lease op, which returns ErrRevoked (mapped to 410 Gone).
 	alloc, err := h.q.GetAllocation(r.Context(), allocID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		writeOAuthError(w, http.StatusNotFound, "not_found", "")
 		return pgtype.UUID{}, pgtype.UUID{}, false
 	}
