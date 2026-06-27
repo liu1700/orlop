@@ -357,15 +357,16 @@ func deleteToken(t *testing.T, srvURL string, cookie *http.Cookie, id string) *h
 	return resp
 }
 
-// requireBearerProbe wraps RequireBearer with a tiny handler that echoes
+// requireBearerProbe wraps RequireEnrollBearer with a tiny handler that echoes
 // {tenant_id, purpose} from the request context as JSON. Used by the
-// API-token middleware tests below. Driving the middleware directly is
-// cleaner than going through /agent/enroll, which depends on the agent CA
-// being wired up.
+// API-token middleware tests below — the `orlop_` API-token branch is shared
+// across every bearer middleware, so probing it through RequireEnrollBearer
+// exercises the same code path. Driving the middleware directly is cleaner than
+// going through /agent/enroll, which depends on the agent CA being wired up.
 func requireBearerProbe(t *testing.T, pool *pgxpool.Pool) *httptest.Server {
 	t.Helper()
 	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	h := RequireBearer(svc, postgres.New(pool))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := RequireEnrollBearer(svc, postgres.New(pool))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ident, ok := IdentityFromRequest(r)
 		if !ok {
 			w.WriteHeader(http.StatusInternalServerError)

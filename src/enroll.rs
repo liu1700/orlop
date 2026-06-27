@@ -1,7 +1,7 @@
 //! `orlop mount` enrollment against the hosted control plane.
 //!
-//! `enroll` POSTs `/agent/enroll` with the bearer token persisted by `orlop
-//! login`, writes the returned cert / key / CA chain to disk under
+//! `enroll` POSTs `/agent/enroll` with the agent's bearer token (stored in
+//! `credentials.json` by the mount path), writes the returned cert / key / CA chain to disk under
 //! `~/.config/orlop/{cert,key,ca}.pem` (mode 0600), and returns the metadata
 //! the mount handler needs to dial the per-tenant `orlop-server` over mTLS.
 //! `shred` overwrites and removes those files on `orlop unmount`.
@@ -60,7 +60,7 @@ struct EnrollResp {
     size_bytes: Option<u64>,
 }
 
-/// POST `/agent/enroll` with the credentials from `orlop login`, persist the
+/// POST `/agent/enroll` with the agent's stored credentials, persist the
 /// returned PEMs to `cert_dir`, and return metadata for the dial.
 pub fn enroll(creds: &Credentials, cert_dir: &Path) -> anyhow::Result<EnrolledCert> {
     let url = format!("{}/agent/enroll", creds.control_plane_base());
@@ -70,27 +70,33 @@ pub fn enroll(creds: &Credentials, cert_dir: &Path) -> anyhow::Result<EnrolledCe
     let status = resp.status();
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        bail!("/agent/enroll returned 401 — run `orlop login` to refresh credentials");
+        bail!(
+            "/agent/enroll returned 401 — the host must re-enroll the agent \
+             (mint a fresh enroll token and re-run `orlop mount --from-env`)"
+        );
     }
     if status == reqwest::StatusCode::FORBIDDEN {
         // orlop-control returns `{"error":"access_denied","error_description":"<reason>"}`.
         // The description disambiguates revoke vs. suspension so we surface the
-        // recovery the user actually needs.
+        // recovery the host actually needs.
         let desc = read_oauth_error_description(resp);
         let hint = match desc.as_deref() {
             Some("allocation_revoked") => {
-                "your allocation was revoked. Visit https://example.com/dashboard \
-                or run `orlop login` to allocate a new disk"
+                "your allocation was revoked; the host must re-enroll the agent \
+                (mint a fresh enroll token and re-run `orlop mount --from-env`) \
+                to allocate a new disk"
             }
             Some("allocation_not_found") => {
-                "the allocation cached locally is no longer accessible. \
-                Run `orlop login` to re-enroll"
+                "the allocation cached locally is no longer accessible; the host \
+                must re-enroll the agent (mint a fresh enroll token and re-run \
+                `orlop mount --from-env`)"
             }
             Some("tenant_suspended") => {
                 "tenant is suspended; contact support@example.com"
             }
             Some("tenant_not_found") => {
-                "the tenant on this credential is unknown — run `orlop login --force`"
+                "the tenant on this credential is unknown; the host must re-enroll \
+                the agent (mint a fresh enroll token and re-run `orlop mount --from-env`)"
             }
             _ => "access denied (tenant or user suspended)",
         };
@@ -229,7 +235,7 @@ pub struct EnrollmentSidecar {
 
 /// Load an `enrollment.json` sidecar from `cert_dir`. Returns `Ok(None)`
 /// when the file is absent — that signals the caller to fall back to the
-/// normal device-flow + `/agent/enroll` path. Returns `Err` only on a
+/// normal `/agent/enroll` HTTP path. Returns `Err` only on a
 /// present-but-unparseable file (corruption / wrong shape).
 pub fn load_enrollment_sidecar(cert_dir: &Path) -> anyhow::Result<Option<EnrolledCert>> {
     let path = cert_dir.join(FILE_ENROLLMENT);

@@ -114,7 +114,7 @@ func newEntityHandlers(logger *slog.Logger, q entityQuerier, mintEnroll enrollTo
 // forwarding; the prefixed mount lets a same-origin caller hit the control
 // plane directly). Both are gated by the svc middleware — these are
 // control-plane→control-plane calls, never a user-facing surface, so they do
-// NOT go through the user RequireBearer path.
+// NOT go through the user-facing bearer path (RequireEnrollBearer).
 func mountEntities(r chi.Router, svc func(http.Handler) http.Handler, h *entityHandlers) {
 	for _, prefix := range []string{"", "/api"} {
 		r.With(svc).Post(prefix+"/v1/entities", h.handleProvision)
@@ -621,8 +621,8 @@ const EntityTypeAgent = "agent"
 // when expected is empty (token unconfigured) every request is rejected, so an
 // unconfigured deployment never exposes the provisioning API unauthenticated.
 //
-// This is deliberately NOT the user RequireBearer path: /v1/entities is a
-// service surface, not a user surface.
+// This is deliberately NOT the user-facing bearer path (RequireEnrollBearer):
+// /v1/entities is a service surface, not a user surface.
 func RequireServiceToken(expected string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

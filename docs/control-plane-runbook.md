@@ -141,7 +141,7 @@ orlop-control user seed \
 # created user alice@acme.example under tenant acme (only on first run)
 # admin session token: <opaque>
 # expires at:          2026-07-27 12:34:56 UTC
-# approval URL:        https://control.orlop.example/device?session=<opaque>
+# admin session URL:   https://control.orlop.example/admin/session?token=<opaque>
 ```
 
 The command provisions a tenant and an admin user, and is idempotent on tenant
@@ -216,7 +216,7 @@ orlop-control user suspend --email alice@acme.example
 ```
 
 This stamps `users.suspended_at`. The bearer middleware joins through that column,
-so the user's access and refresh tokens stop validating on their next use, and
+so the user's access tokens stop validating on their next use, and
 `/agent/enroll` refuses to mint new leaves for them. An agent leaf already minted
 for that user (up to 1h old) keeps authenticating to orlop-server until it
 expires, because the data plane does not call back to the control plane on each

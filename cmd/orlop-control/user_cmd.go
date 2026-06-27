@@ -110,11 +110,11 @@ func runUserSeed(ctx context.Context, out io.Writer, args []string) error {
 		if err != nil {
 			return fmt.Errorf("parse --base-url: %w", err)
 		}
-		u.Path = "/device"
+		u.Path = "/admin/session"
 		q := u.Query()
-		q.Set("session", tok)
+		q.Set("token", tok)
 		u.RawQuery = q.Encode()
-		fmt.Fprintf(out, "approval URL:        %s\n", u.String())
+		fmt.Fprintf(out, "admin session URL:   %s\n", u.String())
 	}
 	return nil
 }

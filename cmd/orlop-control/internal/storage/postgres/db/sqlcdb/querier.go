@@ -24,7 +24,6 @@ type Querier interface {
 	// Record a revoked cert serial (issue #5). Idempotent: a serial already on the
 	// deny-list is left untouched (the first revocation's reason/expiry win).
 	AddCertRevocation(ctx context.Context, arg AddCertRevocationParams) error
-	ApproveDeviceAuthorization(ctx context.Context, arg ApproveDeviceAuthorizationParams) (DeviceAuthorization, error)
 	BindAllocation(ctx context.Context, arg BindAllocationParams) (DiskAllocation, error)
 	// Two-step: promote allocations, then mark sessions claimed.
 	ClaimAnonymousAllocations(ctx context.Context, arg ClaimAnonymousAllocationsParams) ([]pgtype.UUID, error)
@@ -44,8 +43,6 @@ type Querier interface {
 	CreateAPIToken(ctx context.Context, arg CreateAPITokenParams) (CreateAPITokenRow, error)
 	CreateAccessToken(ctx context.Context, arg CreateAccessTokenParams) (AccessToken, error)
 	CreateAgentEnrollment(ctx context.Context, arg CreateAgentEnrollmentParams) (AgentEnrollment, error)
-	CreateDeviceAuthorization(ctx context.Context, arg CreateDeviceAuthorizationParams) (DeviceAuthorization, error)
-	CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error)
 	CreateServerVM(ctx context.Context, arg CreateServerVMParams) (ServerVm, error)
 	CreateTenant(ctx context.Context, arg CreateTenantParams) (Tenant, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
@@ -56,7 +53,6 @@ type Querier interface {
 	// placement from the pool.
 	DeleteServerVM(ctx context.Context, tenantID string) (int64, error)
 	DeleteUnclaimedExpiredAnonymousAllocations(ctx context.Context) ([]pgtype.UUID, error)
-	DenyDeviceAuthorization(ctx context.Context, arg DenyDeviceAuthorizationParams) (DeviceAuthorization, error)
 	// Idempotent: create the tenant if it does not already exist. The caller
 	// follows up with GetTenant when it needs the row. Used by /v1/entities
 	// provisioning to lazily ensure the customer's per-user tenant.
@@ -80,10 +76,6 @@ type Querier interface {
 	GetAllocationByAgent(ctx context.Context, agentID pgtype.Text) (DiskAllocation, error)
 	GetAnonymousSession(ctx context.Context, sessionID string) (AnonymousSession, error)
 	GetAnonymousSessionAllocation(ctx context.Context, sessionID string) (GetAnonymousSessionAllocationRow, error)
-	GetDeviceAuthorizationByDeviceCodeHash(ctx context.Context, deviceCodeHash string) (DeviceAuthorization, error)
-	GetDeviceAuthorizationByUserCodeHash(ctx context.Context, userCodeHash string) (DeviceAuthorization, error)
-	GetPendingDeviceAuthorizationByUserCodeHashForUpdate(ctx context.Context, userCodeHash string) (DeviceAuthorization, error)
-	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (GetRefreshTokenByHashRow, error)
 	GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (ServerPool, error)
 	GetServerVMByTenant(ctx context.Context, tenantID string) (ServerVm, error)
 	GetTenant(ctx context.Context, id string) (Tenant, error)
@@ -119,9 +111,6 @@ type Querier interface {
 	// (zero rows) when the allocation is not revoked yet or already purged.
 	MarkAllocationPurged(ctx context.Context, id pgtype.UUID) (DiskAllocation, error)
 	MarkAnonymousAllocationDeleted(ctx context.Context, id pgtype.UUID) (DiskAllocation, error)
-	MarkDeviceAuthorizationExchanged(ctx context.Context, id pgtype.UUID) error
-	MarkDeviceAuthorizationExpired(ctx context.Context, id pgtype.UUID) error
-	MarkRefreshTokenRotated(ctx context.Context, id pgtype.UUID) error
 	MarkServerVMProvisioned(ctx context.Context, arg MarkServerVMProvisionedParams) (ServerVm, error)
 	PickBestAvailableServer(ctx context.Context, freeBytes int64) (ServerPool, error)
 	// Re-home an agent's live allocation to a new billing owner (the orlop side of
@@ -148,8 +137,6 @@ type Querier interface {
 	RevokeAPIToken(ctx context.Context, arg RevokeAPITokenParams) error
 	RevokeAccessToken(ctx context.Context, tokenHash string) error
 	RevokeAllocation(ctx context.Context, arg RevokeAllocationParams) (DiskAllocation, error)
-	RevokeRefreshToken(ctx context.Context, tokenHash string) error
-	RevokeRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error
 	// Sets a user's aggregate quota. Used to provision the shared control-plane system
 	// user with a high ceiling so per-agent caps are governed by each allocation's size.
 	SetUserQuota(ctx context.Context, arg SetUserQuotaParams) error
@@ -157,7 +144,6 @@ type Querier interface {
 	SuspendTenant(ctx context.Context, id string) error
 	SuspendUser(ctx context.Context, id pgtype.UUID) error
 	TouchAPITokenLastUsed(ctx context.Context, id pgtype.UUID) error
-	TouchDeviceAuthorizationPoll(ctx context.Context, arg TouchDeviceAuthorizationPollParams) error
 	UnsuspendUser(ctx context.Context, id pgtype.UUID) error
 	// Raise (or lower) an allocation's hard size cap in place, preserving its id so the
 	// control-plane's stored disk handle stays valid. Used by the entity disk PATCH path
