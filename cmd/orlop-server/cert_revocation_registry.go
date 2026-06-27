@@ -34,9 +34,9 @@ func newCertRevocationRegistry() *certRevocationRegistry {
 }
 
 // Add records a revoked serial with the cert's expiry (its prune horizon).
-// Idempotent; also opportunistically prunes already-expired entries so the map
-// stays bounded without a separate ticker (Add is driven by the control-plane
-// reconcile push).
+// Idempotent. Aged-out entries are reclaimed once per push batch via Prune
+// (called by the push handler), not per Add, so merging a full reconcile
+// snapshot stays O(n) rather than O(n²).
 func (r *certRevocationRegistry) Add(serial string, expiresAt time.Time) {
 	serial = normalizeSerial(serial)
 	if serial == "" {
@@ -44,7 +44,6 @@ func (r *certRevocationRegistry) Add(serial string, expiresAt time.Time) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.pruneLocked()
 	r.serials[serial] = expiresAt
 }
 

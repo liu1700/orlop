@@ -40,7 +40,7 @@ func TestLoadConfigReadsEnv(t *testing.T) {
 	t.Setenv("PORT", "9090")
 	t.Setenv("DATABASE_URL", "postgres://example")
 
-	cfg := loadConfig()
+	cfg := mustLoadConfig(t)
 
 	if cfg.Addr != ":9090" {
 		t.Fatalf("addr = %q, want :9090", cfg.Addr)
@@ -52,14 +52,48 @@ func TestLoadConfigReadsEnv(t *testing.T) {
 
 func TestLoadConfigInitialGrant(t *testing.T) {
 	// Default when unset.
-	if cfg := loadConfig(); cfg.InitialGrantBytes != agentDiskInitialGrantBytes {
+	if cfg := mustLoadConfig(t); cfg.InitialGrantBytes != agentDiskInitialGrantBytes {
 		t.Errorf("default initial grant = %d, want %d", cfg.InitialGrantBytes, int64(agentDiskInitialGrantBytes))
 	}
 	// Override parses.
 	t.Setenv("ORLOP_INITIAL_GRANT_BYTES", "2147483648") // 2 GiB
-	if cfg := loadConfig(); cfg.InitialGrantBytes != 2<<30 {
+	if cfg := mustLoadConfig(t); cfg.InitialGrantBytes != 2<<30 {
 		t.Errorf("initial grant = %d, want %d", cfg.InitialGrantBytes, int64(2<<30))
 	}
+}
+
+// TestParseBoolEnvRejectsTypos covers the security-review fix: a set-but-
+// unrecognized boolean is an error (fail boot), not a silent fallback that
+// would leave a security toggle in its permissive default.
+func TestParseBoolEnvRejectsTypos(t *testing.T) {
+	const key = "ORLOP_TEST_BOOL"
+
+	t.Setenv(key, "")
+	if v, err := parseBoolEnv(key, true); err != nil || v != true {
+		t.Fatalf("unset: got (%v, %v), want (true, nil)", v, err)
+	}
+	for _, s := range []string{"false", "0", "no", "OFF"} {
+		t.Setenv(key, s)
+		if v, err := parseBoolEnv(key, true); err != nil || v != false {
+			t.Fatalf("%q: got (%v, %v), want (false, nil)", s, v, err)
+		}
+	}
+	for _, s := range []string{"fals", "tru", "nope", "2"} {
+		t.Setenv(key, s)
+		if _, err := parseBoolEnv(key, true); err == nil {
+			t.Fatalf("%q: expected an error, got nil", s)
+		}
+	}
+}
+
+// mustLoadConfig loads config and fails the test on a config error.
+func mustLoadConfig(t *testing.T) config {
+	t.Helper()
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	return cfg
 }
 
 func TestRunShutsDownWhenContextIsCanceled(t *testing.T) {
@@ -75,7 +109,7 @@ func TestRunShutsDownWhenContextIsCanceled(t *testing.T) {
 func TestDefaultPort(t *testing.T) {
 	t.Setenv("PORT", "")
 
-	cfg := loadConfig()
+	cfg := mustLoadConfig(t)
 
 	if cfg.Addr != ":8080" {
 		t.Fatalf("addr = %q, want :8080", cfg.Addr)

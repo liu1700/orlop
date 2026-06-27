@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -154,8 +155,18 @@ func TestJWTVerifyRejectsBadSignature(t *testing.T) {
 	ed25519Pub, ed25519Priv, _ := ed25519.GenerateKey(rand.Reader)
 	v := newVerifier(t, ed25519Pub)
 	tok := signJWT(t, "EdDSA", ed25519Priv, baseClaims())
-	// Flip a byte in the signature segment.
-	tok = tok[:len(tok)-2] + "AA"
+	// Corrupt a byte near the START of the signature segment. Flipping the
+	// trailing base64 chars is unreliable — the final char carries only ~2
+	// significant bits, so an Ed25519 signature can survive the change and the
+	// token still verifies; mutating the first sig char always alters byte 0.
+	b := []byte(tok)
+	sigStart := strings.LastIndexByte(tok, '.') + 1
+	if b[sigStart] == 'A' {
+		b[sigStart] = 'B'
+	} else {
+		b[sigStart] = 'A'
+	}
+	tok = string(b)
 	if _, err := v.Verify(context.Background(), AuthInfo{Bearer: tok}); !errors.Is(err, ErrBadSignature) && !errors.Is(err, ErrMalformedToken) {
 		t.Fatalf("err = %v, want bad signature/malformed", err)
 	}
