@@ -73,8 +73,8 @@ Honest gaps a deployment should account for:
 
 - **Rate limiters are per-process and in-memory.** They reset on restart and are
   not shared across replicas. Running more than one control-plane replica, or a
-  crash loop, weakens every rate-limit-dependent control (device-code, enroll).
-  Multi-replica deployments would need a shared rate-limit store.
+  crash loop, weakens the per-`Authorization` enroll rate limit. Multi-replica
+  deployments would need a shared rate-limit store.
 - **Disk accounting when quota enforcement is off.** There is no in-process
   per-tenant byte accountant; the per-tenant cap depends entirely on the
   filesystem/JuiceFS quota (see "what the operator must do").
@@ -85,8 +85,6 @@ Honest gaps a deployment should account for:
   fail-closed, is the gate that rejects a leaked intermediate key minting
   another tenant's SAN; the control plane must still guard intermediate keys
   carefully.
-- **Device user_code entropy.** The device-flow user code is short; approval
-  requires an authenticated admin session.
 
 ## Reporting a vulnerability
 

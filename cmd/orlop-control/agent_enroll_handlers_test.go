@@ -94,7 +94,7 @@ func TestAgentEnrollReturnsAllocation(t *testing.T) {
 	token := "allocation-token"
 	if _, err := q.CreateAccessToken(context.Background(), sqlcdb.CreateAccessTokenParams{
 		TokenHash:    sha256Hex(token),
-		Purpose:      devauth.PurposeDevice,
+		Purpose:      devauth.PurposeAgentEnroll,
 		UserID:       userID,
 		TenantID:     "acme",
 		ExpiresAt:    pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
@@ -169,34 +169,6 @@ func TestAgentEnrollTokenSingleUse(t *testing.T) {
 	}
 	if !row.ConsumedAt.Valid {
 		t.Fatal("expected consumed_at to be set after first enroll")
-	}
-}
-
-// TestAgentEnrollDeviceTokenMultiUse guards the other side of issue #6: a
-// device-flow access token is a multi-use session, so enrolling with it must
-// NOT consume it. Only PurposeAgentEnroll tokens are single-use.
-func TestAgentEnrollDeviceTokenMultiUse(t *testing.T) {
-	pool := httpOpenTestPool(t)
-	q := sqlcdb.New(pool)
-	token, _ := seedEnrollTenant(t, q, "acme", "active", false) // PurposeDevice token
-	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), nil)
-
-	for i := 1; i <= 2; i++ {
-		resp := postEnroll(t, srv.URL, token)
-		if resp.StatusCode != http.StatusOK {
-			b, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			t.Fatalf("device-token enroll #%d status = %d, want 200; body = %s", i, resp.StatusCode, b)
-		}
-		resp.Body.Close()
-	}
-
-	row, err := q.GetAccessTokenByHash(context.Background(), sha256Hex(token))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if row.ConsumedAt.Valid {
-		t.Fatal("device-flow token must not be consumed by /agent/enroll")
 	}
 }
 
@@ -314,13 +286,19 @@ func TestAgentEnrollReturns503WhenServerVMInactive(t *testing.T) {
 func TestAgentEnrollRateLimit(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	q := sqlcdb.New(pool)
-	token, _ := seedEnrollTenant(t, q, "acme", "active", false)
+	// A "provisioning" server makes the first enroll return 503 *before* the
+	// single-use enroll token is consumed (consumption only happens after a
+	// successful mint), so the same token can drive a second request. The rate
+	// limiter is checked at the top of the handler and consumes its only bucket
+	// token on the first request regardless of outcome, so the second request
+	// trips the limiter.
+	token, _ := seedEnrollTenant(t, q, "acme", "provisioning", false)
 	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), newAgentEnrollLimiter(1, time.Hour))
 
 	resp := postEnroll(t, srv.URL, token)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("first status = %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d, want 503", resp.StatusCode)
 	}
 	resp = postEnroll(t, srv.URL, token)
 	defer resp.Body.Close()
@@ -382,7 +360,7 @@ func seedEnrollTenant(t *testing.T, q *sqlcdb.Queries, tenantID, serverStatus st
 	token := "test-token-" + tenantID
 	if _, err := q.CreateAccessToken(ctx, sqlcdb.CreateAccessTokenParams{
 		TokenHash:    sha256Hex(token),
-		Purpose:      devauth.PurposeDevice,
+		Purpose:      devauth.PurposeAgentEnroll,
 		UserID:       user.ID,
 		TenantID:     tenantID,
 		ExpiresAt:    pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
@@ -569,7 +547,7 @@ func TestEnrollPlacesTenantWhenServerVMMissing(t *testing.T) {
 	token := "place-token"
 	if _, err := q.CreateAccessToken(ctx, sqlcdb.CreateAccessTokenParams{
 		TokenHash:    sha256Hex(token),
-		Purpose:      devauth.PurposeDevice,
+		Purpose:      devauth.PurposeAgentEnroll,
 		UserID:       user.ID,
 		TenantID:     tenantID,
 		ExpiresAt:    pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},

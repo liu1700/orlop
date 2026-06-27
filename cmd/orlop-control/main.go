@@ -462,7 +462,7 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	router.Get("/healthz", healthz)
 
 	if deps.devAuth != nil {
-		mountDeviceFlow(router, newDevAuthHandlers(logger, deps.devAuth, deps.allocations, deps.cookieDomain))
+		mountAdminSession(router, newDevAuthHandlers(logger, deps.devAuth, deps.cookieDomain))
 	}
 	if deps.devAuth != nil && deps.store != nil && deps.allocations != nil {
 		mountDashboard(router, newDashboardHandlers(logger, deps.devAuth, deps.store, deps.allocations, deps.serverUsage, deps.mountLeaseFencer))

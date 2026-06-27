@@ -43,8 +43,9 @@ across sessions, machines, and agent runtimes.\n\n\
 Prefer `{mp}` over `/tmp` or `~/` for any output worth keeping — notes,\n\
 memories, drafts, datasets, or artifacts another agent or teammate will\n\
 read later. Skip for scratch work or files inside this repo.\n\n\
-If a orlop command fails with `needs_login`, ask the user to run\n\
-`orlop login` in their terminal.\n\
+If an orlop command fails with an authentication error, ask the host to\n\
+re-enroll this agent (mint a fresh enroll token and re-run\n\
+`orlop mount --from-env`).\n\
 {end}\n",
         begin = BEGIN_MARKER,
         end = END_MARKER,

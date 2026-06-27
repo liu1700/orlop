@@ -3,7 +3,7 @@
   <img alt="orlop" src="brand/orlop-wordmark-light.svg" width="220">
 </picture>
 
-**Give each untrusted agent its own durable POSIX disk, without ever handing it your storage credentials.**
+**Durable POSIX disks for untrusted agents, with identity.**
 
 [![Go CI](https://github.com/liu1700/orlop/actions/workflows/go.yml/badge.svg)](https://github.com/liu1700/orlop/actions/workflows/go.yml)
 [![Rust CI](https://github.com/liu1700/orlop/actions/workflows/orlop-cli.yml/badge.svg)](https://github.com/liu1700/orlop/actions/workflows/orlop-cli.yml)

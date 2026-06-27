@@ -215,12 +215,12 @@ fn enroll_persists_cert_files_on_200() {
 }
 
 #[test]
-fn enroll_unauthorized_says_run_orlop_login() {
+fn enroll_unauthorized_says_re_enroll() {
     let srv = start(Behaviour::Unauthorized);
     let dir = Tmp::new();
     let err = enroll::enroll(&creds(&srv.addr), &dir.0).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("orlop login"), "msg: {msg}");
+    assert!(msg.contains("re-enroll"), "msg: {msg}");
     assert!(!dir.0.join("cert.pem").exists());
 }
 

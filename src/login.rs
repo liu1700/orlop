@@ -1,14 +1,18 @@
-//! `orlop login` device-flow client.
+//! Credential storage and token management for the hosted mount paths.
 //!
-//! Drives the first-party device-code flow against the control plane (see
-//! `cmd/orlop-control/devauth_handlers.go`) and persists the resulting bearer
-//! and refresh token to `~/.config/orlop/credentials.json` with mode `0600`.
+//! Persists the control-plane URL plus an agent's bearer / refresh token to
+//! `~/.config/orlop/credentials.json` with mode `0600`, and exposes
+//! [`TokenManager`], which hands out a fresh access token to the enroll path
+//! (`/agent/enroll`) — refreshing it against `/auth/token/refresh` when it is
+//! close to expiry. There is no interactive login: credentials are minted out
+//! of band (an enroll token via `orlop mount --from-env`, or a refresh-token
+//! exchange) and dropped here for the mount engine to consume.
 
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
@@ -70,23 +74,28 @@ pub fn credentials_path() -> anyhow::Result<PathBuf> {
     Ok(util::home_dir()?.join(".config/orlop/credentials.json"))
 }
 
-/// Load the credentials file, bailing with the canonical "run `orlop login`"
-/// hint if it's missing. Returns the path alongside so callers that need to
-/// pass it back to `TokenManager::new` don't have to recompute it.
+/// Load the credentials file, bailing with a re-enroll hint if it's missing.
+/// Returns the path alongside so callers that need to pass it back to
+/// `TokenManager::new` don't have to recompute it.
 pub fn require_credentials() -> anyhow::Result<(PathBuf, Credentials)> {
     let path = credentials_path()?;
-    let creds = load(&path)?
-        .ok_or_else(|| anyhow!("no credentials at {} — run `orlop login`", path.display()))?;
+    let creds = load(&path)?.ok_or_else(|| {
+        anyhow!(
+            "no credentials at {} — the host must re-enroll the agent \
+             (mint a fresh enroll token and re-run `orlop mount --from-env`)",
+            path.display()
+        )
+    })?;
     Ok((path, creds))
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Option<Credentials>> {
     match fs::read(path) {
         Ok(bytes) => {
-            // Treat an empty file the same as a missing one. `orlop login
-            // --credentials <path>` is commonly driven with `mktemp`, which
-            // returns a fresh 0-byte file; a strict parse would error out
-            // before save_creds could populate it.
+            // Treat an empty file the same as a missing one. A `--credentials
+            // <path>` override is commonly driven with `mktemp`, which returns
+            // a fresh 0-byte file; a strict parse would error out before the
+            // mount path could populate it.
             if bytes.is_empty() {
                 return Ok(None);
             }
@@ -155,123 +164,6 @@ fn tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Format a one-line status of `creds` against `now`, suitable for `--check`.
-pub fn check_status(creds: Option<&Credentials>, now: DateTime<Utc>) -> String {
-    match creds {
-        None => "no credentials found".to_string(),
-        Some(c) if c.refresh_expires_at <= now => format!(
-            "refresh expired at {} (control plane {})",
-            c.refresh_expires_at.to_rfc3339(),
-            c.control_plane_url
-        ),
-        Some(c) if c.access_expires_at <= now => format!(
-            "expired at {} (control plane {})",
-            c.access_expires_at.to_rfc3339(),
-            c.control_plane_url
-        ),
-        Some(c) => format!(
-            "valid until {} (control plane {})",
-            c.access_expires_at.to_rfc3339(),
-            c.control_plane_url
-        ),
-    }
-}
-
-/// In-progress device-code flow, persisted to disk so the prompt-and-poll
-/// halves of login can be split across separate process invocations. Used
-/// by agent runtimes that kill long-running commands (e.g. Hermes' 30 s
-/// bash timeout): `orlop login --start` writes this, prints the URL and
-/// code, exits 0 immediately; `orlop login --resume` reads it and polls.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DevicePending {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    pub interval_secs: u64,
-    pub expires_at: DateTime<Utc>,
-    pub control_plane_url: String,
-}
-
-/// Default sibling of `credentials.json` — `device.pending.json` next to
-/// where the credentials would land. Same parent dir, same chmod policy.
-pub fn device_pending_path_for(creds_path: &Path) -> PathBuf {
-    creds_path.with_file_name("device.pending.json")
-}
-
-pub fn load_pending(path: &Path) -> anyhow::Result<Option<DevicePending>> {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let p: DevicePending = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse pending login at {}", path.display()))?;
-            Ok(Some(p))
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err)
-            .with_context(|| format!("read pending login at {}", path.display())),
-    }
-}
-
-pub fn save_pending(path: &Path, p: &DevicePending) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        tighten_parent_perms(parent)?;
-    }
-    let body = serde_json::to_vec_pretty(p).context("serialize pending login")?;
-    let tmp = tmp_path(path);
-    {
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("open {}", tmp.display()))?;
-        f.write_all(&body)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
-pub fn clear_pending(path: &Path) -> anyhow::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err)
-            .with_context(|| format!("remove pending login at {}", path.display())),
-    }
-}
-
-/// Like [`load_pending`] but treats an already-expired pending as absent
-/// and unlinks the stale file. Without this, `orlop login --resume` could
-/// find a leftover pending from a previous session (whose `--resume`
-/// either errored after `save_creds` and skipped its `let _ = clear_pending`
-/// or never ran at all), poll the server once, and immediately exit with
-/// "device code expired" — making it look like the 10-minute TTL is only
-/// a few minutes.
-pub fn load_pending_if_unexpired(path: &Path) -> anyhow::Result<Option<DevicePending>> {
-    let Some(pending) = load_pending(path)? else {
-        return Ok(None);
-    };
-    if Utc::now() >= pending.expires_at {
-        let _ = clear_pending(path);
-        return Ok(None);
-    }
-    Ok(Some(pending))
-}
-
-#[derive(Deserialize)]
-struct DeviceCodeResp {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    expires_in: i64,
-    interval: u64,
-}
-
 #[derive(Deserialize)]
 struct TokenOk {
     access_token: String,
@@ -298,148 +190,6 @@ struct OAuthErr {
     error_description: Option<String>,
 }
 
-/// POST `/auth/device/code` and return the pending state. Prints the
-/// verification URL + user code to `stderr` so the caller can show them
-/// to the user. Exits in milliseconds — safe to call from agent contexts
-/// with short tool timeouts.
-pub fn start_device_flow(
-    control_plane_url: &str,
-    stderr: &mut dyn Write,
-) -> anyhow::Result<DevicePending> {
-    let base = control_plane_url.trim_end_matches('/').to_string();
-    let client = util::http_client(Duration::from_secs(30))?;
-    let dc: DeviceCodeResp = {
-        let resp = client
-            .post(format!("{base}/auth/device/code"))
-            .header("Content-Type", "application/json")
-            .body("{}")
-            .send()
-            .with_context(|| format!("POST {base}/auth/device/code"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
-            bail!("device code request failed: {status} {body}");
-        }
-        resp.json().context("decode /auth/device/code response")?
-    };
-    writeln!(stderr, "To authorize, visit: {}", dc.verification_uri)?;
-    writeln!(stderr, "Enter code: {}", dc.user_code)?;
-    stderr.flush().ok();
-    Ok(DevicePending {
-        device_code: dc.device_code,
-        user_code: dc.user_code,
-        verification_uri: dc.verification_uri,
-        interval_secs: dc.interval.max(1),
-        expires_at: Utc::now() + chrono::Duration::seconds(dc.expires_in.max(0)),
-        control_plane_url: base,
-    })
-}
-
-pub enum ResumeOutcome {
-    Approved(Credentials),
-    StillPending,
-    Expired,
-}
-
-/// Poll `/auth/device/token` for at most `budget` wall-clock time. Returns
-/// `Approved(creds)` on success, `StillPending` if `budget` elapsed before
-/// the user approved, `Expired` if the device code's TTL ran out.
-///
-/// The bounded budget lets agent runtimes call this repeatedly without
-/// any single invocation tripping a tool timeout — caller checks the
-/// returned variant and decides whether to retry.
-pub fn resume_device_flow(
-    pending: &DevicePending,
-    budget: Duration,
-) -> anyhow::Result<ResumeOutcome> {
-    let base = pending.control_plane_url.trim_end_matches('/').to_string();
-    let client = util::http_client(Duration::from_secs(30))?;
-    let mut interval = Duration::from_secs(pending.interval_secs.max(1));
-    let resume_started = Instant::now();
-    loop {
-        if Utc::now() >= pending.expires_at {
-            return Ok(ResumeOutcome::Expired);
-        }
-        let elapsed = resume_started.elapsed();
-        if elapsed >= budget {
-            return Ok(ResumeOutcome::StillPending);
-        }
-        // Bound the sleep so we never overshoot the budget.
-        std::thread::sleep(interval.min(budget - elapsed));
-        if Utc::now() >= pending.expires_at {
-            return Ok(ResumeOutcome::Expired);
-        }
-        if resume_started.elapsed() >= budget {
-            return Ok(ResumeOutcome::StillPending);
-        }
-        let resp = client
-            .post(format!("{base}/auth/device/token"))
-            .json(&serde_json::json!({
-                "device_code": pending.device_code,
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            }))
-            .send()
-            .with_context(|| format!("POST {base}/auth/device/token"))?;
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        if status.is_success() {
-            let tr: TokenOk = serde_json::from_str(&body).context("decode token response")?;
-            let access_expires_at = tr
-                .access_expires_at
-                .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(tr.expires_in));
-            return Ok(ResumeOutcome::Approved(Credentials {
-                access_token: tr.access_token,
-                access_expires_at,
-                refresh_token: tr.refresh_token,
-                refresh_expires_at: tr.refresh_expires_at,
-                control_plane_url: tr.control_plane_url.unwrap_or_else(|| base.clone()),
-                user_id: tr.user_id,
-                allocation_id: tr.allocation_id,
-                size_bytes: tr.size_bytes,
-                server_addr: None,
-            }));
-        }
-        let err: OAuthErr = serde_json::from_str(&body).unwrap_or(OAuthErr {
-            error: format!("http_{}", status.as_u16()),
-            error_description: Some(body.clone()),
-        });
-        match err.error.as_str() {
-            "authorization_pending" => continue,
-            "slow_down" => {
-                interval += Duration::from_secs(5);
-                continue;
-            }
-            "expired_token" => return Ok(ResumeOutcome::Expired),
-            "access_denied" => bail!("approval denied"),
-            other => bail!(
-                "token poll failed: {other} ({})",
-                err.error_description.unwrap_or_default()
-            ),
-        }
-    }
-}
-
-/// Drive the device-code flow against `control_plane_url` end-to-end and
-/// return the resulting credentials. Convenience wrapper for the classic
-/// blocking flow — agents needing short-budget polling should use
-/// [`start_device_flow`] + [`resume_device_flow`] directly.
-pub fn run_device_flow(
-    control_plane_url: &str,
-    stderr: &mut dyn Write,
-) -> anyhow::Result<Credentials> {
-    let pending = start_device_flow(control_plane_url, stderr)?;
-    let remaining = (pending.expires_at - Utc::now()).num_seconds().max(0);
-    writeln!(stderr, "Waiting for approval (expires in {remaining}s)...")?;
-    stderr.flush().ok();
-    // One bounded poll loop with the full TTL as budget. Any
-    // StillPending here is unreachable because budget == TTL.
-    match resume_device_flow(&pending, Duration::from_secs(remaining as u64))? {
-        ResumeOutcome::Approved(c) => Ok(c),
-        ResumeOutcome::StillPending => bail!("device code expired before approval"),
-        ResumeOutcome::Expired => bail!("device code expired before approval"),
-    }
-}
-
 pub struct TokenManager {
     path: PathBuf,
     creds: Credentials,
@@ -449,8 +199,12 @@ pub struct TokenManager {
 
 impl TokenManager {
     pub fn load(path: PathBuf) -> anyhow::Result<Self> {
-        let creds =
-            load(&path)?.ok_or_else(|| anyhow!("no credentials found; run `orlop login`"))?;
+        let creds = load(&path)?.ok_or_else(|| {
+            anyhow!(
+                "no credentials found; the host must re-enroll the agent \
+                 (mint a fresh enroll token and re-run `orlop mount --from-env`)"
+            )
+        })?;
         Ok(Self::new(path, creds))
     }
 
@@ -480,7 +234,9 @@ impl TokenManager {
     fn refresh(&mut self) -> anyhow::Result<String> {
         if self.creds.refresh_expires_at <= Utc::now() {
             bail!(
-                "refresh token expired locally at {}; run `orlop login` again",
+                "refresh token expired locally at {}; the host must re-enroll \
+                 the agent (mint a fresh enroll token and re-run \
+                 `orlop mount --from-env`)",
                 self.creds.refresh_expires_at.to_rfc3339()
             );
         }
@@ -500,7 +256,9 @@ impl TokenManager {
             });
             let detail = err.error_description.as_deref().unwrap_or("no detail");
             bail!(
-                "control plane rejected refresh: {} {} ({}); run `orlop login` again",
+                "control plane rejected refresh: {} {} ({}); the host must \
+                 re-enroll the agent (mint a fresh enroll token and re-run \
+                 `orlop mount --from-env`)",
                 status.as_u16(),
                 err.error,
                 detail
@@ -612,9 +370,9 @@ mod tests {
 
     #[test]
     fn load_empty_file_returns_none() {
-        // `orlop login --credentials $(mktemp)` lands here: mktemp creates a
-        // 0-byte file that we must treat as "no credentials yet" so save_creds
-        // can populate it.
+        // A `--credentials $(mktemp)` override lands here: mktemp creates a
+        // 0-byte file that we must treat as "no credentials yet" so the mount
+        // path can populate it.
         let dir = Tmp::new();
         let path = dir.path().join("empty.json");
         fs::write(&path, b"").unwrap();
@@ -722,39 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn check_status_reports_no_creds() {
-        assert_eq!(check_status(None, Utc::now()), "no credentials found");
-    }
-
-    #[test]
-    fn check_status_reports_valid() {
-        let now = Utc::now();
-        let c = sample(now);
-        let s = check_status(Some(&c), now);
-        assert!(s.starts_with("valid until "), "got {s}");
-        assert!(s.contains("https://control.example"), "got {s}");
-    }
-
-    #[test]
-    fn check_status_reports_expired() {
-        let now = Utc::now();
-        let mut c = sample(now);
-        c.access_expires_at = now - chrono::Duration::seconds(1);
-        let s = check_status(Some(&c), now);
-        assert!(s.starts_with("expired at "), "got {s}");
-    }
-
-    #[test]
-    fn check_status_reports_refresh_expired() {
-        let now = Utc::now();
-        let mut c = sample(now);
-        c.access_expires_at = now - chrono::Duration::seconds(1);
-        c.refresh_expires_at = now - chrono::Duration::seconds(1);
-        let s = check_status(Some(&c), now);
-        assert!(s.starts_with("refresh expired at "), "got {s}");
-    }
-
-    #[test]
     fn token_manager_reuses_fresh_access_token() {
         let dir = Tmp::new();
         let path = dir.path().join("creds.json");
@@ -855,7 +580,7 @@ mod tests {
         assert!(msg.contains("401"), "got: {msg}");
         assert!(msg.contains("invalid_token"), "got: {msg}");
         assert!(msg.contains("token revoked"), "got: {msg}");
-        assert!(msg.contains("run `orlop login`"), "got: {msg}");
+        assert!(msg.contains("re-enroll"), "got: {msg}");
         join.join().unwrap();
     }
 
@@ -872,7 +597,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("403"), "got: {msg}");
         assert!(msg.contains("access_denied"), "got: {msg}");
-        assert!(msg.contains("run `orlop login`"), "got: {msg}");
+        assert!(msg.contains("re-enroll"), "got: {msg}");
         join.join().unwrap();
     }
 
@@ -894,45 +619,6 @@ mod tests {
         let err = mgr.access_token().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("refresh token expired locally"), "got: {msg}");
-        assert!(msg.contains("run `orlop login`"), "got: {msg}");
-    }
-
-    fn pending_at(expires_at: DateTime<Utc>) -> DevicePending {
-        DevicePending {
-            device_code: "dc_xyz".into(),
-            user_code: "ORL-XYZ".into(),
-            verification_uri: "https://control.example/device".into(),
-            interval_secs: 5,
-            expires_at,
-            control_plane_url: "https://control.example".into(),
-        }
-    }
-
-    #[test]
-    fn load_pending_if_unexpired_returns_fresh() {
-        let dir = Tmp::new();
-        let path = dir.path().join("device.pending.json");
-        save_pending(&path, &pending_at(Utc::now() + chrono::Duration::minutes(5))).unwrap();
-        assert!(load_pending_if_unexpired(&path).unwrap().is_some());
-        assert!(path.exists(), "fresh pending must not be deleted");
-    }
-
-    #[test]
-    fn load_pending_if_unexpired_drops_stale() {
-        let dir = Tmp::new();
-        let path = dir.path().join("device.pending.json");
-        save_pending(&path, &pending_at(Utc::now() - chrono::Duration::seconds(1))).unwrap();
-        assert!(
-            load_pending_if_unexpired(&path).unwrap().is_none(),
-            "stale pending should read as absent"
-        );
-        assert!(!path.exists(), "stale pending file should be removed");
-    }
-
-    #[test]
-    fn load_pending_if_unexpired_missing_returns_none() {
-        let dir = Tmp::new();
-        let path = dir.path().join("missing.json");
-        assert!(load_pending_if_unexpired(&path).unwrap().is_none());
+        assert!(msg.contains("re-enroll"), "got: {msg}");
     }
 }

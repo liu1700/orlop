@@ -72,8 +72,7 @@ this document is only about the host → control-plane integration point.
 2. The host IdP signs a short-lived JWT carrying `aud=orlop`, a tenant claim,
    and an `exp`.
 3. The token is presented to orlop-control as a bearer token. Today the verifier
-   is wired to `GET /v1/whoami`; enrollment is gated by an enroll token or a
-   device-flow access token.
+   is wired to `GET /v1/whoami`; enrollment is gated by a single-use enroll token.
 4. orlop-control checks the signature against the configured public key, checks
    `iss`/`aud`/`exp`, and maps the tenant claim onto the tenant subject, but only
    if that claim value is on the operator allowlist.

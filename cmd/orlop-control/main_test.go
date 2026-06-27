@@ -121,17 +121,3 @@ func TestShutdownTimeoutIsBounded(t *testing.T) {
 		t.Fatalf("shutdown timeout = %s, want <= 30s", shutdownTimeout)
 	}
 }
-
-func TestDeviceFlowRoutesNotMountedWithoutDB(t *testing.T) {
-	server := httptest.NewServer(newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{}, config{}))
-	defer server.Close()
-
-	resp, err := http.Post(server.URL+"/auth/device/code", "application/json", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 404/405 without DB, got %d", resp.StatusCode)
-	}
-}

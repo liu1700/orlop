@@ -1,8 +1,8 @@
 # Control plane API
 
 The hosted control plane (`cmd/orlop-control`, a single Go binary that is both
-the service and a CLI) handles human authentication, short-lived bearer
-credentials, agent enrollment, per-tenant CA signing, and disk placement. The data plane is
+the service and a CLI) handles agent enrollment, short-lived bearer credentials,
+per-tenant CA signing, disk placement, and admin sessions for the dashboard. The data plane is
 the per-tenant `orlop-server`; once an agent is enrolled it reads and writes its
 files directly against that server over mTLS, keeping the control plane out of
 the data path.
@@ -30,9 +30,9 @@ table names the one it requires.
 
 | Credential | How it is sent | Where it comes from |
 | --- | --- | --- |
-| Device access token / API token | `Authorization: Bearer <token>` | device-flow poll, or an `orlop_…` token from `POST /v1/tokens` |
+| API token | `Authorization: Bearer <orlop_…>` | `POST /v1/tokens` |
 | Enroll token | `Authorization: Bearer <token>` | `orlop-control token issue` / `POST /v1/agents/{id}/enroll-token` (single-use) |
-| Admin session cookie | `HttpOnly` cookie set at `/device?session=…` | `orlop-control user seed` |
+| Admin session cookie | `HttpOnly` cookie set at `/admin/session?token=…` | `orlop-control user seed` |
 | Service token | `Authorization: Bearer $ORLOP_CONTROL_PLANE_TOKEN` | shared static token, set by the operator |
 | Host JWT | `Authorization: Bearer <jwt>` | a host-issued, signed JWT (see [`design-identity.md`](./design-identity.md)) |
 | Agent identity | client mTLS cert, or an `agent_fingerprint` body field | the leaf minted at enrollment |
@@ -43,8 +43,7 @@ trailing whitespace.
 ### Request and response format
 
 Request bodies, where present, are JSON (`Content-Type: application/json`).
-Successful responses are JSON with `Content-Type: application/json`. The
-device-approval pages under `/device` are the only HTML surface.
+Successful responses are JSON with `Content-Type: application/json`.
 
 ### Status codes
 
@@ -52,14 +51,14 @@ device-approval pages under `/device` are the only HTML surface.
 | --- | --- |
 | `200 OK` | success, JSON body |
 | `204 No Content` | success, no body (`POST /auth/logout`) |
-| `400 Bad Request` | malformed request, or a device-flow poll that is still pending (`authorization_pending`, `slow_down`, `expired_token`) |
+| `400 Bad Request` | malformed request |
 | `401 Unauthorized` | missing/invalid/expired credential (`invalid_token`, `invalid_client`) |
 | `403 Forbidden` | authenticated but not allowed (`access_denied`: suspended tenant/user, tenant not allowed, missing agent scope) |
-| `404 Not Found` | unknown resource / `user_code` |
-| `409 Conflict` | device `user_code` already approved or denied |
-| `410 Gone` | revoked allocation, or expired `user_code` |
+| `404 Not Found` | unknown resource |
+| `409 Conflict` | mount or capacity conflict (`wrong_agent`, `already_mounted`, `insufficient_capacity`) |
+| `410 Gone` | revoked allocation or lost lease (`revoked`, `lease_lost`) |
 | `422 Unprocessable Entity` | `quota_exceeded` |
-| `429 Too Many Requests` | rate limited (`slow_down`, `rate_limited`) |
+| `429 Too Many Requests` | rate limited (`rate_limited`) |
 | `503 Service Unavailable` | transient; retry. `POST /agent/enroll` adds `Retry-After: 60` when CA material or server placement is not yet ready |
 | `500 Internal Server Error` | `server_error` |
 
@@ -76,8 +75,8 @@ Errors use an OAuth-style body. `error_description` is omitted when empty.
 The set of mounted routes depends on configuration:
 
 - `GET /healthz` is always mounted.
-- The device-flow, dashboard, API-token, `/v1/entities`, journal, and
-  `/agent/enroll` routes are mounted only when `DATABASE_URL` is set.
+- The dashboard, API-token, `/v1/entities`, journal, and `/agent/enroll` routes
+  are mounted only when `DATABASE_URL` is set.
 - `/agent/enroll`, `POST /control/sign-server-cert`, and the `/v1/tenants` and
   `/v1/admin` service routes additionally need an agent CA configured (a
   filesystem CA at `ORLOP_SECRETS_DIR`, or the in-DB CA via
@@ -88,14 +87,9 @@ The set of mounted routes depends on configuration:
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
 | GET | `/healthz` | public | liveness; returns `{"status":"ok"}` |
-| POST | `/auth/device/code` | public | start a device authorization code request; rate-limited |
-| POST | `/auth/device/token` | public | poll for the access/refresh tokens; rate-limited |
-| POST | `/auth/token/refresh` | bearer (refresh token) | exchange a refresh token for fresh tokens |
+| GET | `/admin/session` | admin session token (`?token=`) | sets the `orlop_admin_session` cookie and redirects to the dashboard |
 | POST | `/auth/logout` | admin session cookie | clears the admin cookie; `204` |
-| GET | `/device` | admin session cookie (or `?session=` token) | HTML approval page |
-| GET | `/device/lookup` | admin session cookie | look up a pending `user_code` |
-| POST | `/device/approve` | admin session cookie | approve or deny a `user_code` |
-| POST | `/agent/enroll` | enroll token or device access token | mint a one-hour agent leaf cert (see below) |
+| POST | `/agent/enroll` | enroll token | mint a one-hour agent leaf cert (see below) |
 | GET | `/v1/whoami` | host JWT | echo the verified tenant/subject (see below) |
 | GET | `/me` | admin session cookie | dashboard: current user |
 | GET | `/allocations` | admin session cookie | dashboard: list the user's disk allocations |
@@ -138,10 +132,9 @@ where revocation propagation happens; it is not a control-plane HTTP route.
 ### `POST /agent/enroll`
 
 Trades a bearer credential for a one-hour agent leaf certificate plus the CA
-chain and the data-plane address to dial. The bearer may be a device-flow access
-token or a single-use enroll token; the agent must already have a provisioned,
-agent-scoped disk allocation (the request is rejected with
-`access_denied / agent_scope_required` otherwise).
+chain and the data-plane address to dial. The bearer is a single-use enroll
+token; the agent must already have a provisioned, agent-scoped disk allocation
+(the request is rejected with `access_denied / agent_scope_required` otherwise).
 
 ```bash
 curl -fsS -X POST https://control.orlop.example/agent/enroll \
@@ -213,7 +206,7 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 | Variable | Meaning |
 | --- | --- |
 | `PORT` | HTTP listen port. Default `8080`. |
-| `DATABASE_URL` | Storage backend. Accepts a `postgres://…` DSN or a `sqlite:…` URL; the scheme selects the backend. Without it, the device-flow, dashboard, `/v1/entities`, journal, and enroll routes are not mounted. See [`database-backends.md`](./database-backends.md). |
+| `DATABASE_URL` | Storage backend. Accepts a `postgres://…` DSN or a `sqlite:…` URL; the scheme selects the backend. Without it, the dashboard, `/v1/entities`, journal, and enroll routes are not mounted. See [`database-backends.md`](./database-backends.md). |
 | `ORLOP_SECRETS_DIR` | Filesystem secrets root holding CA material (the default CA backend). |
 | `ORLOP_SECRETS_BACKEND` | `postgres` keeps the CA (root key + tenant intermediates) in the shared DB instead of on disk; any other value uses the filesystem backend at `ORLOP_SECRETS_DIR`. `/agent/enroll` mounts whenever a CA is configured by *either* backend, so `ORLOP_SECRETS_DIR` is not strictly required. `postgres` requires a Postgres `DATABASE_URL`. |
 | `ORLOP_SECRETS_ENC_KEY` | Hex-encoded 32-byte AES key; encrypts CA values at rest. Recommended with `ORLOP_SECRETS_BACKEND=postgres`. |
@@ -226,7 +219,6 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 | `ORLOP_INITIAL_GRANT_BYTES` | Disk granted at provision when no `quota_bytes` is supplied. Default 1 GiB. |
 | `ORLOP_DATAGW_SERVER_FQDN` | The only name `POST /control/sign-server-cert` will issue a server cert for. Default `orlop-server`. |
 | `ORLOP_DATAGW_SERVER_CERT_TTL` | Validity of a self-provisioned server cert (e.g. `2160h`). Default 90 days. |
-| `ORLOP_DASHBOARD_URL` | When set, used as the base of the device-flow `verification_uri`. |
 | `ORLOP_IDENTITY_AUDIENCE` | Enables the host-issued JWT identity verifier and mounts `GET /v1/whoami`; pins the JWT `aud`. The other `ORLOP_IDENTITY_*` knobs apply only when this is set. |
 | `ORLOP_IDENTITY_PUBLIC_KEY_FILE` | PKIX/SPKI PEM public key the host JWT is verified against (RSA, ECDSA P-256, or Ed25519). Required when the audience is set. |
 | `ORLOP_IDENTITY_ISSUER` | Optional; when set, must equal the JWT `iss`. |

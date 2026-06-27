@@ -130,8 +130,8 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| "<config>".into());
                 anyhow::bail!(
                     "config at {path} is missing the `hosted:` block. \
-                     Run `orlop login` (or `orlop login --force`) to regenerate, \
-                     or hand-edit the file to add `hosted: {{}}` and re-run."
+                     Add `hosted: {{}}` to the file (control_plane_url and \
+                     cert_dir fall back to credentials.json) and re-run."
                 );
             }
             let mountpoint = mountpoint
@@ -529,7 +529,7 @@ fn control_plane_url_for_hosted(
 }
 
 /// Load the credentials at `creds_override` if set, else the default location.
-/// Bails with the canonical "run `orlop login`" hint when the file is missing.
+/// Bails with a re-enroll hint when the file is missing.
 fn require_credentials_with(
     creds_override: Option<&Path>,
 ) -> anyhow::Result<(PathBuf, login::Credentials)> {
@@ -537,8 +537,8 @@ fn require_credentials_with(
         Some(path) => {
             let creds = login::load(path)?.ok_or_else(|| {
                 anyhow!(
-                    "no credentials at {} — run `orlop login --credentials {}`",
-                    path.display(),
+                    "no credentials at {} — the host must re-enroll the agent \
+                     (mint a fresh enroll token and re-run `orlop mount --from-env`)",
                     path.display()
                 )
             })?;
@@ -927,7 +927,10 @@ fn cert_renewal_loop(
                 failure_count = failure_count.saturating_add(1);
                 eprintln!("warning: hosted client certificate renewal failed: {err:#}");
                 if auth_state_invalid(&err) {
-                    eprintln!("hosted session is invalid; run `orlop login` and remount");
+                    eprintln!(
+                        "hosted session is invalid; the host must re-enroll the agent \
+                         (mint a fresh enroll token and re-run `orlop mount --from-env`)"
+                    );
                     return;
                 }
             }
@@ -1066,11 +1069,13 @@ fn jitter_millis(max: u64) -> u64 {
 
 fn auth_state_invalid(err: &anyhow::Error) -> bool {
     // Cases where the cert-renewer loop should give up rather than back off:
-    // every recovery path here is "user must do something" (run orlop login,
-    // contact support for suspension, etc) — retrying behind the scenes will
-    // never succeed.
+    // every recovery path here is "the host must do something" (re-enroll the
+    // agent, contact support for suspension, etc) — retrying behind the scenes
+    // will never succeed. "re-enroll" is the stable marker carried by every
+    // terminal auth failure from the refresh (login.rs) and enroll (enroll.rs)
+    // paths; the remaining substrings catch 403 hints that don't restate it.
     let msg = err.to_string();
-    msg.contains("run `orlop login`")
+    msg.contains("re-enroll")
         || msg.contains("session expired")
         || msg.contains("access denied")
         || msg.contains("allocation was revoked")
@@ -1079,7 +1084,7 @@ fn auth_state_invalid(err: &anyhow::Error) -> bool {
 
 /// Parsed `orlop mount --from-env` inputs. The in-pod mounter is driven
 /// entirely by env (the control plane injects these via the sidecar spec),
-/// so there is no config file and no `orlop login` step: the enroll token
+/// so there is no config file and no separate auth step: the enroll token
 /// IS the identity, traded for a 1h client cert by `/agent/enroll`.
 #[derive(Debug, Clone, PartialEq)]
 struct EnvMountSpec {
@@ -1159,7 +1164,7 @@ fn run_env_mount(no_inject: bool) -> anyhow::Result<()> {
 
     // Persist the enroll token as credentials.json so the standard hosted
     // path (enroll_for_mount -> token_manager_for_hosted -> require_credentials_with)
-    // and the CertManager renewal loop both load it without a `orlop login`.
+    // and the CertManager renewal loop both load it without any separate auth step.
     let creds = login::Credentials::for_enroll(spec.control_plane.clone(), spec.enroll_token);
     let creds_path = cert_dir.join("credentials.json");
     login::save(&creds_path, &creds)
@@ -1173,8 +1178,8 @@ fn run_env_mount(no_inject: bool) -> anyhow::Result<()> {
     );
 
     // Synthesize a hosted Config. control_plane_url + cert_dir come from env;
-    // policy is read-write (the in-pod disk is the workspace, mirroring the
-    // `orlop login` default), and the rest take struct defaults.
+    // policy is read-write (the in-pod disk is the workspace, matching the
+    // default hosted config), and the rest take struct defaults.
     let cfg = Config {
         mountpoint: Some(spec.mount_point.clone()),
         audit_log: default_env_audit_log(&cert_dir),
@@ -1276,7 +1281,10 @@ fn run_mount_payload(
         let tls = enroll::load_identity(&enrolled)
             .with_context(|| format!("load identity from {}", enrolled.cert_dir.display()))?;
         let allocation_id = enrolled.allocation_id.clone().ok_or_else(|| {
-            anyhow!("no allocation_id in enrollment response; run `orlop login` again")
+            anyhow!(
+                "no allocation_id in enrollment response; the host must re-enroll \
+                 the agent (mint a fresh enroll token and re-run `orlop mount --from-env`)"
+            )
         })?;
         // Pre-enrolled hosted mode (Phase 2 anonymous sandbox): the cert
         // was minted directly by control without a row in agent_enrollments,

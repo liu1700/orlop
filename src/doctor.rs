@@ -124,17 +124,17 @@ pub fn gather(inputs: DoctorInputs) -> DoctorReport {
         (Some(p), Some(false)) => Check::warn_fail(
             "config",
             format!("{} has no `hosted:` block", p.display()),
-            "run `orlop login` to regenerate, or add `hosted: {}` by hand",
+            "add `hosted: {}` by hand (control_plane_url and cert_dir fall back to credentials.json)",
         ),
         (Some(p), None) => Check::warn_fail(
             "config",
             format!("{} failed to parse", p.display()),
-            "fix the YAML, or run `orlop login` to regenerate it",
+            "fix the YAML so the file parses",
         ),
         (None, _) => Check::warn_fail(
             "config",
             "no config found",
-            "run `orlop login`, pass --config, or mount with `orlop mount --from-env`",
+            "pass --config, or mount with `orlop mount --from-env`",
         ),
     });
 
@@ -144,7 +144,7 @@ pub fn gather(inputs: DoctorInputs) -> DoctorReport {
         None => Check::warn_fail(
             "credentials",
             "no credentials.json",
-            "run `orlop login` (in-pod `--from-env` mounts supply this out of band)",
+            "re-enroll the agent, or mount with `orlop mount --from-env` (it supplies credentials out of band)",
         ),
     });
 

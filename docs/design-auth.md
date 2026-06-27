@@ -123,8 +123,8 @@ clock skew.
 agent box                         control plane
 ─────────                         ─────────────
   bearer credential ───────────►  POST /agent/enroll  (Authorization: Bearer …)
-  (enroll token, or a                │
-   device-flow access token)         ├─ verify token; derive tenant_id + user_id +
+  (single-use enroll token)          │
+                                      ├─ verify token; derive tenant_id + user_id +
                                       │  agent_id from the bound allocation (never the body)
                                       ├─ reject if tenant suspended
                                       ├─ ensure tenant intermediate exists
