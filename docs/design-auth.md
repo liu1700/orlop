@@ -60,11 +60,11 @@ orlop mount    ── POST /agent/enroll (Bearer token) ─►   │
              write to ~/.config/orlop/{cert.pem, key.pem, ca.pem} (0600)
 
 orlop FUSE → HTTPS request ─────────────────────────────►  orlop-server (Go, stdlib)
-             TLS client cert presented                    tls.Config.ClientAuth = RequireAndVerifyClientCert
-             server_fqdn in TLS SNI                       ClientCAs = tenant intermediate
-                                                          On accept: read peer cert SAN
-                                                                     check tenant matches own tenant_id
-                                                                     proceed or 403
+             TLS client cert (+ intermediate)             tls.Config.ClientAuth = RequireAndVerifyClientCert
+             server_fqdn in TLS SNI                       ClientCAs = org root (client sends its intermediate)
+                                                          On accept: drop if leaf serial revoked;
+                                                                     tenant SAN must match the signing
+                                                                     intermediate's tenant OU; else drop
 ```
 
 Key properties:
@@ -73,9 +73,12 @@ Key properties:
   bastion, no Tailscale agent on the server.
 - Server presents a normal Let's Encrypt cert for the tenant FQDN
   (`tenant-acme.orlop.example.com`). Agent verifies it via the public PKI.
-- Agent presents a client cert minted by the control plane's CA. Server
-  verifies it via the tenant's intermediate CA bundle (deployed with the
-  server, rotated separately from agent certs).
+- Agent presents a client cert minted by the control plane's CA, together with
+  the tenant intermediate it received at enroll. The server verifies the chain
+  against the shared org root (its `ClientCAs`), then confirms — fail-closed —
+  that the intermediate which signed the leaf is scoped to the same tenant as
+  the leaf's SAN, so a leaked tenant-intermediate key can't forge a cross-tenant
+  cert (`cmd/orlop-server/cert_tenant_binding.go`).
 - Tenant identity is encoded in the client cert's URI SAN as
   `spiffe://<trust-domain>/tenant/<id>` (resolved 2026-04-29; see "open
   questions").
@@ -84,9 +87,9 @@ Key properties:
 
 | Threat | Mitigation |
 |--------|-----------|
-| Agent cert leaked | 1h TTL bounds blast radius; CA can be rotated to invalidate all outstanding certs. |
-| Tenant A agent dials tenant B server | TLS handshake completes (cert is valid against the org root) but server-side tenant check returns 403. Audited as `allowed: false`. |
-| Forged bearer token at `/agent/enroll` | Opaque tokens have at least 128 bits of entropy; only token hashes are stored; unknown, expired, revoked, suspended-user, and suspended-tenant tokens are rejected. |
+| Agent cert leaked | 1h TTL bounds blast radius. Releasing the mount lease revokes the leaf's serial onto a data-plane deny-list (issue #5), killing a leaked copy mid-TTL within the reconcile window; rotating the tenant CA stays a backstop. |
+| Tenant A agent dials tenant B server | TLS handshake completes (cert is valid against the org root) but the data-plane tenant-binding check fails closed and the connection is dropped. |
+| Forged/stolen bearer token at `/agent/enroll` | Opaque tokens have ≥128 bits of entropy; only hashes are stored; unknown, expired, revoked, consumed, suspended-user, and suspended-tenant tokens are rejected. Per-pod agent-enroll tokens are single-use — spent once a cert is minted — so a captured token cannot be replayed (issue #6). |
 | Replay of old cert | Cert TTL 1h; server clock-skew tolerance ±5min. |
 | Server impersonation | Agent verifies server cert against public PKI + pinned tenant FQDN. |
 | MITM on the wire | TLS 1.3, modern cipher suites only. |
@@ -104,10 +107,14 @@ Key properties:
 - **Server cert**: standard Let's Encrypt for the tenant FQDN, renewed by
   certbot or equivalent on the VM. Independent of the agent CA chain.
 
-Revocation is by expiry — no CRL, no OCSP. If a tenant must be cut off
-immediately, the runbook rotates the tenant intermediate (invalidates all
-outstanding agent certs for that tenant) and pushes the new chain to the
-tenant's server VM.
+Revocation has two levels. Expiry is the floor (1h TTL — no CRL, no OCSP). On
+top of it sits a per-serial **deny-list kill switch** (issue #5): releasing a
+mount lease records the bound leaf's serial in `cert_revocations`, a
+control-plane reconcile loop pushes the active set to each server
+(`PUT /control/cert-revocations`), and the server refuses a matching leaf at
+session start — so a single leaked cert dies mid-TTL without a CA rotation.
+Rotating the tenant intermediate (invalidating every outstanding cert for that
+tenant) remains the blunt, tenant-wide instrument.
 
 ## What this collapses vs. the Tailscale design
 
@@ -147,8 +154,10 @@ hosted MVP:
 
 1. `cmd/orlop-server` uses the stdlib TLS listener with
    `tls.RequireAndVerifyClientCert`.
-2. Tenant isolation is enforced by the tenant intermediate configured as
-   `tls.client_ca_file` and the SPIFFE tenant identity in the client cert.
+2. Tenant isolation is enforced by the SPIFFE tenant identity in the client
+   cert plus the data-plane fail-closed tenant-binding check; the server trusts
+   the shared org root as its client CA, and the agent supplies its tenant
+   intermediate in the chain it presents.
 3. `cmd/orlop-control` owns tenant CA operations, first-party device flow,
    refresh-token backed sessions, and `/agent/enroll`.
 4. `orlop login` and hosted `orlop mount` use the control-plane and mTLS flow

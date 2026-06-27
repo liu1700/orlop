@@ -381,6 +381,17 @@ revision so the per-layer ROI is visible in the PR.
 
 - mTLS on the data plane — tenant identity in the client cert, just as on
   `/v1`.
+- **Session-level cert gates (before any frame is served, in `serveFrames`):**
+  - *Revocation deny-list* (issue #5): each client leaf's serial is checked
+    against an in-memory deny-list pushed from orlop-control via
+    `PUT /control/cert-revocations` (gated to the control-plane cert). A revoked
+    leaf is dropped at session start, so a released or leaked cert dies within
+    the reconcile window instead of surviving its full TTL.
+  - *Tenant binding* (issue #7): the intermediate that signed the leaf must
+    carry a `tenant=<id>` OU matching the leaf's SPIFFE SAN tenant. This fails
+    **closed** — it is the gate against cross-tenant cert forgery if an
+    intermediate key leaks (the shared org root is the only `ClientCAs`, so the
+    client supplies its intermediate in the presented chain).
 - Per-op policy check still runs server-side (`cmd/orlop-server/policy.go`).
 - Chunk reads are not authenticated past the connection layer — chunks are
   opaque blobs, and reading a chunk you don't have the manifest for is

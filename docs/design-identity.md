@@ -22,10 +22,11 @@ plane (`orlop-server`) confines each connection to the SPIFFE SAN's prefix
 subject, and the SAN-in-credential shape, is the isolation boundary and is the
 correct design.
 
-**(B) The human/account LIFECYCLE — DELETE from orlop.** Who the human is, how
-they sign up, how an account is recovered — email-OTP, the Resend mailer,
-first-login auto-provision of a tenant+user, the seeded admin-session URL. This
-is not orlop's job.
+**(B) The human/account LIFECYCLE — not orlop's job (self-service signup removed
+in #9).** Who the human is, how they sign up, how an account is recovered. The
+self-service email-OTP path — the Resend mailer, first-login auto-provision of a
+tenant+user — was deleted; an operator-seeded admin session (`user seed`) is the
+only built-in onboarding left.
 
 The survey is unanimous: **no infra storage/data component bakes in human
 signup.** MinIO, Garage, SeaweedFS, Ceph, FoundationDB, CockroachDB, Temporal,
@@ -195,14 +196,17 @@ JWT-SVID is the natural fit.
 
 ## 5. Map to the existing code
 
-### DELETE — the human-lifecycle surface (none of it touches isolation)
+### REMOVED in #9 — the self-service signup surface (none of it touched isolation)
 
-| What | Where |
-| --- | --- |
-| Email-OTP start/verify + auto-provision | `internal/devauth/devauth.go` `StartEmailOTP`, `VerifyEmailOTP`, `createHostedUser`; handlers `handleOTPStart`/`handleOTPVerify` in `devauth_handlers.go` |
-| Mailer / Resend | `mailer.go` (`resendMailer`, `resend-go` dep), `logMailer`, `mailer_otp_log_test.go` |
-| OTP storage | migration `0009_email_otp_attempts.sql` (+ the `email_otps` table from `0001`), `queries/email_otps.sql`, `sqlcdb/email_otps.sql.go`, `email_otp_lockout_test.go`, OTP rate limiters |
-| Seeded admin-session URL | the `?session=TOK` cookie path in `devauth_handlers.go`, the `user seed` URL printing in `user_cmd.go` |
+Deleted (the symbols/files below no longer exist in the tree): the email-OTP
+start/verify + first-login auto-provision flow (`StartEmailOTP`/`VerifyEmailOTP`/
+`createHostedUser` and their handlers), the Resend mailer (`resend-go` dep), and
+the OTP storage (`email_otps` table — added in `0009`, dropped in migration
+`0010` — plus its queries, generated code, and rate limiters).
+
+**Kept** as the operator path: the seeded admin session — `orlop-control user
+seed` and the `?session=TOK` cookie path in `devauth_handlers.go`. A self-hoster
+seeds an admin instead of users self-serving by email.
 
 ### ADD — the pluggable identity seam (Temporal/Envoy shaped)
 
@@ -215,8 +219,9 @@ JWT-SVID is the natural fit.
    **Implemented** (`internal/identity/jwt.go`, RS256/ES256/EdDSA against a
    static PKIX public key; wired via `ORLOP_IDENTITY_*` and exercised by
    `GET /v1/whoami`). *Follow-ups:* `jwks_uri` with rotation; sender-constraint
-   (DPoP/mTLS) on the enroll seam; re-sourcing `/agent/enroll` authorization
-   from the verifier with allowlisted tenant bootstrap (issue #8).
+   (DPoP/mTLS) on the enroll seam; re-sourcing `/agent/enroll` authorization from
+   the verifier — the allowlisted tenant-bootstrap gate it relies on (issue #8)
+   is now in place.
 3. A built-in platform-token verifier (Mode A fallback): per-tenant scoped,
    expirable token via `api_tokens`, with default-deny stripping of
    caller-supplied tenant. *Not yet implemented.*

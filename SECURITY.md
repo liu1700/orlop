@@ -46,19 +46,23 @@ These are not optional for a production deployment:
 - **Front the control plane with a trusted proxy.** Rate limiters key on the
   client IP via `X-Forwarded-For`; only expose the control plane behind a proxy
   that sets that header. Never expose its port directly.
-- **Configure a real mailer.** Set `RESEND_API_KEY`; otherwise OTP delivery is
-  skipped and codes are only logged when `ORLOP_DEV_LOG_OTP=1` (dev only).
 - **Consider an API-token TTL.** Set `ORLOP_API_TOKEN_TTL` (e.g. `2160h`) so
   `orlop_` tokens expire; the default is no expiry.
+- **Lock down lazy tenant bootstrap.** By default the control plane will
+  bootstrap a CA intermediate for any server-derived `u_`/`a_` tenant. Set
+  `ORLOP_CA_TENANT_ALLOWLIST` (and optionally `ORLOP_CA_ALLOW_DYNAMIC_TENANTS=false`)
+  to restrict which tenants may self-onboard (issue #8).
 
 ## Hardening in place
 
 The data plane bounds untrusted input and load: msgpack decoding is guarded
 against pre-allocation bombs, each request handler is panic-isolated (one bad
 request can't crash the server), and concurrent connections, in-flight requests,
-and per-chunk size are all capped. Email OTPs lock out after a small budget of
-wrong guesses; API tokens can expire; cert issuance derives every SAN
-server-side and pins client/server usage.
+and per-chunk size are all capped. On the identity side: per-pod agent-enroll
+tokens are single-use (issue #6); a released or leaked agent leaf is revoked
+onto a data-plane serial deny-list checked at session start (issue #5); the
+cross-tenant cert-forgery check fails closed (issue #7); API tokens can expire;
+and cert issuance derives every SAN server-side and pins client/server usage.
 
 ## Known limitations
 
@@ -66,8 +70,8 @@ Honest gaps a deployment should account for:
 
 - **Rate limiters are per-process and in-memory.** They reset on restart and are
   not shared across replicas. Running more than one control-plane replica, or a
-  crash loop, weakens every rate-limit-dependent control (OTP, device-code,
-  enroll). Use a shared store (Redis is already in the stack) for multi-replica.
+  crash loop, weakens every rate-limit-dependent control (device-code, enroll).
+  Use a shared store (Redis is already in the stack) for multi-replica.
 - **Disk accounting when quota enforcement is off.** There is no in-process
   per-tenant byte accountant; the per-tenant cap depends entirely on the
   filesystem/JuiceFS quota (see "what the operator must do").
