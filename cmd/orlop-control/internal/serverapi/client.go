@@ -203,7 +203,7 @@ type resizeTenantRequest struct {
 // ResizeTenant calls PATCH https://<opsAddr>/control/tenants/{id} to change a
 // tenant's hard size cap in place, preserving its project ID. It is the
 // data-plane half of elastic storage — the storage autoscaler grows a tenant
-// toward its promised ceiling, and the email-OTP upgrade raises an anon trial's
+// toward its promised ceiling, and a cap upgrade raises an anon trial's
 // cap the same way. Idempotent: re-applying the current size returns the
 // unchanged projectID.
 //

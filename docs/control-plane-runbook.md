@@ -165,26 +165,23 @@ Auth0 / Dex is intentionally deferred: a real OIDC provider can replace
 the four endpoints later without changing the CLI, but operating
 Auth0/Dex for the MVP is more surface than the device flow itself.
 
-### 1. Sign in with email OTP
+### 1. Sign in (operator-seeded admin session)
 
-Hosted v1 uses email OTP for browser login. The control plane exposes:
+Self-service email-OTP login was **removed**. An embeddable infra component does
+not own the human signup/login lifecycle: identities are provisioned by the
+operator, not self-served via an emailed code. See
+[`design-identity.md`](./design-identity.md) for the full rationale and the
+planned BYO-IdP (verify-a-signed-JWT) direction that will replace this seed flow.
 
-- `POST /auth/otp/start` with `{"email":"alice@example.test"}`. It always
-  returns `204` and sends a six-digit code with a 10-minute TTL.
-- `POST /auth/otp/verify` with `{"email":"alice@example.test","code":"123456"}`.
-  On success it creates the user and a per-user tenant when needed, then sets
-  the HttpOnly `orlop_admin_session` cookie.
-- `POST /auth/logout`, which clears that cookie.
-
-Production delivery uses Resend when `RESEND_API_KEY` is set. Configure the
-sender with `ORLOP_EMAIL_FROM`; local/dev deployments without a Resend key log
-the code instead. Set `ORLOP_COOKIE_DOMAIN` in staging when the web app and
-control-plane API share a parent domain through the reverse proxy.
+Until that lands, browser sign-in is the operator-seeded admin session below.
+The only remaining auth endpoint here is `POST /auth/logout`, which clears the
+`orlop_admin_session` cookie. Set `ORLOP_COOKIE_DOMAIN` in staging when the web
+app and control-plane API share a parent domain through the reverse proxy.
 
 ### 2. Seed an admin user for a tenant
 
-This path is deprecated for normal browser login, but remains useful as an ops
-escape hatch and for non-interactive smoke tooling.
+This is the primary way to obtain a browser admin session (and is also used for
+non-interactive smoke tooling).
 
 The session is seeded by the operator running `orlop-control user seed` against
 the control-plane database. The command is idempotent on tenant + user; each

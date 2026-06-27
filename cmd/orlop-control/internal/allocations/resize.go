@@ -23,7 +23,7 @@ type TenantResizer interface {
 // places that track it consistent: the disk_allocations row (size_bytes), the
 // hosting server's server_pool reservation (free_bytes), and the data-plane
 // ext4 quota (via TenantResizer). It is the primitive the storage autoscaler and
-// the email-OTP upgrade both drive. Idempotent when newSizeBytes already matches.
+// a cap upgrade both drive. Idempotent when newSizeBytes already matches.
 //
 // If the allocation's tenant has not been placed on a server yet (no server_vms
 // row — e.g. provisioned but never enrolled), only the DB size is updated; the

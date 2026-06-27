@@ -72,7 +72,7 @@ func dashGetUserID(t *testing.T, cookie *http.Cookie, srvURL string) pgtype.UUID
 
 func TestDashboardListAllocationsRequiresAuth(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, _, _ := httpStartServer(t, pool)
+	srv, _ := httpStartServer(t, pool)
 
 	resp, err := http.Get(srv.URL + "/api/allocations")
 	if err != nil {
@@ -86,7 +86,7 @@ func TestDashboardListAllocationsRequiresAuth(t *testing.T) {
 
 func TestDashboardRevokeRequiresAuth(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, _, _ := httpStartServer(t, pool)
+	srv, _ := httpStartServer(t, pool)
 
 	resp, err := http.Post(srv.URL+"/api/allocations/00000000-0000-0000-0000-000000000000/revoke", "application/json", nil)
 	if err != nil {
@@ -100,7 +100,7 @@ func TestDashboardRevokeRequiresAuth(t *testing.T) {
 
 func TestDashboardListAllocationsShape(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -162,7 +162,7 @@ func TestDashboardListAllocationsShape(t *testing.T) {
 
 func TestDashboardListAllocationsScopedToCaller(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -203,7 +203,7 @@ func TestDashboardListAllocationsScopedToCaller(t *testing.T) {
 
 func TestDashboardRevokeSuccess(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -237,7 +237,7 @@ func TestDashboardRevokeSuccess(t *testing.T) {
 
 func TestDashboardRevokeIdempotent(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -264,7 +264,7 @@ func TestDashboardRevokeIdempotent(t *testing.T) {
 
 func TestDashboardRevokeOtherUserReturns404(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	asvc := dashAllocSvc(pool)
 
@@ -303,7 +303,7 @@ func TestDashboardRevokeOtherUserReturns404(t *testing.T) {
 
 func TestDashboardRevokeBadIDReturns400(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/allocations/not-a-uuid/revoke", nil)
@@ -339,7 +339,7 @@ type testAllocationDTO struct {
 func dashboardResponseForLease(t *testing.T, leaseExpiresAt time.Time) *http.Response {
 	t.Helper()
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -382,7 +382,7 @@ func dashboardResponseForLease(t *testing.T, leaseExpiresAt time.Time) *http.Res
 func dashboardResponseForUnbound(t *testing.T) *http.Response {
 	t.Helper()
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -489,7 +489,7 @@ func TestDashboardListAllocationsMountStatusUnbound(t *testing.T) {
 
 func TestDashboardMeIncludesUsedBytes(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)

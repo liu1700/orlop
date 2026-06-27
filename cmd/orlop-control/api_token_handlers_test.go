@@ -39,7 +39,7 @@ func postTokenRequest(t *testing.T, srvURL string, cookie *http.Cookie, body str
 
 func TestPostAPIToken_HappyPath(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 
 	resp := postTokenRequest(t, srv.URL, cookie, `{"name":"ci-bot"}`)
@@ -92,7 +92,7 @@ func TestPostAPIToken_HappyPath(t *testing.T) {
 
 func TestPostAPIToken_RejectsEmptyName(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 
 	resp := postTokenRequest(t, srv.URL, cookie, `{"name":""}`)
@@ -104,7 +104,7 @@ func TestPostAPIToken_RejectsEmptyName(t *testing.T) {
 
 func TestPostAPIToken_Unauthenticated(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, _, _ := httpStartServer(t, pool)
+	srv, _ := httpStartServer(t, pool)
 
 	resp := postTokenRequest(t, srv.URL, nil /* no cookie */, `{"name":"x"}`)
 	defer resp.Body.Close()
@@ -126,7 +126,7 @@ func mustParseUUID(t *testing.T, s string) pgtype.UUID {
 
 func TestGetAPITokens_ReturnsActiveTokens(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()
@@ -197,7 +197,7 @@ func TestGetAPITokens_ReturnsActiveTokens(t *testing.T) {
 
 func TestGetAPITokens_EmptyReturnsEmptyArray(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/tokens", nil)
@@ -223,7 +223,7 @@ func TestGetAPITokens_EmptyReturnsEmptyArray(t *testing.T) {
 
 func TestGetAPITokens_Unauthenticated(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, _, _ := httpStartServer(t, pool)
+	srv, _ := httpStartServer(t, pool)
 
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/tokens", nil)
 	resp, err := http.DefaultClient.Do(req)
@@ -238,7 +238,7 @@ func TestGetAPITokens_Unauthenticated(t *testing.T) {
 
 func TestDeleteAPIToken_Revokes(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()
@@ -272,7 +272,7 @@ func TestDeleteAPIToken_Revokes(t *testing.T) {
 
 func TestDeleteAPIToken_OtherUserCannotRevoke(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()
@@ -315,7 +315,7 @@ func TestDeleteAPIToken_OtherUserCannotRevoke(t *testing.T) {
 
 func TestDeleteAPIToken_Idempotent(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()

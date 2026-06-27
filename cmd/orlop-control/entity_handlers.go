@@ -43,7 +43,7 @@ type entityQuerier interface {
 	GetAllocationByAgent(ctx context.Context, agentID pgtype.Text) (sqlcdb.DiskAllocation, error)
 	GetUser(ctx context.Context, id pgtype.UUID) (sqlcdb.User, error)
 	// Quota lifecycle (anon-trial funnel): revoke an agent's disk when a trial
-	// expires (DELETE). The email-OTP cap upgrade (PATCH) routes through the
+	// expires (DELETE). A cap upgrade (PATCH) routes through the
 	// resize primitive (allocationResizer), not a direct size write here.
 	RevokeAllocation(ctx context.Context, arg sqlcdb.RevokeAllocationParams) (sqlcdb.DiskAllocation, error)
 	// Account-budget path (the buy/upgrade): list a user's allocations to re-stamp the
@@ -298,7 +298,7 @@ func (h *entityHandlers) handleResolve(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSetQuota raises (or lowers) an agent's disk hard cap in place, preserving
-// the allocation id (the control-plane's stored disk handle). The email-OTP
+// the allocation id (the control-plane's stored disk handle). A cap
 // upgrade flips an anon agent's 128 MiB disk to the registered size.
 // PATCH /v1/entities/{type}/{id}.
 func (h *entityHandlers) handleSetQuota(w http.ResponseWriter, r *http.Request) {
@@ -341,7 +341,7 @@ func (h *entityHandlers) handleSetQuota(w http.ResponseWriter, r *http.Request) 
 	}
 	// Route through the end-to-end resize primitive so the new cap propagates to
 	// the data-plane ext4 quota and the server_pool reservation — not just the DB
-	// row. (Before this, the OTP upgrade was a cosmetic DB-only change.)
+	// row. (Before this, the cap upgrade was a cosmetic DB-only change.)
 	resized, err := h.resize.Resize(r.Context(), h.serverAPI, alloc.ID, alloc.UserID, newGrant)
 	if err != nil {
 		switch {

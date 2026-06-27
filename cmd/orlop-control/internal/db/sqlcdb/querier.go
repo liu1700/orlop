@@ -25,7 +25,6 @@ type Querier interface {
 	BindAllocation(ctx context.Context, arg BindAllocationParams) (DiskAllocation, error)
 	// Two-step: promote allocations, then mark sessions claimed.
 	ClaimAnonymousAllocations(ctx context.Context, arg ClaimAnonymousAllocationsParams) ([]pgtype.UUID, error)
-	ConsumeEmailOTP(ctx context.Context, arg ConsumeEmailOTPParams) (EmailOtp, error)
 	// Live (non-revoked) allocations a user still has. The purge path uses this
 	// to decide between a per-agent subtree purge (other agents share the tenant
 	// dir) and a whole-tenant unregister (this was the last one).
@@ -36,7 +35,6 @@ type Querier interface {
 	CreateAccessToken(ctx context.Context, arg CreateAccessTokenParams) (AccessToken, error)
 	CreateAgentEnrollment(ctx context.Context, arg CreateAgentEnrollmentParams) (AgentEnrollment, error)
 	CreateDeviceAuthorization(ctx context.Context, arg CreateDeviceAuthorizationParams) (DeviceAuthorization, error)
-	CreateEmailOTP(ctx context.Context, arg CreateEmailOTPParams) (EmailOtp, error)
 	CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error)
 	CreateServerVM(ctx context.Context, arg CreateServerVMParams) (ServerVm, error)
 	CreateTenant(ctx context.Context, arg CreateTenantParams) (Tenant, error)
@@ -69,7 +67,6 @@ type Querier interface {
 	GetAnonymousSessionAllocation(ctx context.Context, sessionID string) (GetAnonymousSessionAllocationRow, error)
 	GetDeviceAuthorizationByDeviceCodeHash(ctx context.Context, deviceCodeHash string) (DeviceAuthorization, error)
 	GetDeviceAuthorizationByUserCodeHash(ctx context.Context, userCodeHash string) (DeviceAuthorization, error)
-	GetLatestEmailOTPForUpdate(ctx context.Context, email string) (EmailOtp, error)
 	GetPendingDeviceAuthorizationByUserCodeHashForUpdate(ctx context.Context, userCodeHash string) (DeviceAuthorization, error)
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (GetRefreshTokenByHashRow, error)
 	GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (ServerPool, error)
@@ -78,7 +75,6 @@ type Querier interface {
 	GetUser(ctx context.Context, id pgtype.UUID) (User, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserForUpdate(ctx context.Context, id pgtype.UUID) (User, error)
-	IncrementEmailOTPAttempts(ctx context.Context, id pgtype.UUID) (int32, error)
 	InsertAllocation(ctx context.Context, arg InsertAllocationParams) (DiskAllocation, error)
 	InsertAnonymousAllocation(ctx context.Context, arg InsertAnonymousAllocationParams) (DiskAllocation, error)
 	InsertAnonymousSession(ctx context.Context, arg InsertAnonymousSessionParams) (AnonymousSession, error)

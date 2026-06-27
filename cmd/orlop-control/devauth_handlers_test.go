@@ -24,36 +24,6 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 )
 
-type fakeMailer struct {
-	mu    sync.Mutex
-	codes map[string]string
-	sends map[string]int
-}
-
-func newFakeMailer() *fakeMailer {
-	return &fakeMailer{codes: make(map[string]string), sends: make(map[string]int)}
-}
-
-func (m *fakeMailer) SendOTP(_ context.Context, email, code string, _ time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.codes[email] = code
-	m.sends[email]++
-	return nil
-}
-
-func (m *fakeMailer) code(email string) string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.codes[email]
-}
-
-func (m *fakeMailer) sendCount(email string) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sends[email]
-}
-
 func httpTestDatabaseURL() string { return os.Getenv("TEST_DATABASE_URL") }
 
 var (
@@ -83,31 +53,29 @@ func httpOpenTestPool(t *testing.T) *pgxpool.Pool {
 		// anonymous sandbox flow) still get a clean slate, since the older
 		// tables they descend from may not be referenced.
 		_, _ = pool.Exec(context.Background(),
-			"TRUNCATE TABLE sessions_anonymous, disk_allocations, server_pool, refresh_tokens, access_tokens, email_otps, device_authorizations, agent_enrollments, server_vms, users, tenants RESTART IDENTITY CASCADE")
+			"TRUNCATE TABLE sessions_anonymous, disk_allocations, server_pool, refresh_tokens, access_tokens, device_authorizations, agent_enrollments, server_vms, users, tenants RESTART IDENTITY CASCADE")
 		pool.Close()
 	})
 	return pool
 }
 
-func httpStartServer(t *testing.T, pool *pgxpool.Pool) (*httptest.Server, *devauth.Service, *fakeMailer) {
+func httpStartServer(t *testing.T, pool *pgxpool.Pool) (*httptest.Server, *devauth.Service) {
 	t.Helper()
 	return httpStartServerWithFencer(t, pool, nil)
 }
 
-func httpStartServerWithFencer(t *testing.T, pool *pgxpool.Pool, fencer mountLeaseFencer) (*httptest.Server, *devauth.Service, *fakeMailer) {
+func httpStartServerWithFencer(t *testing.T, pool *pgxpool.Pool, fencer mountLeaseFencer) (*httptest.Server, *devauth.Service) {
 	t.Helper()
 	svc := devauth.NewService(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	mailer := newFakeMailer()
 	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
 		devAuth:          svc,
 		queries:          sqlcdb.New(pool),
 		allocations:      allocations.NewService(pool, nil),
-		mailer:           mailer,
 		mountLeaseFencer: fencer,
 	}, config{})
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
-	return srv, svc, mailer
+	return srv, svc
 }
 
 // httpSeedAdminCounter ensures repeated calls within the same test create
@@ -142,7 +110,7 @@ func httpSeedAdmin(t *testing.T, pool *pgxpool.Pool, svc *devauth.Service) (cook
 
 func TestHTTPHappyPath(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 
 	// 1. CLI creates a device code.
@@ -323,7 +291,7 @@ func TestHTTPHappyPath(t *testing.T) {
 
 func TestHTTPApproveRequiresAdminCookie(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, _, _ := httpStartServer(t, pool)
+	srv, _ := httpStartServer(t, pool)
 
 	form := url.Values{"user_code": {"ORL-ZZZZ"}, "action": {"approve"}}
 	resp, err := http.Post(srv.URL+"/device/approve",
@@ -339,7 +307,7 @@ func TestHTTPApproveRequiresAdminCookie(t *testing.T) {
 
 func TestHTTPDeviceSessionQueryParamSetsCookie(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -362,212 +330,9 @@ func TestHTTPDeviceSessionQueryParamSetsCookie(t *testing.T) {
 	}
 }
 
-func TestHTTPEmailOTPLoginIssuesSession(t *testing.T) {
-	pool := httpOpenTestPool(t)
-	srv, _, mailer := httpStartServer(t, pool)
-	email := "alice@example.test"
-
-	resp, err := http.Post(srv.URL+"/auth/otp/start", "application/json", strings.NewReader(`{"email":"`+email+`"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("start status = %d, want 204", resp.StatusCode)
-	}
-	code := mailer.code(email)
-	if code == "" {
-		t.Fatal("mailer did not capture otp code")
-	}
-
-	resp, err = http.Post(srv.URL+"/auth/otp/verify", "application/json", strings.NewReader(`{"email":"`+email+`","code":"`+code+`"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("verify status = %d body = %s", resp.StatusCode, body)
-	}
-	var sessionCookie *http.Cookie
-	for _, c := range resp.Cookies() {
-		if c.Name == devauth.AdminSessionCookie && c.HttpOnly {
-			sessionCookie = c
-		}
-	}
-	if sessionCookie == nil {
-		t.Fatalf("session cookie not set; cookies=%v", resp.Cookies())
-	}
-
-	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/me", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.AddCookie(sessionCookie)
-	meResp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer meResp.Body.Close()
-	if meResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(meResp.Body)
-		t.Fatalf("me status = %d body = %s", meResp.StatusCode, body)
-	}
-	var me struct {
-		UserID     string `json:"user_id"`
-		TenantID   string `json:"tenant_id"`
-		Purpose    string `json:"purpose"`
-		Email      string `json:"email"`
-		QuotaBytes int64  `json:"quota_bytes"`
-		UsedBytes  int64  `json:"used_bytes"`
-	}
-	if err := json.NewDecoder(meResp.Body).Decode(&me); err != nil {
-		t.Fatal(err)
-	}
-	if me.UserID == "" || !strings.HasPrefix(me.TenantID, "user_") || me.Purpose != devauth.PurposeAdmin {
-		t.Fatalf("bad /api/me: %#v", me)
-	}
-	if me.Email != email {
-		t.Fatalf("/api/me email = %q, want %q", me.Email, email)
-	}
-	if me.QuotaBytes <= 0 {
-		t.Fatalf("/api/me quota_bytes = %d, want default > 0", me.QuotaBytes)
-	}
-	if me.UsedBytes != 0 {
-		t.Fatalf("/api/me used_bytes = %d, want 0 (no allocations)", me.UsedBytes)
-	}
-}
-
-// TestHTTPEmailOTPVerifyExposesIsNewUser pins the contract the dashboard
-// relies on for its one-time welcome banner: first successful verify for a
-// brand-new email returns is_new_user=true; a second login by the same email
-// returns is_new_user=false. Pre-OTP-submission endpoints must never leak
-// this — only the verify response, after the user has proven email control.
-func TestHTTPEmailOTPVerifyExposesIsNewUser(t *testing.T) {
-	pool := httpOpenTestPool(t)
-	srv, _, mailer := httpStartServer(t, pool)
-	email := "welcome-banner@example.test"
-
-	verify := func() bool {
-		t.Helper()
-		resp, err := http.Post(srv.URL+"/auth/otp/start", "application/json", strings.NewReader(`{"email":"`+email+`"}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		code := mailer.code(email)
-		if code == "" {
-			t.Fatal("no otp code captured")
-		}
-		resp, err = http.Post(srv.URL+"/auth/otp/verify", "application/json", strings.NewReader(`{"email":"`+email+`","code":"`+code+`"}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			t.Fatalf("verify status = %d body = %s", resp.StatusCode, body)
-		}
-		var body struct {
-			IsNewUser bool `json:"is_new_user"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			t.Fatal(err)
-		}
-		return body.IsNewUser
-	}
-
-	if !verify() {
-		t.Fatal("first verify: want is_new_user=true, got false")
-	}
-	if verify() {
-		t.Fatal("second verify: want is_new_user=false, got true")
-	}
-}
-
-func TestHTTPEmailOTPSingleUse(t *testing.T) {
-	pool := httpOpenTestPool(t)
-	srv, _, mailer := httpStartServer(t, pool)
-	email := "single@example.test"
-	if resp, err := http.Post(srv.URL+"/auth/otp/start", "application/json", strings.NewReader(`{"email":"`+email+`"}`)); err != nil {
-		t.Fatal(err)
-	} else {
-		resp.Body.Close()
-	}
-	code := mailer.code(email)
-	if code == "" {
-		t.Fatal("mailer did not capture otp code")
-	}
-	body := `{"email":"` + email + `","code":"` + code + `"}`
-	resp, err := http.Post(srv.URL+"/auth/otp/verify", "application/json", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("first verify status = %d, want 200", resp.StatusCode)
-	}
-	resp, err = http.Post(srv.URL+"/auth/otp/verify", "application/json", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("second verify status = %d, want 401", resp.StatusCode)
-	}
-}
-
-func TestHTTPEmailOTPExpired(t *testing.T) {
-	pool := httpOpenTestPool(t)
-	srv, _, mailer := httpStartServer(t, pool)
-	email := "expired@example.test"
-	resp, err := http.Post(srv.URL+"/auth/otp/start", "application/json", strings.NewReader(`{"email":"`+email+`"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	code := mailer.code(email)
-	if code == "" {
-		t.Fatal("mailer did not capture otp code")
-	}
-	if _, err := pool.Exec(context.Background(), "UPDATE email_otps SET expires_at = now() - interval '1 minute' WHERE email = $1", email); err != nil {
-		t.Fatal(err)
-	}
-	resp, err = http.Post(srv.URL+"/auth/otp/verify", "application/json", strings.NewReader(`{"email":"`+email+`","code":"`+code+`"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("verify status = %d, want 401", resp.StatusCode)
-	}
-	if got := decodeError(t, resp); got != "expired_token" {
-		t.Fatalf("error = %s, want expired_token", got)
-	}
-}
-
-func TestHTTPEmailOTPStartRateLimitByEmail(t *testing.T) {
-	pool := httpOpenTestPool(t)
-	srv, _, mailer := httpStartServer(t, pool)
-	email := "limit@example.test"
-	for i := 0; i < 6; i++ {
-		resp, err := http.Post(srv.URL+"/auth/otp/start", "application/json", strings.NewReader(`{"email":"`+email+`"}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("start status = %d, want 204", resp.StatusCode)
-		}
-	}
-	if got := mailer.sendCount(email); got != 5 {
-		t.Fatalf("sends = %d, want 5", got)
-	}
-}
-
 func TestHTTPBearerRejectsMissing(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	_, svc, _ := httpStartServer(t, pool)
+	_, svc := httpStartServer(t, pool)
 	wrapped := RequireBearer(svc, sqlcdb.New(pool))(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 	}))
@@ -619,7 +384,7 @@ func httpCreateDeviceCode(t *testing.T, srvURL string) string {
 
 func TestHTTPApproveReusesExistingAllocation(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -672,7 +437,7 @@ func TestHTTPApproveReusesExistingAllocation(t *testing.T) {
 
 func TestHTTPApproveCrossUserAllocation(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	owner, _ := httpSeedAdmin(t, pool, svc)
 	other, _ := httpSeedAdmin(t, pool, svc)
 	ownerID := dashGetUserID(t, owner, srv.URL)
@@ -704,7 +469,7 @@ func TestHTTPApproveCrossUserAllocation(t *testing.T) {
 
 func TestHTTPApproveRevokedAllocation(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -738,7 +503,7 @@ func TestHTTPApproveRevokedAllocation(t *testing.T) {
 
 func TestHTTPApproveBothFieldsRejected(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -769,7 +534,7 @@ func TestHTTPApproveBothFieldsRejected(t *testing.T) {
 
 func TestHTTPApproveNeitherFieldRejected(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 
 	userCode := httpCreateDeviceCode(t, srv.URL)

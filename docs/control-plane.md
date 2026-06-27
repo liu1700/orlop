@@ -27,6 +27,28 @@ Service environment:
 | `ORLOP_SECRETS_DIR` | Filesystem secrets root containing CA material. Required for `/agent/enroll`. |
 | `ORLOP_TRUST_DOMAIN` | SPIFFE trust domain, default `orlop.example`. |
 | `ORLOP_ORG_NAME` | X.509 organization, default `ORL`. |
+| `ORLOP_IDENTITY_AUDIENCE` | Enables the Mode B host-identity verifier (pins the JWT `aud`). When set, the other `ORLOP_IDENTITY_*` knobs apply and `GET /v1/whoami` is mounted. |
+| `ORLOP_IDENTITY_PUBLIC_KEY_FILE` | PKIX/SPKI PEM public key the host JWT is verified against (RSA, ECDSA P-256, or Ed25519). Required when audience is set. |
+| `ORLOP_IDENTITY_ISSUER` | Optional; when set, required to equal the JWT `iss`. |
+| `ORLOP_IDENTITY_TENANT_CLAIM` | Claim mapped onto the tenant subject. Default `tenant`. |
+| `ORLOP_IDENTITY_TENANT_ALLOWLIST` | Comma-separated fail-closed allowlist of tenant ids that may be provisioned. Required when audience is set. |
+
+## Host identity (Mode B)
+
+When `ORLOP_IDENTITY_AUDIENCE` is set, orlop-control acts as a relying party for
+a host-issued, signed JWT: it verifies the signature against
+`ORLOP_IDENTITY_PUBLIC_KEY_FILE`, checks `iss`/`aud`/`exp`, and maps the
+`ORLOP_IDENTITY_TENANT_CLAIM` value onto the tenant subject — only if that value
+is on `ORLOP_IDENTITY_TENANT_ALLOWLIST` (fail-closed). The host owns the human;
+orlop verifies the assertion. See [`design-identity.md`](./design-identity.md)
+for the full model. `GET /v1/whoami` echoes the verified tenant subject and is a
+concrete check that a host token is accepted:
+
+```bash
+curl -fsS https://control.orlop.example/v1/whoami \
+  -H "Authorization: Bearer $HOST_JWT"
+# → {"tenant_id":"u_acme","subject":"host-user-42"}
+```
 
 Health check:
 
