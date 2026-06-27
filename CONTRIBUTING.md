@@ -3,10 +3,10 @@
 Thanks for your interest in orlop. This guide gets you from a fresh clone to a
 passing build with the least setup possible.
 
-## The one thing to know first: you usually need only **one** toolchain
+## You usually need only one toolchain
 
-orlop is split into two halves that talk over the network (mTLS + QUIC +
-msgpack), **not** over FFI. There is no cgo and no shared linking, so the two
+orlop is split into two halves that talk over the network (mTLS + msgpack over a
+long-lived connection), **not** over FFI. There is no cgo and no shared linking, so the two
 sides build, test, and ship completely independently. That means **most changes
 touch only one side, and you only install the toolchain for the side you touch.**
 
@@ -19,17 +19,17 @@ The CI mirrors this: [`go.yml`](.github/workflows/go.yml) runs on `**.go`
 changes, [`orlop-cli.yml`](.github/workflows/orlop-cli.yml) runs on `src/**`
 changes. A pure-Go change never triggers the Rust build, and vice versa.
 
-(Why two languages at all? See [Why Go *and* Rust](README.md#why-go-and-rust)
-in the README. Short version: each side uses the language that's strongest for
-its job, and the clean network boundary keeps that essentially free.)
+(Why two languages at all? See [Why Go *and* Rust](README.md#architecture) in the
+README. Short version: each side uses the language that's strongest for its job,
+and the clean network boundary keeps that essentially free.)
 
 ## Setup
 
 The fastest path is the **dev container**: open the repo in VS Code (or any
 devcontainer-aware editor) and "Reopen in Container". It provisions both
 toolchains, the Linux FUSE headers, and pre-fetched deps from
-[`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json) — nothing
-to install on your host.
+[`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json), with
+nothing to install on your host.
 
 Otherwise, install only the toolchain(s) you need from the table above and let
 the Makefile do the rest. It checks each toolchain is present, installs the
@@ -74,17 +74,18 @@ cargo test --locked
 ### Both at once (full stack)
 
 Only needed if you're changing the wire protocol or running the end-to-end
-stack. The [standalone quickstart](docs/standalone-quickstart.md) brings up
-Postgres + control + server + a mounted disk on one host.
+stack. The [standalone quickstart](docs/standalone-quickstart.md) brings up a
+database (Postgres or the embedded SQLite backend), the control plane, the
+server, and a mounted disk on one host.
 
 ## The cross-language contract
 
 The Go and Rust halves are decoupled, but they must agree on two things, and
 both are guarded by tests so you can't drift them silently:
 
-- **Wire protocol** — message framing and msgpack payloads on the mTLS/QUIC data
+- **Wire protocol**: message framing and msgpack payloads on the mTLS/QUIC data
   path (`src/backend/dataplane/` on the Rust side).
-- **Content addressing** — both sides run FastCDC chunking and must produce
+- **Content addressing**: both sides run FastCDC chunking and must produce
   **byte-identical chunk boundaries**, since chunks are content-addressed. This
   is pinned by golden vectors: [`tests/fastcdc_parity.rs`](tests/fastcdc_parity.rs)
   checks the Rust chunker against `tests/golden/fastcdc_chunks_go.txt`.

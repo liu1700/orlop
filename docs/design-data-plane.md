@@ -1,412 +1,363 @@
-# Orlop Data Plane — Local-Feel Filesystem Over WAN
+# Orlop Data Plane: Chunked Storage Over mTLS
 
-This doc covers the data plane between `orlop` (Rust client, FUSE) and
-`orlop-server` (Go, per-tenant data plane). The control plane
-(`orlop-control`: auth, allocations, mount leases) is out of scope; see
-`docs/design-auth.md`, `docs/control-plane.md`.
+The data plane is everything between the mount client and the chunk store:
+the wire it speaks, how files are split into content-addressed chunks, how
+those chunks are named and reassembled, and how concurrent writes stay
+consistent. The mount client is `orlop` (Rust: FUSE on Linux, an in-process
+localhost NFSv3 server on macOS); the server is `orlop-server` (Go, one
+process per tenant).
 
-This doc covers the binary-framed mTLS data plane (chunked, leased). The
-carrier is TCP+TLS today; QUIC is implemented and present in both binaries
-but kept opt-in pending throughput work — see Layer 1.
+This doc is about the storage and transport mechanics. The control plane
+(auth, disk allocation, mount leases) lives in
+[`design-auth.md`](design-auth.md) and [`control-plane.md`](control-plane.md).
 
-## Problem
+The guiding constraint throughout: **the agent is untrusted.** Anything the
+agent could forge (which tenant it belongs to, which chunk it is allowed to
+read) must be decided from its verified certificate or from cryptographic
+content, never from a value it puts on the wire.
 
-Today's data plane is HTTP/1.1 over TLS. Every FUSE op on a cache miss is one
-HTTP request — `GET /v1/entries?path=…`, `HEAD /v1/files?path=…`,
-`GET /v1/files?path=…`. Read returns whole-file bytes.
+## 1. Terminology
 
-This is fine on a LAN. It is bad on a WAN:
+| Term | Meaning |
+|------|---------|
+| **chunk** | A variable-length slice of a file's bytes, named by the BLAKE3 hash of its contents. The unit of storage, transfer, and dedup. |
+| **manifest** | The per-path record that maps a file to its ordered chunk list, plus size, mode, mtime, and a version counter. |
+| **chunk store** | Server-side directory of raw chunk blobs, one file per unique hash. |
+| **lease** | A server-granted capability over a path (`SHARED_READ` or `EXCLUSIVE_WRITE`) that makes write-back caching safe. |
+| **journal** | A per-tenant log of recent manifest changes that supports point-in-time revert (undo). |
+| **frame** | One request or response on the wire: a 16-byte header plus a msgpack payload. |
 
-- **One RTT minimum per op.** `ls -la` on a 100-entry directory is 1 list +
-  100 HEAD = 101 RTTs. At 50ms RTT that's >5 seconds.
-- **No persistent cache.** `orlop unmount` clears the in-memory list/metadata
-  caches; the next mount re-downloads everything.
-- **Whole-file reads.** Reading byte 0 of a 100 MiB file downloads 100 MiB.
-- **No write side.** The `Backend` trait is read-only; FUSE writes return
-  EROFS.
-- **No connection migration.** Laptop sleep, IP change, WiFi switch breaks
-  any in-flight stream.
+## 2. Data model: the hash is the name
 
-The product promise is "a disk that follows you across machines and agents".
-Today's wire makes that disk feel like a slow web service. This doc is the
-plan to make it feel local.
+A file is not stored as a byte stream. It is stored as:
 
-## Goals
+1. A list of chunks, each named by `BLAKE3-256(chunk_bytes)` (32 bytes).
+2. A manifest that records the path, the ordered chunk list, and metadata.
 
-|                                         | Today                       | Goal                                     |
-|-----------------------------------------|-----------------------------|------------------------------------------|
-| stat / ls p50 over 50ms WAN, warm cache | ≥50 ms per entry            | <5 ms per entry                          |
-| ls cold (100-entry dir)                 | >5 s                        | <100 ms                                  |
-| Sequential read warm                    | n/a (no persistence)        | local-disk speeds across mount cycles    |
-| Sequential read cold                    | RTT × file_size / chunk     | RTT × missing_chunks                     |
-| Write                                   | full POSIX with chunked uploads | full POSIX, fsync correct            |
-| Network blip survival                   | breaks the mount            | survives sleep + IP change               |
-| Bandwidth on small edits                | full file uploaded          | one chunk (~4 MiB)                       |
-| User-visible install                    | `orlop` binary + FUSE       | unchanged                                |
+Because a chunk's name *is* the hash of its bytes, two chunks with identical
+contents have the same name and are stored once. This is the property the
+rest of the design leans on: dedup is automatic, integrity is checkable, and
+a cached chunk can be trusted by re-hashing it.
 
-**Zero new user-side installs is a hard requirement.** Everything ships in
-the `orlop` and `orlop-server` binaries. Binary framing, chunking, leases,
-persistent cache — all internal.
+This fits agent workloads well. Agents re-create the same `node_modules`,
+the same model weights, the same datasets across sessions and across machines.
+Content addressing collapses all of those copies to a single stored blob, and
+a single-byte edit to a large file re-uploads one chunk (~4 MiB), not the file.
 
-## Non-goals
+## 3. Chunking: why boundaries must move with the content
 
-- **Multi-writer CRDT directory semantics.** Orlop is single-user; lease
-  serialization handles real workloads.
-- **Adapting third-party stores.** By design, no S3/rclone/local-fs
-  adapters. The chunk store is Orlop's own format on the `orlop-server`
-  host filesystem.
-- **A generic remote-FS protocol.** Not building NFSv5.
+If files were split at fixed offsets (every 4 MiB, say), inserting one byte
+near the front would shift every later byte across a boundary. Every
+subsequent chunk would get a new hash, and the entire cache for that file
+would miss. Fixed-size chunking turns a 1-byte edit into a whole-file
+re-transfer.
 
-## Architecture
+Orlop uses **FastCDC** (content-defined chunking). Boundaries are chosen by a
+rolling hash over the content, so a boundary lands at the same *content*
+position regardless of what came before it. An insert disturbs only the one
+or two chunks around the edit; everything after it keeps its old boundaries
+and old hashes, and stays a cache hit.
 
-```
-agent → /mnt/orlop → GatewayFs (Rust FUSE)
-                           │
-                           ▼
-                       DataStore
-                           │  (data plane: binary frames over
-                           │   long-lived TCP+TLS; QUIC opt-in)
-                           ▼
-                     orlop-server (Go)
-                           │
-              ┌────────────┴────────────┐
-              ▼                         ▼
-        manifest store              chunk store
-      (per-tenant SQLite)      (objects/<hh>/<blake3>)
-
-control plane (auth, allocate, mount-lease):
-   orlop → orlop-control (HTTP/JSON over TLS) — unchanged
-```
-
-The data plane decomposes into six layers, each independently shippable and
-independently justified.
-
-| # | Layer            | What it does                              | Why it earns its place                                              |
-|---|------------------|-------------------------------------------|---------------------------------------------------------------------|
-| 1 | Transport        | TCP+TLS default; QUIC opt-in              | Long-lived multiplexed binary frames over a single mTLS socket      |
-| 2 | Framing          | Long-lived connection, binary frames      | Amortize handshake; carry server-push (lease revoke) on same socket |
-| 3 | Storage model    | Content-addressed chunks (BLAKE3 + FastCDC) | Dedup; deltas on edit; persistent client cache hits local-disk speed |
-| 4 | Manifests        | path → chunk-list, version, mode, mtime   | Atomic writes via CAS on version                                    |
-| 5 | Consistency      | Capability leases (SHARED_READ / EXCLUSIVE_WRITE) | Safe write-back caching with correct fsync                  |
-| 6 | Cache            | Persistent client chunk cache             | Survives unmount; second access is local-disk speed                 |
-
-## Why each layer earns its place (first principles)
-
-### Layer 1: Transport — TCP+TLS today, QUIC opt-in
-
-**Bottleneck.** HTTP/1.1 forces a TCP+TLS handshake per connection or queues
-ops behind keep-alive serially. The connection drops on network change.
-
-**Today.** A single long-lived mTLS socket carries all v2 frames. Same
-binary wire, same ops, regardless of carrier. The client config field
-`TransportMode` selects `Tcp` (default), `Quic`, or `Auto` (try QUIC, fall
-back to TCP and remember the choice).
-
-**Why TCP is default.** We shipped both transports and benched them
-end-to-end against staging WAN (see `bench-results/remote-v2-{tcp,quic}.json`,
-`bench-results/par-sweep/`):
-
-- 1000× stat-storm: QUIC slightly better (p50 169 ms vs 179 ms, p99 173 ms
-  vs 186 ms). Real but small.
-- 100 MiB sequential cold read: **QUIC ~38 s vs TCP ~10 s** — QUIC ~4×
-  slower. Warm reads were comparable.
-
-The cold-read regression dominates the user-visible "feels local" goal, so
-TCP is the default for production. Likely causes (not fully isolated yet):
-client kernel UDP receive buffer cap (non-root binaries can't `setsockopt`
-past `net.core.rmem_max`), QUIC stream/connection flow-control window
-defaults, and cloud UDP path quality. Issue #80 is closed against this
-finding; revisiting QUIC requires throughput parity on cold large reads
-first.
-
-**What QUIC still buys (when re-enabled).**
-
-- Multiplexed streams without TCP head-of-line blocking — a slow chunk
-  read can't stall a quick stat.
-- Connection migration across IP / network changes — the "follow you
-  across machines" promise. Not yet validated end-to-end.
-- 0-RTT resumption for safe ops (`LIST/STAT/MANIFEST_GET/CHUNK_GET/CHUNK_HAS`).
-
-QUIC support is intentionally kept in-tree (server listens on UDP, client
-opens per-RPC bidi streams for `chunk_get`) so a future throughput fix
-doesn't have to re-introduce the carrier.
-
-**Out of scope.** HTTP/3 framing — the wire is orlop-specific binary; QUIC
-is just a carrier.
-
-### Layer 2: Framing — minimal binary
-
-**Bottleneck.** JSON parse + HTTP header overhead per op. A 4 KiB read
-becomes a multi-KiB request/response. A 16-byte header is enough.
-
-**Why custom binary, not Cap'n Proto v1.** Cap'n Proto's promise pipelining
-(`open(p) → read(<promise>, …)` in 1 RTT) is real but its win mostly
-disappears once chunks + leases are in place. Stat results become cache
-hits; "100 stats in 1 RTT" stops being on the critical path. Cap'n Proto
-stays an option for v2, gated on benchmark evidence.
-
-**Frame shape (illustrative).**
+The parameters are pinned and identical on both sides of the wire:
 
 ```
-+--------+--------+----------+----------+----------+
-| op (1) | flags  |  rid (8) | rsv (2)  | len (4)  | payload (len bytes)
-+--------+--------+----------+----------+----------+
+MIN = 1 MiB    AVG = 4 MiB    MAX = 16 MiB     (FastCDC v2020)
 ```
 
-Op codes mirror FUSE-side concepts: `LIST`, `STAT`, `MANIFEST_GET`,
-`CHUNK_GET`, `CHUNK_HAS`, `CHUNK_PUT`, `MANIFEST_PUT`, `LEASE_GRANT`,
-`LEASE_REFRESH`, `LEASE_RELEASE`, plus server-push `LEASE_REVOKE`.
+- Rust client: `CHUNK_MIN` / `CHUNK_AVG` / `CHUNK_MAX` in `src/write_handle.rs`.
+- Go server: `ChunkMin` / `ChunkAvg` / `ChunkMax` in `cmd/orlop-server/cdc.go`.
 
-### Layer 3: Storage model — content-addressed chunks
+The two implementations must produce byte-identical boundaries, or a file
+chunked by the client would fail to dedup against the same file chunked by the
+server. `tests/fastcdc_parity.rs` enforces this against a golden vector
+(`tests/golden/fastcdc_chunks_go.txt`).
 
-**Bottleneck.** Whole-file reads/writes. One byte changes → whole file
-re-uploaded. Same file across sessions → re-downloaded every time.
+## 4. Content addressing and dedup
 
-**Why content addressing wins for Orlop specifically.**
+Dedup happens at three points, all for free:
 
-- Agent workloads have massive duplication. Same `node_modules`, same
-  model weights, same datasets across sessions. Content addressing dedupes
-  naturally.
-- Persistent client cache by hash means second-access is local-disk speed.
-- Single-byte edits ship one chunk (~4 MiB), not the whole file.
-- Server-side dedup is free.
+- **Within a file:** repeated regions chunk to the same hash.
+- **Across files and sessions:** uploading a chunk that already exists is a
+  no-op; the server bumps a refcount instead of writing bytes.
+- **In the client cache:** a chunk fetched once is keyed by hash, so any
+  later file that references it is served locally.
 
-**Why FastCDC, not fixed-size.** A single-byte insert in a fixed-chunked
-file shifts every subsequent chunk and invalidates the entire cache.
-FastCDC's content-defined boundaries mean an insert affects ~2 chunks.
+The server tracks how many manifests reference each chunk (`chunks.refcount`),
+which is what makes garbage collection safe (section 11).
 
-> **Canonical FastCDC parameters (pinned, shared by Rust client and Go server):**
-> `MIN = 1 MiB / AVG = 4 MiB / MAX = 16 MiB`
-> Algorithm: FastCDC v2020, normalization level 1, seed 0. Constants in
-> `src/fs/write_handle.rs` (`CHUNK_MIN/AVG/MAX`) and
-> `cmd/orlop-server/cdc.go` (`ChunkMin/Avg/Max`) must stay in sync.
+## 5. On-disk layout
 
-**Why BLAKE3.** ~3 GB/s on a single core, parallelizable, prefix-free. Hash
-cost matters when streaming GB-scale files.
+**Server chunk store:** raw blobs on the `orlop-server` host filesystem,
+sharded by the first two hex characters of the hash to keep directories small:
 
-**Reference points.** restic, JuiceFS, Tahoe-LAFS, casync, Perkeep all
-ship chunked content-addressed storage in production.
+```
+<store-root>/objects/
+  ab/
+    ab1f… (raw chunk bytes, filename = full BLAKE3 hex)
+  cd/
+    cdee…
+```
 
-### Layer 4: Manifests
+The chunk store writes blobs to the local filesystem as plain files
+(`cmd/orlop-server/chunkstore.go`).
 
-**Bottleneck.** With chunks we still need a path → chunk-list mapping with
-versioning for atomic updates.
+**Client chunk cache:** the same content-addressed shape, under the user's
+cache dir (`$XDG_CACHE_HOME/orlop`, else `$HOME/.cache/orlop`):
 
-**Schema** (per-tenant SQLite):
+```
+<cache-root>/
+  chunks/
+    ab/
+      ab1f…
+  index.sqlite     # one row per cached chunk: (hash, size, last_access)
+```
+
+`index.sqlite` is metadata only; the bytes live next to it under `chunks/`.
+Its single table tracks `last_access` so eviction can pick the
+least-recently-used chunks. Refcounting is a server concern; the client just
+caches and evicts by size.
+
+## 6. Manifests
+
+Manifests and the chunk index are a per-tenant SQLite database on the server
+(`cmd/orlop-server/tenantdb.go`):
 
 ```sql
-create table manifests (
-  path text primary key,
-  size integer not null,
-  mode integer not null,
-  mtime integer not null,
-  version integer not null,         -- monotonic per path
-  chunks blob not null              -- packed [hash(32) | offset(8) | len(4)]
+create table chunks (
+  hash     blob primary key,                 -- BLAKE3, 32 bytes
+  size     integer not null,
+  refcount integer not null default 0 check (refcount >= 0),
+  added_at integer not null
 );
 
-create table chunks (
-  hash blob primary key,             -- BLAKE3, 32 bytes
-  size integer not null,
-  refcount integer not null,
-  added_at integer not null
+create table manifests (
+  path    text primary key,
+  size    integer not null,
+  mode    integer not null,
+  mtime   integer not null,
+  version integer not null,                   -- monotonic per path
+  chunks  blob not null                       -- packed [hash(32) | offset(8) | len(4)] …
 );
 
 create table dir_entries (
   parent text not null,
-  name text not null,
+  name   text not null,
   primary key (parent, name)
 );
 ```
 
-`MANIFEST_PUT` is a CAS on `version`. Concurrent writers without a lease
-get `409 stale_version`; with an `EXCLUSIVE_WRITE` lease they cannot
-conflict.
+(`symlinks` and `special_nodes` tables hold the corresponding node types;
+`uid`/`gid`/`atime` columns were added to `manifests` later for POSIX
+ownership and times.)
 
-### Layer 5: Consistency — capability leases
+The `manifests.chunks` BLOB is the ordered chunk list packed inline:
+`hash(32) | offset(8) | len(4)` per entry. To read a file you read its
+manifest, then fetch the listed chunks (most of them from cache).
 
-**Bottleneck.** Write-back caching is unsafe without consistency primitives.
-Polling kills latency.
+**Atomic updates use compare-and-swap on `version`.** A writer sends the
+version it believes is current; the server applies the write only if the
+stored version still matches, then increments it. A writer that lost the race
+gets back errno **ESTALE (116)**, produced by `dataplane.ErrESTALE`, carried
+in the error frame, and surfaced to FUSE as a real `ESTALE`. The wire speaks
+errnos, not HTTP status codes.
+The error frame can also carry a `RecoveryHint` with the caller's version and
+the server's current version so the client can refetch and retry.
 
-**Why leases.** CephFS / NFSv4 delegations / SMB3 oplocks all use this.
-~15–20 years in production. For Orlop (single user) lease grants are
-essentially permanent; revocation is rare. Write-back caching becomes a
-near-free correctness improvement.
+## 7. Integrity
 
-**Modes.**
+Every chunk is self-verifying: its name is the hash of its bytes. The client
+re-hashes a chunk on every cache hit (`ChunkCache::get`); a mismatch means
+on-disk corruption, so the entry is deleted and refetched. BLAKE3 makes this
+cheap (it runs at multiple GB/s on one core and parallelizes), so
+hash-on-read costs little even when streaming GB-scale files. A 256-bit digest
+also means an attacker cannot construct a different chunk that hashes to a name
+they don't already hold, so "read a chunk you have no manifest for" is not a
+reachable attack.
 
-- `SHARED_READ` — any number of clients, no in-flight writes.
-- `EXCLUSIVE_WRITE` — single client, may buffer writes locally; `fsync`
-  flushes.
+## 8. Read path
 
-**Lease scope.** Per-path. The mount-level lease (#71) is orthogonal —
-that controls who holds the mount; per-path leases govern caching
-semantics within a held mount.
-
-**Eviction.** Server can revoke for any reason (contention, admin action,
-TTL expiry). Client must flush any pending writes before relinquishing.
-Failure to flush before TTL is a correctness bug — audit-logged loudly.
-
-**Server-push for revoke.** Bidirectional protocol on the same long-lived
-connection (Layer 2). Polling-based invalidation is expressly rejected.
-
-### Layer 6: Cache — persistent, content-addressed
-
-**Bottleneck.** Today's `moka` caches are in-memory and per-process.
-`orlop unmount` throws everything away.
-
-**Layout.**
+Reading a file never hits a server "read" op; reads are reassembled
+client-side from chunks:
 
 ```
-$XDG_CACHE_HOME/orlop/
-  chunks/
-    ab/
-      abcd1234…  (raw chunk bytes)
-  index.sqlite     # LRU metadata: hash, size, last_access, refcount
+open("/proj/data.bin")
+  └─ MANIFEST_GET /proj/data.bin   → version, size, [chunkA, chunkB, chunkC, …]
+read(off, len)
+  └─ for each chunk covering [off, off+len):
+       cache hit?  → serve locally (hash-verify, done)
+       cache miss? → CHUNK_HAS / CHUNK_GET → store in cache → serve
 ```
 
-LRU eviction with a configurable cap (default 2 GiB). Hash-on-read verifies
-integrity on every cache hit — cheap with BLAKE3, catches disk corruption.
+The first read of a cold file costs one round trip per *missing* chunk; the
+second read (even after unmount and remount) is served entirely from local
+disk. A read of byte 0 of a 100 MiB file fetches one ~4 MiB chunk, not 100 MiB.
 
-## What we are explicitly not building
+## 9. Write path and crash ordering
 
-- **CRDTs for directory metadata.** Single-user, lease-serialized.
-- **Cap'n Proto promise pipelining.** Conditional v2; gated on benchmark
-  evidence after Layers 3 + 5.
-- **Distributed chunk storage / multi-region replication.** `orlop-server`
-  is single-tenant per process.
-- **Encrypted chunks at rest.** Tenant TLS isolates the data plane;
-  filesystem encryption is the host's responsibility.
-- **Adapters for S3 / rclone / local-fs.** This document is canon.
-
-## Sequencing (ROI-ordered, not time-ordered)
-
-Each step is shippable on its own and measurable against the benchmark
-harness.
-
-1. **Benchmark harness** — emulated WAN (`tc qdisc … netem`), workload
-   fixtures, JSON output. Gates measurability of everything else.
-   Implemented in `bench/` (workspace member, binary `orlop-bench`); see
-   "Benchmark harness" below.
-2. **Long-lived data-plane connection (TCP+TLS, binary framing)** —
-   amortizes per-op handshake cost. Carries existing list/stat/read.
-3. **Chunk store + manifests on `orlop-server`** —
-   `MANIFEST_GET / CHUNK_GET / CHUNK_HAS`. Files become chunk lists.
-4. **Persistent client chunk cache + chunked reads** — pairs with #3 for
-   the read-side product win. WAN starts to feel local here.
-5. ✅ **Write-side `Store` trait + chunked uploads** (PR #89) —
-   `write/create/unlink/rename/mkdir/rmdir`. Client computes chunks,
-   uploads novel ones, atomic manifest update.
-6. **Capability leases + write-back caching** — exclusive leases enable
-   immediate-ack writes; fsync blocks on durability.
-7. ✅ **QUIC transport** (#80, closed) — drop-in carrier swap landed
-   server-side and client-side; framing unchanged. Default kept on TCP
-   after WAN bench showed QUIC ~4× slower on 100 MiB cold reads.
-   Connection migration not yet validated end-to-end; revisit if the
-   throughput gap closes.
-8. **Chunk store GC** — server-side mark-and-sweep against manifests;
-   client-side LRU on cache directory.
-9. **Audit + observability extensions** — new event types, lease
-   lifecycle, chunk-level metrics.
-10. **(Conditional) Cap'n Proto promise pipelining** — only if benchmark
-    after #2–#6 still shows stat-storm regressions.
-
-Each item is a tracked GitHub issue. The tracking issue carries the
-checklist.
-
-## Benchmark harness
-
-`orlop-bench` (in `bench/`) drives synthetic workloads against any mount
-point and emits per-workload JSON: `name`, `status`, `p50_ms`, `p99_ms`,
-`bytes_in`, `bytes_out`, `ops`, `duration_s`. Workloads:
-
-- `stat-storm` — 1000 stats across a wide directory
-- `ls-large-dir` — readdir of a 10k-entry directory
-- `sequential-read` — 100 MiB file, 64 KiB reads in order
-- `random-read` — same file, 64 KiB reads at deterministic random offsets
-- `small-edit` — 1 KiB writes at striped 4 MiB-aligned offsets, fsync each
-- `large-edit` — write a fresh 100 MiB file, fsync at the end
-- `cold-warm-cycle` — sequential-read, unmount, mount, sequential-read again
-  (skipped unless `--mount-cmd` and `--unmount-cmd` are provided)
-
-Workloads are mount-agnostic: the harness measures the filesystem at the
-given path, whatever it is. The default `make bench` target points at a
-tmp directory as a smoke test of the pipeline; meaningful orlop numbers
-come from pointing it at a live orlop mount.
-
-Comparing two result files:
+Writes go chunk-first, manifest-last, so a crash can never leave a manifest
+pointing at bytes that were never stored:
 
 ```
-./scripts/bench-compare.sh bench-results/<a>.json bench-results/<b>.json
+1. Client chunks the new/changed file region (FastCDC).
+2. For each chunk: CHUNK_HAS → upload only the novel ones via CHUNK_PUT.
+3. MANIFEST_PUT with expected_version = the version the client last saw.
+      server: CAS on version → write manifest, bump/lower chunk refcounts,
+               append a journal row, all in one SQLite transaction.
 ```
 
-Renders a markdown table; flags p50 regressions above 5% (configurable via
-`--threshold-pct`). Non-CI integration is intentional for the first pass —
-local-first per #74's scope.
+Ordering matters: chunks are durable before any manifest references them, and
+the manifest swap is a single transaction that also adjusts refcounts and
+records the change in the journal. If the CAS fails, the write returns ESTALE
+and nothing is mutated. Write authority is checked at `MANIFEST_PUT`, not at
+`CHUNK_PUT`: chunk uploads dedup globally and are content-addressed, but
+binding a path to a chunk list is the privileged step.
 
-Stability note: on a fast host filesystem (tmpfs), sub-millisecond
-operations show scheduler-jitter variance well above 5% across runs. The
-5%-stability target is for the real measurement targets — orlop mounts
-under emulated WAN where ops are ms-scale and the noise floor is small
-relative to signal. Each subsequent layer (`/v2` framing, chunk store,
-chunked reads, …) ships with bench numbers diffed against the prior
-revision so the per-layer ROI is visible in the PR.
+## 10. The journal (revert)
 
-## Migration
+Each successful manifest change appends a row to a per-tenant
+`session_journal` (`cmd/orlop-server/journal.go`): the path, the operation
+(`create` / `update` / `delete` / `rename`), the version before and after, and
+enough of the prior manifest to undo the change. The append happens inside the
+same transaction as the manifest write, so a change is never left unrecordable.
 
-- `Store` trait (`src/store.rs`) replaced the old `Backend` trait; `DataStore`
-  is the only production implementation. Dead backends (`LocalBackend`,
-  `S3CliBackend`, `RcloneBackend`) and the v1 HTTP wire are deleted.
-- `orlop-server` now speaks only the binary-framed mTLS wire. The `/v1/*`
-  HTTP endpoints are removed; the `data_plane: v1` config flag is gone.
-- Audit log JSONL format is append-only; new event types coexist with old
-  ones.
+Two ops expose it on the wire:
 
-## Operational concerns
+- **`JOURNAL_QUERY` (0x15):** read journal rows (filtered by allocation),
+  e.g. to show what an agent changed during a run.
+- **`JOURNAL_REVERT_PATH` (0x18):** replay the inverse of the most recent
+  change for each named path, restoring the prior bytes. The inverse is
+  applied under CAS too, so a concurrent writer surfaces as a revert conflict
+  rather than being silently clobbered.
 
-- **Cache disk usage.** `~/.cache/orlop/chunks/` capped (default 2 GiB,
-  configurable). LRU evicts stale chunks.
-- **Server chunk disk usage.** Chunks dedupe across files; refcounted.
-  Background GC sweeps unreferenced chunks.
-- **UDP-blocked networks.** Production default is TCP+TLS, so UDP-blocked
-  networks are a non-issue today. If QUIC is ever re-enabled by default,
-  `TransportMode::Auto` already falls back to TCP on connect timeout (2 s)
-  and caches the preference per-server.
-- **Lease expiry under network partition.** Client must assume revoked
-  after TTL/2 with no contact and flush proactively. Audit-loud on any
-  violation.
-- **Manifest version conflicts.** Writes without a lease that race get
-  `409 stale_version` and retry; with a lease they cannot conflict.
+This is what lets an operator roll back an agent's writes to a known-good
+state after a bad run.
 
-## Security
+## 11. Garbage collection and leases
 
-- mTLS on the data plane — tenant identity in the client cert, just as on
-  `/v1`.
-- **Session-level cert gates (before any frame is served, in `serveFrames`):**
-  - *Revocation deny-list* (issue #5): each client leaf's serial is checked
-    against an in-memory deny-list pushed from orlop-control via
-    `PUT /control/cert-revocations` (gated to the control-plane cert). A revoked
-    leaf is dropped at session start, so a released or leaked cert dies within
-    the reconcile window instead of surviving its full TTL.
-  - *Tenant binding* (issue #7): the intermediate that signed the leaf must
-    carry a `tenant=<id>` OU matching the leaf's SPIFFE SAN tenant. This fails
-    **closed** — it is the gate against cross-tenant cert forgery if an
-    intermediate key leaks (the shared org root is the only `ClientCAs`, so the
-    client supplies its intermediate in the presented chain).
-- Per-op policy check still runs server-side (`cmd/orlop-server/policy.go`).
-- Chunk reads are not authenticated past the connection layer — chunks are
-  opaque blobs, and reading a chunk you don't have the manifest for is
-  cryptographically infeasible (BLAKE3-32 collision).
-- Write capability is checked on `MANIFEST_PUT`, not `CHUNK_PUT`. Chunk
-  uploads dedupe globally; writing a manifest pointing at a chunk you
-  uploaded but don't own the path for is rejected.
+**GC is reference-counted, not mark-and-sweep.** Because every manifest write
+already maintains `chunks.refcount`, the sweeper does not need to walk
+manifests to find unreachable chunks. It simply deletes rows where the refcount
+has reached zero and the chunk is older than a retention window
+(`cmd/orlop-server/gc.go`):
 
-## Open questions
+```sql
+delete from chunks where refcount = 0 and added_at < <cutoff>
+```
 
-- **Manifest store on Postgres vs SQLite per tenant.** Per memory, Postgres
-  = Supabase, never self-hosted. Manifests are per-tenant data and live
-  with `orlop-server`'s host (currently SQLite). Confirm during Layer 3.
-- **Chunk store atop ZFS vs ext4.** ZFS gives free dedup at the block
-  layer (redundant with content addressing) plus snapshots. Decide as a
-  deployment knob, not a protocol concern.
-- **Cap'n Proto vs hand-rolled binary v2.** Decide post-benchmark, see
-  Issue 10.
+The same predicate is re-asserted on the per-row delete, so a refcount bump
+landing between select and delete leaves the chunk alive. Each sweep emits a
+`gc_swept_chunks` audit event. The retention window (`added_at < cutoff`) holds
+a just-unreferenced chunk back from collection until it has aged past the
+window, rather than deleting it the instant its refcount hits zero.
+
+The **client cache** is collected independently: LRU eviction down to a byte
+budget (default 2 GiB, configurable), picking victims by `last_access`. Losing
+a cached chunk only costs a refetch, so the cache index is kept lightweight and
+non-durable.
+
+**Leases** make write-back caching safe. Without a consistency primitive,
+caching writes locally would risk serving stale data; polling the server for
+invalidations would wreck latency. Instead the server grants a per-path
+capability:
+
+| Mode | Holders | Allows |
+|------|---------|--------|
+| `SHARED_READ` | many | cache reads; no in-flight writes |
+| `EXCLUSIVE_WRITE` | one | buffer writes locally; `fsync` flushes to the server |
+
+The server can revoke a lease at any time (contention, admin action, expiry).
+Revocation is **pushed on the same long-lived connection** (`LEASE_REVOKE`,
+0x13) rather than discovered by polling; the holder must flush pending writes
+before releasing. This is the same approach as NFSv4 delegations, SMB3
+oplocks, and CephFS capabilities. For a single-user disk, grants are
+effectively long-lived and revocation is rare, so leases buy near-free
+write-back correctness. (A separate mount-level lease governs who holds the
+mount; that is a control-plane concern, distinct from these per-path leases.)
+
+## 12. Transport and wire
+
+The data path is a **single long-lived mTLS connection** carrying binary
+frames. Each frame is a fixed 16-byte header followed by a msgpack payload:
+
+```
+byte:  0        1        2 .. 9          10  11     12 .. 15
+      +--------+--------+----------------+--------+----------------+
+      | op (1) | flags  | request id (8) | rsv(2) | payload len(4) |  msgpack payload
+      +--------+--------+----------------+--------+----------------+
+```
+
+(`cmd/orlop-server/dataplane/codec.go`; `flags` carries the response and error
+bits; multi-byte fields are big-endian; reserved bytes must be zero.) The op
+codes and msgpack message shapes are mirrored on both sides: Go in
+`cmd/orlop-server/dataplane/`, Rust in `src/backend/dataplane/`. Large reads
+never travel as a single frame; they are chunk fetches, capped by
+`MaxPayloadLen` (64 MiB).
+
+**Transport carrier.** The server always listens on both TCP and QUIC on the
+same bind (`runV2TCPListener` + `runV2QUICListener`). The client's
+`TransportMode` defaults to **`Tcp`**; `Quic` and `Auto` (try QUIC, fall back
+to TCP, remember the choice) are opt-in. So: **TCP+TLS is the default; QUIC is
+implemented but opt-in.** The carrier is just a pipe: the orlop binary frame
+format above is identical over either, so QUIC is not an HTTP/3 protocol, only
+a different socket. QUIC stays in the tree because it offers stream
+multiplexing without head-of-line blocking and connection migration across
+network changes; it is held opt-in pending throughput parity on large cold
+reads.
+
+### Op codes
+
+All ops are client→server requests except `LEASE_REVOKE`, which the server
+pushes to the client. (Codes from `cmd/orlop-server/dataplane/protocol.go`.)
+
+| Op | Hex | Direction |
+|----|-----|-----------|
+| `LIST` | 0x01 | client → server |
+| `STAT` | 0x02 | client → server |
+| `PING` | 0x04 | client → server |
+| `CLOSE` | 0x05 | client → server |
+| `MANIFEST_GET` | 0x06 | client → server |
+| `MANIFEST_PUT` | 0x07 | client → server |
+| `CHUNK_GET` | 0x08 | client → server |
+| `CHUNK_HAS` | 0x09 | client → server |
+| `CHUNK_PUT` | 0x0A | client → server |
+| `MANIFEST_DELETE` | 0x0B | client → server |
+| `MANIFEST_RENAME` | 0x0C | client → server |
+| `DIR_CREATE` | 0x0D | client → server |
+| `DIR_REMOVE` | 0x0E | client → server |
+| `SETATTR` | 0x0F | client → server |
+| `LEASE_GRANT` | 0x10 | client → server |
+| `LEASE_REFRESH` | 0x11 | client → server |
+| `LEASE_RELEASE` | 0x12 | client → server |
+| `LEASE_REVOKE` | 0x13 | server → client (push) |
+| `JOURNAL_QUERY` | 0x15 | client → server |
+| `SYMLINK` | 0x16 | client → server |
+| `READLINK` | 0x17 | client → server |
+| `JOURNAL_REVERT_PATH` | 0x18 | client → server |
+| `MKNOD` | 0x19 | client → server |
+
+A benchmark harness (`orlop-bench`, in `bench/`) drives synthetic filesystem
+workloads under emulated WAN; the TCP-vs-QUIC comparison that set the default
+is summarized in one line above (QUIC was ~4× slower on 100 MiB cold reads).
+
+## 13. Threat model
+
+The mount client runs next to an untrusted agent, so the data plane assumes
+the agent may send anything. Defenses:
+
+- **Tenant comes from the cert, never the request.** mTLS identifies the
+  client; the per-agent identity is bound to its certificate. The session is
+  gated before any frame is served: a revoked leaf is dropped, and the
+  intermediate that signed the leaf must carry a tenant OU matching the leaf's
+  tenant SAN (fail-closed cross-tenant gate). See [`design-auth.md`](design-auth.md).
+- **Per-op policy still runs server-side** (`cmd/orlop-server/policy.go`); a
+  valid connection does not imply a valid operation.
+- **Chunks are content-verified, not trusted.** A chunk's name is its hash, so
+  a tampered chunk fails verification on read, and a chunk cannot be addressed
+  without already knowing its 256-bit hash.
+- **Writes are authorized at the manifest, not the chunk.** Uploading a chunk
+  is harmless (it dedups); binding a path to a chunk list is the gated step.
+
+Chunks are not encrypted at rest: tenant TLS isolates the data plane in
+transit, and at-rest encryption is left to the host filesystem. Per-tenant
+process and database isolation, not in-band encryption, is the data-at-rest
+boundary.

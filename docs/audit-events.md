@@ -1,155 +1,310 @@
-# Audit + Observability — `audit.log` and `/metrics`
+# Audit Events and Metrics
 
-The Orlop data plane writes one JSONL audit event per FUSE op, every chunk
-or manifest RPC, every lease lifecycle transition, and every GC sweep.
-`orlop audit tail` streams these events from the client. The Prometheus
-exposition at `/metrics` (server only) reports the same activity in aggregate.
+orlop records what happens to a tenant's files in two complementary forms:
 
-This doc is the canonical schema. Operators tail it; dashboards depend on
-the event names; new layers must conform.
+- **`audit.log`**: one JSON object per line (JSONL), one line per filesystem
+  operation, chunk/manifest RPC, lease transition, and GC sweep. It answers
+  "who touched what, when, and was it allowed?"
+- **`/metrics`**: a Prometheus exposition on the server that reports the same
+  activity in aggregate (latencies, byte counters, lease gauges).
+
+The agent is untrusted, so the audit log never takes the caller's word for
+identity: server-side lines carry the `tenant_id`/`agent_id` taken from the
+verified client certificate, not from anything in the request. The two halves
+of orlop (the Rust mount client and the Go data-plane server) write the
+*same line shape* to their own `audit.log`, so a single `jq` filter works
+across both.
 
 ## Where events come from
 
-| Layer | Process | Emitter |
+| Surface | Process | Writes |
 |---|---|---|
-| FUSE handlers (lookup, readdir, open, read, write, …) | `orlop` (Rust client) | `src/audit.rs` via `crate::audit::AuditLog` |
-| Chunk + manifest + lease handlers | `orlop-server` (Go) | `cmd/orlop-server/audit.go` via `*AuditLog` |
-| Lease lifecycle (grant/refresh/release/revoke/violation) | `orlop-server` | `cmd/orlop-server/lease.go` |
-| Cache poisoning detection | `orlop` (Rust client) | `src/backend/dataplane/cache.rs` |
-| Chunk GC sweep | `orlop-server` | `cmd/orlop-server/audit.go` `RecordGCSweep` |
+| FUSE / NFS handlers (lookup, read, create, write, …) | `orlop` (Rust mount client) | `src/audit.rs` |
+| Client read-cache integrity check | `orlop` (Rust mount client) | `src/backend/dataplane/cache.rs` |
+| Agent enrollment | `orlop` (Rust mount client) | `src/main.rs` |
+| Data-plane RPCs (manifest, chunk, dir, journal) | `orlop-server` (Go) | `cmd/orlop-server/dataplane_server.go` |
+| Lease lifecycle | `orlop-server` (Go) | `cmd/orlop-server/lease.go` |
+| Chunk GC + agent purge | `orlop-server` (Go) | `cmd/orlop-server/gc.go`, `control_purge_agent.go` |
+| Control HTTP endpoint (`/audit`) | `orlop-server` (Go) | `cmd/orlop-server/handlers.go` |
 
-Both halves write to the same on-disk file (`audit.log` or
-`<storeRoot>/audit.log` on the server); the line shape is identical so a
-single `tail -f` works across both.
+Each side writes to the path named by its `audit_log` config key (default
+`./audit.log`). The client streams its own file with `orlop audit tail`; the
+server's `/audit` endpoint reads the server file.
 
-## Common fields
+A user-level operation often appears on *both* sides. A `setattr`, for example,
+produces one client line (the FUSE op the kernel handed `orlop`) and one server
+line (the wire op `orlop-server` executed). Tell them apart by the identity
+fields: client lines name the calling process in `command` and have no
+`tenant_id`; server lines have `command: "orlop-server"` plus `tenant_id` and
+the cert fields.
 
-Every event carries:
+## The envelope
 
-- `ts` — RFC3339 UTC timestamp.
-- `event` — event type (see table below).
-- `path` — mount-relative path the op acted on. Empty for chunk events
-  (chunks are content-addressed) and for `gc_swept_chunks`.
-- `allowed` — `true` if the op completed (or was permitted), `false` for a
-  policy denial or a `lease_violation`.
-- `command` — emitter binary name (`orlop`, `orlop-server`).
-- `agent_pid`, `agent_id`, `uid`, `gid` — caller identity. Server-side
-  events also carry `tenant_id`, `cert_serial`, `cert_subject`.
+Every line is a flat JSON object. These fields form the shared envelope; the
+catalogue below lists only the fields specific to each event.
 
-Optional fields (omitted from JSONL when absent) are documented per event.
-
-## Event catalogue
-
-### FUSE / read surface (Rust client)
-
-| `event` | Fields | When |
+| Field | Type | Meaning |
 |---|---|---|
-| `lookup` | `path`, `allowed` | FUSE lookup |
-| `readdir_entry` | `path`, `allowed` | one event per entry returned to FUSE |
-| `open` | `path`, `allowed` | open(2) |
-| `read` | `path`, `size`, `offset`, `allowed` | read(2) chunk |
+| `ts` | RFC3339 string | When the event was written (UTC). |
+| `event` | string | Event name (the catalogue keys below). |
+| `path` | string | Mount-relative path the op acted on. Empty for content-addressed (`chunk_*`), journal, and sweep events. |
+| `allowed` | bool | `true` if the op completed or was permitted; `false` for a denial. See conventions. |
+| `command` | string | Client: the calling process name (from `/proc/<pid>/comm` on Linux). Server: `"orlop-server"`. |
+| `agent_pid` | int | Client: PID of the process that issued the syscall. |
+| `uid`, `gid` | int | Caller's user/group id. |
 
-### Write surface (Rust client)
+Identity richness depends on the emitter:
 
-| `event` | Fields |
-|---|---|
-| `create`, `mkdir`, `unlink`, `rmdir` | `path`, `mode?`, `allowed` |
-| `rename` | `path` (from), `to_path`, `allowed` |
-| `setattr` | `path`, `setattr_fields` (bitmask), `mode?`, `allowed` |
-| `flush` | `path`, `size`, `chunks_new`, `chunks_reused`, `cas_retries`, `version_new`, `allowed` |
+- **Server data-plane and HTTP events** add `agent_id`, `tenant_id`,
+  `cert_serial`, `cert_subject`, all read from the verified client cert.
+- **`session_id`** (optional) is the mount's implicit session id: at mount time
+  orlop stamps each backend with a `mount:<hex>` id (derived from the
+  exclusive-mount lease), and every write for the lifetime of that mount carries
+  it. It is omitted on non-write events.
+- **`size`** (optional) appears only on events that move or measure bytes:
+  `read`, `flush`, `head_file`, `manifest_get`, `manifest_put`, `chunk_get`,
+  `chunk_put`. It is absent on `manifest_delete`, `manifest_rename`, `chunk_has`
+  (which carries `count` instead), and open/create-style events.
+- **Lease-lifecycle and GC events carry a deliberately reduced envelope.** See
+  those sections.
 
-`setattr_fields` bitmask: `0x01` mode, `0x02` uid, `0x04` gid, `0x08` size,
-`0x10` mtime, `0x20` atime.
+## Conventions
 
-### Data plane RPCs (server)
+- **Success vs failure is the `allowed` boolean, not a status code.** The wire
+  has no HTTP status; a failed op is logged with `allowed: false`.
+- **Policy and authorization denials reuse the op's own event name.** When an
+  agent cert's per-agent scope rejects a path, the server writes the normal op
+  line (e.g. `manifest_put`) with `allowed: false`, rather than a distinct
+  "denied" event.
+- **`lease_denied` and `lease_violation` are not `allowed: false`.** Both
+  hard-code `allowed: true`: `lease_denied` records that the client fell back
+  to an uncached path, and `lease_violation` records a server-side lease
+  invariant break. Neither is a caller-facing access denial.
+- **What is not logged:** file *contents* never appear; chunk events carry the
+  BLAKE3 hash and byte count only. `chunk_has` is summarized as a batch count
+  rather than one line per probed hash, to bound log volume. The log is
+  unredacted, so keep `audit.log` access-controlled like any sensitive log.
 
-| `event` | Fields |
-|---|---|
-| `manifest_get` | `path`, `size`, `version`, `allowed`, `lease_id?` |
-| `manifest_put` | `path`, `size`, `version` (post-write), `allowed`, `lease_id?` |
-| `chunk_get` | `hash`, `size`, `allowed` (path empty — content-addressed) |
-| `chunk_put` | `hash`, `size`, `allowed` |
-| `chunk_has` | `count` (number of hashes probed), `allowed` (one event per batch) |
+## Catalogue
 
-### Lease lifecycle (server)
+### Mount client: FUSE/NFS surface (Rust)
 
-| `event` | Fields |
-|---|---|
-| `lease_grant` | `path`, `lease_id`, `mode` (`read` \| `write`), `agent_id` |
-| `lease_refresh` | `path`, `lease_id`, `mode`, `agent_id` |
-| `lease_release` | `path`, `lease_id`, `mode`, `reason` (`client` \| `conn_closed`) |
-| `lease_revoke` | `path`, `lease_id`, `mode`, `reason` (e.g. `contention`, `manifest_put_contention`) |
-| `lease_violation` | `path`, `lease_id`, `mode`, `reason` (e.g. `revoke_timeout`) |
+These are emitted as the kernel drives the mount. Envelope identity is the
+calling process (`command`, `agent_pid`, `uid`, `gid`).
 
-`mode` is `read` for `LeaseSharedRead`, `write` for `LeaseExclusiveWrite`.
-
-### Cache + GC
-
-| `event` | Fields | When |
+| `event` | When | Extra fields |
 |---|---|---|
-| `cache_corrupt` | `path` (hex hash), `size`, `allowed: false` | Client cache returned bytes that failed BLAKE3 verification; entry is dropped + refetched. |
-| `gc_swept_chunks` | `tenant_id`, `count`, `bytes_freed` | One event per tenant per sweep cycle. |
+| `lookup` | path resolution | `size` (on hit) |
+| `opendir` | directory open | none |
+| `readdir_entry` | one per child returned to `readdir` | none |
+| `readdirplus_entry` | one per child returned to `readdirplus` | none |
+| `open` | file open | none |
+| `read` | `read(2)` served from the chunk cache | `size`, `offset` |
+| `create` | file create | `mode` |
+| `mkdir` | directory create | `mode` |
+| `unlink` | file remove | none |
+| `rmdir` | directory remove | none |
+| `rename` | rename | `to_path` (`path` is the source) |
+| `symlink` | symlink create | none |
+| `setattr` | `chmod`/`chown`/`truncate`/`utimes` | `setattr_fields` (bitmask) |
+| `flush` | dirty file flushed to the server | `size`, `chunks_new`, `chunks_reused`, `cas_retries`, `version_new`, `recovery_*` (on a write conflict) |
+| `lease_denied` | write lease refused; client falls back | `allowed: true` |
 
-### HTTP surface (legacy v1, retained for hosted demo / inspection)
+`setattr_fields` is a bitmask of which attributes the call set:
 
-`http_create_entity`, `http_get_entity`, `http_list_entries`, `http_head_file`,
-`http_get_file`, `http_get_audit`, `http_auth`. Same `path` / `size` /
-`allowed` shape as the v1 events.
+| Bit | Field |
+|---|---|
+| `0x01` | mode |
+| `0x02` | uid |
+| `0x04` | gid |
+| `0x08` | size (truncate) |
+| `0x10` | mtime |
+| `0x20` | atime |
+
+Sample of a `read` of 4 KiB at offset 0:
+
+```json
+{"ts":"2026-06-27T18:21:09.114Z","event":"read","path":"/agent-7/data/model.bin",
+ "size":4096,"offset":0,"command":"python3","agent_pid":48211,"uid":1000,"gid":1000,
+ "allowed":true}
+```
+
+Sample of a `flush` that wrote two new chunks and reused one:
+
+```json
+{"ts":"2026-06-27T18:21:10.882Z","event":"flush","path":"/agent-7/data/out.txt",
+ "size":1310720,"chunks_new":2,"chunks_reused":1,"cas_retries":0,"version_new":8,
+ "command":"python3","agent_pid":48211,"uid":1000,"gid":1000,"allowed":true}
+```
+
+### Mount client: cache integrity (Rust)
+
+| `event` | When | Extra fields |
+|---|---|---|
+| `cache_corrupt` | a cached chunk's bytes failed BLAKE3 re-verification; the entry is dropped and refetched | `path` = hex hash, `size`, `allowed: false` |
+
+```json
+{"ts":"2026-06-27T18:22:01.004Z","event":"cache_corrupt",
+ "path":"7d865e959b2466918c9863afca942d0fb89d7c9ac0c99bafc3749504ded97730",
+ "size":1048576,"command":"orlop","agent_pid":48000,"uid":1000,"gid":1000,
+ "allowed":false}
+```
+
+### Mount client: enrollment (Rust)
+
+| `event` | When | Extra fields |
+|---|---|---|
+| `enrollment` | the agent obtains its leaf certificate at mount time | `path` = new cert serial on success; empty with `allowed: false` on failure |
+
+### Data plane: binary RPCs (Go server)
+
+Emitted over the long-lived mTLS data connection (binary frames + msgpack),
+not over HTTP. Identity comes from the agent's client cert: these lines carry
+`agent_id`, `tenant_id`, `cert_serial`, `cert_subject`, and `command:
+"orlop-server"`.
+
+| `event` | When | Extra fields |
+|---|---|---|
+| `list_entries` | directory listing | none |
+| `head_file` | file stat | `size` (on success) |
+| `manifest_get` | read a path's manifest | `size`, `version` |
+| `manifest_put` | write a path's manifest (CAS on version) | `size`, `version` (post-write), `session_id?` |
+| `manifest_delete` | delete a path | `session_id?` |
+| `manifest_rename` | rename a path | `path` = source, `session_id?` |
+| `dir_create` | create a directory | `session_id?` |
+| `dir_remove` | remove a directory | `session_id?` |
+| `setattr` | apply attribute change | `session_id?` |
+| `symlink` | create a symlink | `session_id?` |
+| `mknod` | create a special node | `session_id?` |
+| `readlink` | read a symlink target | none |
+| `chunk_get` | fetch a chunk | `hash`, `size` (`path` empty) |
+| `chunk_put` | store a chunk | `hash`, `size`, `session_id?` (`path` empty) |
+| `chunk_has` | presence probe for a batch of hashes | `count` = hashes probed (`path` empty) |
+| `journal_query` | query the per-tenant journal | none (`path` empty) |
+| `journal_revert_path` | revert a path via the journal | none (`path` empty) |
+
+Sample of a `manifest_put` accepted at version 8:
+
+```json
+{"ts":"2026-06-27T18:21:10.901Z","event":"manifest_put","path":"/agent-7/data/out.txt",
+ "size":1310720,"version":8,"agent_id":"agent-7","tenant_id":"acme",
+ "cert_serial":"3af9...","cert_subject":"spiffe://orlop.example/agent/agent-7",
+ "uid":0,"gid":0,"command":"orlop-server","allowed":true}
+```
+
+### Lease lifecycle (Go server)
+
+Leases coordinate concurrent writers (see
+[design-data-plane.md](design-data-plane.md)). These lines carry a reduced
+envelope (`agent_id`, `lease_id`, `mode`, `reason`) and always
+`allowed: true`. `mode` is `read` for a shared-read lease, `write` for an
+exclusive-write lease.
+
+| `event` | When | `reason` values |
+|---|---|---|
+| `lease_grant` | lease granted | (empty) |
+| `lease_refresh` | holder renews | (empty) |
+| `lease_release` | lease released | `client`, `conn_closed` |
+| `lease_revoke` | holder asked to yield | `contention`, `manifest_put_contention` |
+| `lease_violation` | holder did not yield in time, or the lease expired | `revoke_timeout`, `expired` |
+
+```json
+{"ts":"2026-06-27T18:21:11.220Z","event":"lease_revoke","path":"/agent-7/data/out.txt",
+ "lease_id":"5f2a1c7e9b0d4a3f8c6e2d1b0a9f8e7d","mode":"write","agent_id":"agent-7",
+ "reason":"contention","allowed":true}
+```
+
+### Chunk GC and agent purge (Go server)
+
+| `event` | When | Extra fields |
+|---|---|---|
+| `gc_swept_chunks` | one per tenant per GC sweep cycle | `tenant_id`, `count`, `bytes_freed`, `dry_run` (`path` empty) |
+| `agent_data_purged` | an agent's subtree is purged via the control endpoint | `tenant_id`, `count` (manifests deleted), `bytes_freed` |
+
+```json
+{"ts":"2026-06-27T03:00:00.000Z","event":"gc_swept_chunks","path":"","tenant_id":"acme",
+ "count":42,"bytes_freed":58720256,"dry_run":false,"command":"orlop-server","allowed":true}
+```
+
+### Control HTTP endpoint (Go server)
+
+The server's only HTTP audit events. Everything else above rides the binary
+data plane.
+
+| `event` | When | Extra fields |
+|---|---|---|
+| `http_get_audit` | the mTLS-gated `GET /audit` endpoint served the log | `path` = `/audit`, `size` = number of audit records returned (after tenant/agent scoping and the limit cap) |
+| `http_auth` | a request failed authentication at the HTTP layer | `path` = request path+query, `allowed: false` |
 
 ## `orlop audit tail`
 
+Streams the client's `audit.log`. Filters AND together.
+
 ```
-orlop audit tail [--limit N] [--follow]
-                 [--entity <type>:<id>]
-                 [--event <name>]            # repeatable
-                 [--lease-id <hex>]
+orlop audit tail [--event <name>]   # repeatable; matches if any listed name matches
+                 [--lease-id <hex>] # only lease_* events for that lease
+                 [--limit N]        # print the last N matching lines
+                 [--follow]         # keep streaming new lines
 ```
 
-Filters AND together. `--event` may be passed multiple times; an event
-matches if any listed name matches. `--lease-id` filters to the lease
-lifecycle events for one lease (and skips events that don't carry a
-`lease_id`).
-
-Examples:
+`--lease-id` skips any event that has no `lease_id`. Omitting both `--limit`
+and an explicit `--follow` defaults to follow mode.
 
 ```
 orlop audit tail --event lease_revoke
 orlop audit tail --event manifest_put --event lease_grant --follow
-orlop audit tail --lease-id 5f2a... --limit 50
+orlop audit tail --lease-id 5f2a1c7e9b0d4a3f8c6e2d1b0a9f8e7d --limit 50
 ```
 
-## Prometheus metrics — `/metrics`
+## Metrics: `/metrics`
 
-`orlop-server` exposes a Prometheus exposition at `/metrics` (unauthenticated;
-mTLS-terminated externally if desired). Collectors:
+`orlop-server` exposes a Prometheus exposition at `GET /metrics`. Both
+`/metrics` and `/healthz` are unauthenticated by design: scrapers and health
+checks do not carry mTLS client certs. `/audit`, by contrast, is mTLS-gated.
 
-- `orlop_dataplane_op_duration_seconds{op}` — histogram of server-side
-  handler latency. `op` ∈ `{list, stat, read, manifest_get, manifest_put,
-  manifest_delete, manifest_rename, dir_create, dir_remove, chunk_get,
-  chunk_has, chunk_put, lease_grant, lease_refresh, lease_release,
-  lease_revoke}`. Buckets: exponential, base 2, 14 buckets starting at
-  500 µs.
-- `orlop_dataplane_bytes_total{direction, op}` — counter of payload bytes.
-  `direction=in` for client→server bytes (`chunk_put`, `manifest_put`),
-  `direction=out` for server→client bytes (`chunk_get`, `chunk_has`,
-  `manifest_get`).
-- `orlop_chunks_total{state}` — counter of chunk lifecycle events.
-  `state=cached` on a `chunk_put` that stored fresh bytes; `state=deduped`
-  on a `chunk_put` that hit an existing object; `state=fetched` on a
-  successful `chunk_get`; `state=evicted` on each chunk freed by
-  `gc_swept_chunks`.
-- `orlop_lease_held{path}` — gauge, set to `1` while a lease is held on
-  `path`, removed when the lease releases. Per-path cardinality is
-  bounded by the number of files under active write — operators on
-  workloads with many short-lived leases should watch series count.
+The four primary collectors:
 
-The `/metrics` endpoint is intentionally outside the mTLS-required
-middleware so a non-tenant scraper can collect it.
+- **`orlop_dataplane_op_duration_seconds{op}`**: histogram of server-side
+  handler latency. Buckets are exponential, base 2, 14 buckets starting at
+  500 µs. The `op` label set (no `read`; file reads are served client-side
+  from the chunk cache):
 
-## Out of scope
+  ```
+  list  stat  manifest_get  manifest_put  manifest_delete  manifest_rename
+  dir_create  dir_remove  setattr  symlink  readlink  mknod
+  chunk_get  chunk_has  chunk_put  journal_query  journal_revert_path
+  ping  close  lease_grant  lease_refresh  lease_release  lease_revoke
+  ```
 
-- OpenTelemetry tracing.
-- Long-term metric storage and dashboard definitions.
+  Note the metric labels `list`/`stat` correspond to the audit events
+  `list_entries`/`head_file`; the names differ between the two surfaces.
 
-Both are tracked as separate issues; this doc only covers the on-disk
-event schema and the in-process Prometheus collectors.
+- **`orlop_dataplane_bytes_total{direction, op}`**: counter of payload bytes.
+  `direction=in` for client→server (`chunk_put`, `manifest_put`),
+  `direction=out` for server→client (`chunk_get`, `chunk_has`, `manifest_get`).
+
+- **`orlop_chunks_total{state}`**: chunk lifecycle counter. Emitted states:
+  `fetched` (a `chunk_get` hit), `cached` (a `chunk_put` that stored fresh
+  bytes), `deduped` (a `chunk_put` whose content already existed). The help
+  text also names `evicted`, but GC does not currently touch this counter, so
+  that state is reserved and never emitted.
+
+- **`orlop_lease_held{path}`**: gauge set to `1` while a lease is held on
+  `path`, with the series removed on release. Per-path cardinality is bounded
+  by the number of files under active write; watch series count on workloads
+  with many short-lived leases.
+
+Also exposed:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `orlop_journal_writes_total` | counter | `op`, `allocation_id` |
+| `orlop_journal_query_duration_seconds` | histogram | none |
+| `orlop_journal_rows_total` | gauge | `allocation_id` |
+| `orlop_journal_revert_total` | counter | `allocation_id`, `result` |
+| `orlop_session_forgery_rejected_total` | counter | `reason` (`bad_format`, `bad_hex`, `unknown_or_wrong_conn`, `fenced`) |
+| `orlop_agent_path_denied_total` | counter | `op` |
+
+`orlop_agent_path_denied_total` increments when a connection whose cert carries
+an `/agent/<id>` SAN touches a path outside that agent's subtree, the same
+event that writes an `allowed: false` op line to `audit.log`.
