@@ -41,19 +41,6 @@ CREATE TABLE cert_revocations (
     reason text DEFAULT ''::text NOT NULL,
     revoked_at timestamp with time zone DEFAULT now() NOT NULL
 );
-CREATE TABLE device_authorizations (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    device_code_hash text NOT NULL,
-    user_code_hash text NOT NULL,
-    tenant_id text,
-    user_id uuid,
-    allocation_id uuid,
-    status text NOT NULL,
-    expires_at timestamp with time zone NOT NULL,
-    approved_at timestamp with time zone,
-    last_polled_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
 CREATE TABLE dg_ca_secrets (
     key text NOT NULL,
     value bytea NOT NULL,
@@ -74,18 +61,6 @@ CREATE TABLE disk_allocations (
     tenant_id text,
     CONSTRAINT disk_allocations_lease_requires_binding CHECK ((((bound_agent_id IS NULL) AND (bound_at IS NULL) AND (lease_expires_at IS NULL)) OR ((bound_agent_id IS NOT NULL) AND (bound_at IS NOT NULL)))),
     CONSTRAINT disk_allocations_size_bytes_check CHECK ((size_bytes > 0))
-);
-CREATE TABLE refresh_tokens (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    token_hash text NOT NULL,
-    family_id uuid NOT NULL,
-    user_id uuid NOT NULL,
-    tenant_id text NOT NULL,
-    allocation_id uuid,
-    expires_at timestamp with time zone NOT NULL,
-    revoked_at timestamp with time zone,
-    rotated_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 CREATE TABLE server_pool (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -145,20 +120,10 @@ ALTER TABLE ONLY api_tokens
     ADD CONSTRAINT api_tokens_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY cert_revocations
     ADD CONSTRAINT cert_revocations_pkey PRIMARY KEY (cert_serial);
-ALTER TABLE ONLY device_authorizations
-    ADD CONSTRAINT device_authorizations_device_code_hash_key UNIQUE (device_code_hash);
-ALTER TABLE ONLY device_authorizations
-    ADD CONSTRAINT device_authorizations_pkey PRIMARY KEY (id);
-ALTER TABLE ONLY device_authorizations
-    ADD CONSTRAINT device_authorizations_user_code_hash_key UNIQUE (user_code_hash);
 ALTER TABLE ONLY dg_ca_secrets
     ADD CONSTRAINT dg_ca_secrets_pkey PRIMARY KEY (key);
 ALTER TABLE ONLY disk_allocations
     ADD CONSTRAINT disk_allocations_pkey PRIMARY KEY (id);
-ALTER TABLE ONLY refresh_tokens
-    ADD CONSTRAINT refresh_tokens_pkey PRIMARY KEY (id);
-ALTER TABLE ONLY refresh_tokens
-    ADD CONSTRAINT refresh_tokens_token_hash_key UNIQUE (token_hash);
 ALTER TABLE ONLY server_pool
     ADD CONSTRAINT server_pool_data_addr_key UNIQUE (data_addr);
 ALTER TABLE ONLY server_pool
@@ -183,15 +148,12 @@ CREATE INDEX agent_enrollments_user_id_idx ON agent_enrollments USING btree (use
 CREATE UNIQUE INDEX api_tokens_token_hash_idx ON api_tokens USING btree (token_hash);
 CREATE INDEX api_tokens_user_id_active_idx ON api_tokens USING btree (user_id) WHERE (revoked_at IS NULL);
 CREATE INDEX cert_revocations_expires_at_idx ON cert_revocations USING btree (expires_at);
-CREATE INDEX device_authorizations_status_idx ON device_authorizations USING btree (status);
 CREATE UNIQUE INDEX disk_allocations_agent_active_idx ON disk_allocations USING btree (agent_id) WHERE (revoked_at IS NULL);
 CREATE INDEX disk_allocations_bound_agent_idx ON disk_allocations USING btree (bound_agent_id) WHERE (bound_agent_id IS NOT NULL);
 CREATE INDEX disk_allocations_expires_at_idx ON disk_allocations USING btree (expires_at) WHERE (expires_at IS NOT NULL);
 CREATE INDEX disk_allocations_purge_pending_idx ON disk_allocations USING btree (revoked_at) WHERE ((revoked_at IS NOT NULL) AND (purged_at IS NULL));
 CREATE INDEX disk_allocations_tenant_id_idx ON disk_allocations USING btree (tenant_id);
 CREATE INDEX disk_allocations_user_active_idx ON disk_allocations USING btree (user_id) WHERE (revoked_at IS NULL);
-CREATE INDEX refresh_tokens_family_id_idx ON refresh_tokens USING btree (family_id);
-CREATE INDEX refresh_tokens_user_id_idx ON refresh_tokens USING btree (user_id);
 CREATE INDEX server_pool_available_idx ON server_pool USING btree (free_bytes DESC) WHERE (status = 'available'::text);
 CREATE INDEX sessions_anonymous_created_at_idx ON sessions_anonymous USING btree (created_at) WHERE (claimed_at IS NULL);
 CREATE INDEX sessions_anonymous_device_unclaimed_idx ON sessions_anonymous USING btree (device_id, created_at DESC) WHERE (claimed_at IS NULL);
@@ -206,24 +168,12 @@ ALTER TABLE ONLY agent_enrollments
     ADD CONSTRAINT agent_enrollments_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT;
 ALTER TABLE ONLY api_tokens
     ADD CONSTRAINT api_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
-ALTER TABLE ONLY device_authorizations
-    ADD CONSTRAINT device_authorizations_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES disk_allocations(id) ON DELETE RESTRICT;
-ALTER TABLE ONLY device_authorizations
-    ADD CONSTRAINT device_authorizations_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT;
-ALTER TABLE ONLY device_authorizations
-    ADD CONSTRAINT device_authorizations_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT;
 ALTER TABLE ONLY disk_allocations
     ADD CONSTRAINT disk_allocations_bound_agent_id_fkey FOREIGN KEY (bound_agent_id) REFERENCES agent_enrollments(id) ON DELETE SET NULL;
 ALTER TABLE ONLY disk_allocations
     ADD CONSTRAINT disk_allocations_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id);
 ALTER TABLE ONLY disk_allocations
     ADD CONSTRAINT disk_allocations_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
-ALTER TABLE ONLY refresh_tokens
-    ADD CONSTRAINT refresh_tokens_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES disk_allocations(id) ON DELETE RESTRICT;
-ALTER TABLE ONLY refresh_tokens
-    ADD CONSTRAINT refresh_tokens_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT;
-ALTER TABLE ONLY refresh_tokens
-    ADD CONSTRAINT refresh_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT;
 ALTER TABLE ONLY server_vms
     ADD CONSTRAINT server_vms_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT;
 ALTER TABLE ONLY sessions_anonymous
@@ -238,10 +188,8 @@ DROP TABLE IF EXISTS access_tokens CASCADE;
 DROP TABLE IF EXISTS agent_enrollments CASCADE;
 DROP TABLE IF EXISTS api_tokens CASCADE;
 DROP TABLE IF EXISTS cert_revocations CASCADE;
-DROP TABLE IF EXISTS device_authorizations CASCADE;
 DROP TABLE IF EXISTS dg_ca_secrets CASCADE;
 DROP TABLE IF EXISTS disk_allocations CASCADE;
-DROP TABLE IF EXISTS refresh_tokens CASCADE;
 DROP TABLE IF EXISTS server_pool CASCADE;
 DROP TABLE IF EXISTS server_vms CASCADE;
 DROP TABLE IF EXISTS sessions_anonymous CASCADE;
