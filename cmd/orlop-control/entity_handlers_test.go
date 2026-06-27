@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
 
 const (
@@ -30,92 +30,88 @@ const (
 // live database. It records the calls it received and serves a canned
 // allocation row keyed on agent_id.
 type fakeEntityQuerier struct {
-	ensuredTenant  sqlcdb.EnsureTenantParams
-	ensuredUser    sqlcdb.EnsureUserWithIDParams
-	upserted       sqlcdb.UpsertAgentAllocationParams
-	allocByAgent   map[string]sqlcdb.DiskAllocation // agent_id -> row
-	usersByID      map[string]sqlcdb.User           // uuid string -> row
-	reassigned     sqlcdb.ReassignAgentAllocationParams
-	ensureTenantEr error
-	upsertErr      error
+	ensuredTenantID string // last EnsureTenant id
+	ensuredUser     storage.NewUser
+	upserted        storage.NewAgentAllocation
+	allocByAgent    map[string]storage.Allocation // agent_id -> row
+	usersByID       map[string]storage.User       // uuid string -> row
+	ensureTenantEr  error
+	upsertErr       error
 }
 
 func newFakeEntityQuerier() *fakeEntityQuerier {
 	return &fakeEntityQuerier{
-		allocByAgent: map[string]sqlcdb.DiskAllocation{},
-		usersByID:    map[string]sqlcdb.User{},
+		allocByAgent: map[string]storage.Allocation{},
+		usersByID:    map[string]storage.User{},
 	}
 }
 
 // Account-budget path stubs: no placement in unit tests, so the live resize is skipped.
-func (f *fakeEntityQuerier) ListAllocationsForUser(_ context.Context, _ pgtype.UUID) ([]sqlcdb.DiskAllocation, error) {
+func (f *fakeEntityQuerier) ListAllocationsForUser(_ context.Context, _ uuid.UUID) ([]storage.Allocation, error) {
 	return nil, nil
 }
-func (f *fakeEntityQuerier) UpdateAllocationSize(_ context.Context, _ sqlcdb.UpdateAllocationSizeParams) (sqlcdb.DiskAllocation, error) {
-	return sqlcdb.DiskAllocation{}, nil
+func (f *fakeEntityQuerier) UpdateAllocationSize(_ context.Context, _, _ uuid.UUID, _ int64) (storage.Allocation, error) {
+	return storage.Allocation{}, nil
 }
-func (f *fakeEntityQuerier) GetServerVMByTenant(_ context.Context, _ string) (sqlcdb.ServerVm, error) {
-	return sqlcdb.ServerVm{}, pgx.ErrNoRows
+func (f *fakeEntityQuerier) GetServerVMByTenant(_ context.Context, _ string) (storage.ServerVM, error) {
+	return storage.ServerVM{}, storage.ErrNotFound
 }
-func (f *fakeEntityQuerier) GetServerPoolByDataAddr(_ context.Context, _ string) (sqlcdb.ServerPool, error) {
-	return sqlcdb.ServerPool{}, pgx.ErrNoRows
+func (f *fakeEntityQuerier) GetServerPoolByDataAddr(_ context.Context, _ string) (storage.Server, error) {
+	return storage.Server{}, storage.ErrNotFound
 }
 
-func (f *fakeEntityQuerier) GetUser(_ context.Context, id pgtype.UUID) (sqlcdb.User, error) {
-	row, ok := f.usersByID[uuidString(id)]
+func (f *fakeEntityQuerier) GetUser(_ context.Context, id uuid.UUID) (storage.User, error) {
+	row, ok := f.usersByID[id.String()]
 	if !ok {
-		return sqlcdb.User{}, pgx.ErrNoRows
+		return storage.User{}, storage.ErrNotFound
 	}
 	return row, nil
 }
 
-func (f *fakeEntityQuerier) EnsureTenant(_ context.Context, arg sqlcdb.EnsureTenantParams) error {
-	f.ensuredTenant = arg
+func (f *fakeEntityQuerier) EnsureTenant(_ context.Context, id, _ string) error {
+	f.ensuredTenantID = id
 	return f.ensureTenantEr
 }
 
-func (f *fakeEntityQuerier) EnsureUserWithID(_ context.Context, arg sqlcdb.EnsureUserWithIDParams) error {
-	f.ensuredUser = arg
+func (f *fakeEntityQuerier) EnsureUserWithID(_ context.Context, in storage.NewUser) error {
+	f.ensuredUser = in
 	return nil
 }
 
-func (f *fakeEntityQuerier) UpsertAgentAllocation(_ context.Context, arg sqlcdb.UpsertAgentAllocationParams) (sqlcdb.DiskAllocation, error) {
-	f.upserted = arg
+func (f *fakeEntityQuerier) UpsertAgentAllocation(_ context.Context, in storage.NewAgentAllocation) (storage.Allocation, error) {
+	f.upserted = in
 	if f.upsertErr != nil {
-		return sqlcdb.DiskAllocation{}, f.upsertErr
+		return storage.Allocation{}, f.upsertErr
 	}
-	var id pgtype.UUID
-	_ = id.Scan(testHandle)
-	row := sqlcdb.DiskAllocation{ID: id, UserID: arg.UserID, AgentID: arg.AgentID, SizeBytes: arg.SizeBytes}
-	f.allocByAgent[arg.AgentID.String] = row
+	row := storage.Allocation{ID: uuid.MustParse(testHandle), UserID: in.UserID, AgentID: in.AgentID, SizeBytes: in.SizeBytes}
+	f.allocByAgent[in.AgentID] = row
 	return row, nil
 }
 
-func (f *fakeEntityQuerier) GetAllocationByAgent(_ context.Context, agentID pgtype.Text) (sqlcdb.DiskAllocation, error) {
-	row, ok := f.allocByAgent[agentID.String]
+func (f *fakeEntityQuerier) GetAllocationByAgent(_ context.Context, agentID string) (storage.Allocation, error) {
+	row, ok := f.allocByAgent[agentID]
 	if !ok {
-		return sqlcdb.DiskAllocation{}, pgx.ErrNoRows
+		return storage.Allocation{}, storage.ErrNotFound
 	}
 	return row, nil
 }
 
-func (f *fakeEntityQuerier) ReassignAgentAllocation(_ context.Context, arg sqlcdb.ReassignAgentAllocationParams) error {
-	f.reassigned = arg
-	if row, ok := f.allocByAgent[arg.AgentID.String]; ok {
-		row.UserID = arg.UserID
-		f.allocByAgent[arg.AgentID.String] = row
+func (f *fakeEntityQuerier) ReassignAgentAllocation(_ context.Context, agentID string, newUserID uuid.UUID) error {
+	if row, ok := f.allocByAgent[agentID]; ok {
+		row.UserID = newUserID
+		f.allocByAgent[agentID] = row
 	}
 	return nil
 }
 
-func (f *fakeEntityQuerier) RevokeAllocation(_ context.Context, arg sqlcdb.RevokeAllocationParams) (sqlcdb.DiskAllocation, error) {
+func (f *fakeEntityQuerier) RevokeAllocation(_ context.Context, allocID, _ uuid.UUID) error {
 	for k, row := range f.allocByAgent {
-		if uuidString(row.ID) == uuidString(arg.ID) {
+		if row.ID == allocID {
 			delete(f.allocByAgent, k)
-			return row, nil
+			return nil
 		}
 	}
-	return sqlcdb.DiskAllocation{}, pgx.ErrNoRows
+	return storage.ErrNotFound
 }
 
 // recordingMinter is a stub enrollTokenMinter that records its last-call args
@@ -277,11 +273,11 @@ func TestProvisionEntity_HappyPath(t *testing.T) {
 		t.Errorf("virtual_path = %q; want %q", got.VirtualPath, want)
 	}
 	// D3b: the agent's disk gets its OWN tenant "a_" + agent (the last EnsureTenant).
-	if q.ensuredTenant.ID != "a_"+testAgentID {
-		t.Errorf("agent tenant id = %q; want a_%s", q.ensuredTenant.ID, testAgentID)
+	if q.ensuredTenantID != "a_"+testAgentID {
+		t.Errorf("agent tenant id = %q; want a_%s", q.ensuredTenantID, testAgentID)
 	}
 	// D3: dg user reuses owner UUID, tenant is the D2 tenant, synthetic email.
-	if got := uuidString(q.ensuredUser.ID); got != testOwnerID {
+	if got := q.ensuredUser.ID.String(); got != testOwnerID {
 		t.Errorf("user id = %q; want %q", got, testOwnerID)
 	}
 	if q.ensuredUser.TenantID != "u_"+testOwnerID {
@@ -292,8 +288,8 @@ func TestProvisionEntity_HappyPath(t *testing.T) {
 	}
 	// D4: upsert keyed on agent_id, with the small initial elastic grant (1 GiB),
 	// not the 10 GiB ceiling.
-	if q.upserted.AgentID.String != testAgentID {
-		t.Errorf("upsert agent_id = %q", q.upserted.AgentID.String)
+	if q.upserted.AgentID != testAgentID {
+		t.Errorf("upsert agent_id = %q", q.upserted.AgentID)
 	}
 	if q.upserted.SizeBytes != agentDiskInitialGrantBytes {
 		t.Errorf("upsert size = %d; want %d", q.upserted.SizeBytes, agentDiskInitialGrantBytes)
@@ -302,8 +298,8 @@ func TestProvisionEntity_HappyPath(t *testing.T) {
 		t.Errorf("initial grant = %d; want 1 GiB", q.upserted.SizeBytes)
 	}
 	// The allocation is stamped with the per-agent tenant so a re-parent never moves data.
-	if q.upserted.TenantID.String != "a_"+testAgentID {
-		t.Errorf("upsert tenant_id = %q; want a_%s", q.upserted.TenantID.String, testAgentID)
+	if q.upserted.TenantID != "a_"+testAgentID {
+		t.Errorf("upsert tenant_id = %q; want a_%s", q.upserted.TenantID, testAgentID)
 	}
 }
 
@@ -486,15 +482,13 @@ func TestSetQuota_InvalidBody(t *testing.T) {
 // an allocation owned by testOwnerID, and GetUser(owner) returns a user in
 // testTenant — the chain the enroll-token handler walks.
 func seedAllocationAndUser(q *fakeEntityQuerier) {
-	var ownerID, allocID pgtype.UUID
-	_ = ownerID.Scan(testOwnerID)
-	_ = allocID.Scan(testHandle)
-	q.allocByAgent[testAgentID] = sqlcdb.DiskAllocation{
-		ID:      allocID,
+	ownerID := uuid.MustParse(testOwnerID)
+	q.allocByAgent[testAgentID] = storage.Allocation{
+		ID:      uuid.MustParse(testHandle),
 		UserID:  ownerID,
-		AgentID: pgtype.Text{String: testAgentID, Valid: true},
+		AgentID: testAgentID,
 	}
-	q.usersByID[testOwnerID] = sqlcdb.User{ID: ownerID, TenantID: testTenant}
+	q.usersByID[testOwnerID] = storage.User{ID: ownerID, TenantID: testTenant}
 }
 
 func TestEnrollToken_HappyPath(t *testing.T) {
@@ -569,9 +563,7 @@ func TestEnrollToken_Auth(t *testing.T) {
 
 func TestEntityDeleteRevokesAndPurgesInline(t *testing.T) {
 	q := newFakeEntityQuerier()
-	var allocID pgtype.UUID
-	_ = allocID.Scan(testHandle)
-	q.allocByAgent[testAgentID] = sqlcdb.DiskAllocation{ID: allocID}
+	q.allocByAgent[testAgentID] = storage.Allocation{ID: uuid.MustParse(testHandle)}
 
 	purger := &fakePurger{}
 	h := entityRouterWithPurger(q, "svc-secret", (&recordingMinter{}).mint, &fakeResizer{}, purger)
@@ -590,9 +582,7 @@ func TestEntityDeleteRevokesAndPurgesInline(t *testing.T) {
 
 func TestEntityDeletePurgeFailureStill204(t *testing.T) {
 	q := newFakeEntityQuerier()
-	var allocID pgtype.UUID
-	_ = allocID.Scan(testHandle)
-	q.allocByAgent[testAgentID] = sqlcdb.DiskAllocation{ID: allocID}
+	q.allocByAgent[testAgentID] = storage.Allocation{ID: uuid.MustParse(testHandle)}
 
 	purger := &fakePurger{err: context.DeadlineExceeded}
 	h := entityRouterWithPurger(q, "svc-secret", (&recordingMinter{}).mint, &fakeResizer{}, purger)

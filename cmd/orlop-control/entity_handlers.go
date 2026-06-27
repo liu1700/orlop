@@ -10,11 +10,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 // agentDiskInitialGrantBytes is the initial elastic grant for a freshly-
@@ -32,29 +33,24 @@ func agentVirtualPath(agentID string) string {
 	return "/mnt/orlop/agents/" + agentID
 }
 
-// entityQuerier is the slice of db.Store that the entity handlers need.
-// Declaring it as an interface lets the unit tests inject a stub without a live
-// database.
+// entityQuerier is the slice of the storage layer the entity handlers need:
+// the provisioning write surface plus the allocation/user reads the quota and
+// account-budget paths walk. Declaring it as an interface lets the unit tests
+// inject a stub without a live database; *postgres.Store satisfies it.
 type entityQuerier interface {
-	EnsureTenant(ctx context.Context, arg sqlcdb.EnsureTenantParams) error
-	EnsureUserWithID(ctx context.Context, arg sqlcdb.EnsureUserWithIDParams) error
-	UpsertAgentAllocation(ctx context.Context, arg sqlcdb.UpsertAgentAllocationParams) (sqlcdb.DiskAllocation, error)
-	ReassignAgentAllocation(ctx context.Context, arg sqlcdb.ReassignAgentAllocationParams) error
-	GetAllocationByAgent(ctx context.Context, agentID pgtype.Text) (sqlcdb.DiskAllocation, error)
-	GetUser(ctx context.Context, id pgtype.UUID) (sqlcdb.User, error)
+	storage.ProvisioningStore
+	GetUser(ctx context.Context, id uuid.UUID) (storage.User, error)
 	// Quota lifecycle (anon-trial funnel): revoke an agent's disk when a trial
 	// expires (DELETE). A cap upgrade (PATCH) routes through the
 	// resize primitive (allocationResizer), not a direct size write here.
-	RevokeAllocation(ctx context.Context, arg sqlcdb.RevokeAllocationParams) (sqlcdb.DiskAllocation, error)
-	// Account-budget path (the buy/upgrade): list a user's allocations to re-stamp the
-	// new account budget on each, and resolve where they're placed (the two placement
-	// getters below) to resize the live shared owner quota. This handler still resolves
-	// placement inline against these sqlc getters; it migrates onto the storage layer in
-	// a later stage.
-	ListAllocationsForUser(ctx context.Context, userID pgtype.UUID) ([]sqlcdb.DiskAllocation, error)
-	UpdateAllocationSize(ctx context.Context, arg sqlcdb.UpdateAllocationSizeParams) (sqlcdb.DiskAllocation, error)
-	GetServerVMByTenant(ctx context.Context, tenantID string) (sqlcdb.ServerVm, error)
-	GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (sqlcdb.ServerPool, error)
+	RevokeAllocation(ctx context.Context, allocID, userID uuid.UUID) error
+	// Account-budget path (the buy/upgrade): list a user's allocations to re-stamp
+	// the new account budget on each, and resolve where they're placed (the
+	// embedded tenantPlacementQuerier, consumed via resolveTenantOpsAddr) to
+	// resize the live shared owner quota.
+	ListAllocationsForUser(ctx context.Context, userID uuid.UUID) ([]storage.Allocation, error)
+	UpdateAllocationSize(ctx context.Context, allocID, userID uuid.UUID, sizeBytes int64) (storage.Allocation, error)
+	tenantPlacementQuerier
 }
 
 // accountQuotaSetter resizes the live JuiceFS quota on an account's owner tenant dir on
@@ -201,8 +197,8 @@ func (h *entityHandlers) handleProvision(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var ownerUUID pgtype.UUID
-	if err := ownerUUID.Scan(req.OwnerID); err != nil {
+	owner, err := uuid.Parse(req.OwnerID)
+	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "owner_id must be a uuid")
 		return
 	}
@@ -210,10 +206,7 @@ func (h *entityHandlers) handleProvision(w http.ResponseWriter, r *http.Request)
 	tenantID := tenantIDForOwner(req.OwnerID)
 
 	// D2: ensure the customer's per-user tenant (no CA bootstrap, no server_vm).
-	if err := h.queries.EnsureTenant(r.Context(), sqlcdb.EnsureTenantParams{
-		ID:   tenantID,
-		Name: tenantID,
-	}); err != nil {
+	if err := h.queries.EnsureTenant(r.Context(), tenantID, tenantID); err != nil {
 		h.logger.Error("entity_ensure_tenant_failed", "error", err, "tenant_id", tenantID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
@@ -222,8 +215,8 @@ func (h *entityHandlers) handleProvision(w http.ResponseWriter, r *http.Request)
 	// D3: ensure the dg user, reusing the orlop user UUID as the dg user id. Its
 	// tenant_id is a per-user placeholder that satisfies the FK and anchors the
 	// non-agent (OAuth) disk path; the agent's disk lives in its own tenant (D3b).
-	if err := h.queries.EnsureUserWithID(r.Context(), sqlcdb.EnsureUserWithIDParams{
-		ID:       ownerUUID,
+	if err := h.queries.EnsureUserWithID(r.Context(), storage.NewUser{
+		ID:       owner,
 		TenantID: tenantID,
 		Email:    syntheticUserEmail(req.OwnerID),
 	}); err != nil {
@@ -236,10 +229,7 @@ func (h *entityHandlers) handleProvision(w http.ResponseWriter, r *http.Request)
 	// tenant (not the owner's) is what lets a re-parent be a user_id flip with no
 	// data move (docs/design/per-agent-tenant.md).
 	agentTenant := tenantForAgent(req.EntityID)
-	if err := h.queries.EnsureTenant(r.Context(), sqlcdb.EnsureTenantParams{
-		ID:   agentTenant,
-		Name: agentTenant,
-	}); err != nil {
+	if err := h.queries.EnsureTenant(r.Context(), agentTenant, agentTenant); err != nil {
 		h.logger.Error("entity_ensure_agent_tenant_failed", "error", err, "tenant_id", agentTenant)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
@@ -253,10 +243,10 @@ func (h *entityHandlers) handleProvision(w http.ResponseWriter, r *http.Request)
 	if size <= 0 {
 		size = h.initialGrantBytes
 	}
-	row, err := h.queries.UpsertAgentAllocation(r.Context(), sqlcdb.UpsertAgentAllocationParams{
-		UserID:    ownerUUID,
-		AgentID:   pgtype.Text{String: req.EntityID, Valid: true},
-		TenantID:  pgtype.Text{String: agentTenant, Valid: true},
+	row, err := h.queries.UpsertAgentAllocation(r.Context(), storage.NewAgentAllocation{
+		UserID:    owner,
+		AgentID:   req.EntityID,
+		TenantID:  agentTenant,
 		SizeBytes: size,
 	})
 	if err != nil {
@@ -269,10 +259,10 @@ func (h *entityHandlers) handleProvision(w http.ResponseWriter, r *http.Request)
 		"agent_id", req.EntityID,
 		"owner_id", req.OwnerID,
 		"tenant_id", tenantID,
-		"handle", uuidString(row.ID))
+		"handle", row.ID.String())
 
 	writeJSON(w, http.StatusOK, entityResponse{
-		Handle:      uuidString(row.ID),
+		Handle:      row.ID.String(),
 		VirtualPath: agentVirtualPath(req.EntityID),
 	})
 }
@@ -289,9 +279,9 @@ func (h *entityHandlers) handleResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row, err := h.queries.GetAllocationByAgent(r.Context(), pgtype.Text{String: agentID, Valid: true})
+	row, err := h.queries.GetAllocationByAgent(r.Context(), agentID)
 	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) {
 			writeOAuthError(w, http.StatusNotFound, "not_found", "")
 			return
 		}
@@ -301,7 +291,7 @@ func (h *entityHandlers) handleResolve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, entityResponse{
-		Handle:      uuidString(row.ID),
+		Handle:      row.ID.String(),
 		VirtualPath: agentVirtualPath(agentID),
 	})
 }
@@ -338,9 +328,9 @@ func (h *entityHandlers) handleSetQuota(w http.ResponseWriter, r *http.Request) 
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "grant_bytes must be > 0")
 		return
 	}
-	alloc, err := h.queries.GetAllocationByAgent(r.Context(), pgtype.Text{String: agentID, Valid: true})
+	alloc, err := h.queries.GetAllocationByAgent(r.Context(), agentID)
 	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) {
 			writeOAuthError(w, http.StatusNotFound, "not_found", "")
 			return
 		}
@@ -351,7 +341,7 @@ func (h *entityHandlers) handleSetQuota(w http.ResponseWriter, r *http.Request) 
 	// Route through the end-to-end resize primitive so the new cap propagates to
 	// the data-plane ext4 quota and the server_pool reservation — not just the DB
 	// row. (Before this, the cap upgrade was a cosmetic DB-only change.)
-	resized, err := h.resize.Resize(r.Context(), h.serverAPI, alloc.ID, alloc.UserID, newGrant)
+	resized, err := h.resize.Resize(r.Context(), h.serverAPI, fromUUID(alloc.ID), fromUUID(alloc.UserID), newGrant)
 	if err != nil {
 		switch {
 		case errors.Is(err, allocations.ErrNotFound):
@@ -390,8 +380,8 @@ func (h *entityHandlers) handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "id is required")
 		return
 	}
-	alloc, err := h.queries.GetAllocationByAgent(r.Context(), pgtype.Text{String: agentID, Valid: true})
-	if errors.Is(err, db.ErrNotFound) {
+	alloc, err := h.queries.GetAllocationByAgent(r.Context(), agentID)
+	if errors.Is(err, storage.ErrNotFound) {
 		w.WriteHeader(http.StatusNoContent) // idempotent: nothing to revoke
 		return
 	}
@@ -400,9 +390,7 @@ func (h *entityHandlers) handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}
-	if _, err := h.queries.RevokeAllocation(r.Context(), sqlcdb.RevokeAllocationParams{
-		ID: alloc.ID, UserID: alloc.UserID,
-	}); err != nil && !errors.Is(err, db.ErrNotFound) {
+	if err := h.queries.RevokeAllocation(r.Context(), alloc.ID, alloc.UserID); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		h.logger.Error("entity_delete_revoke_failed", "error", err, "agent_id", agentID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
@@ -411,10 +399,10 @@ func (h *entityHandlers) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if h.purge != nil && h.purgeAPI != nil {
 		purgeCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
-		if err := h.purge.PurgeAllocation(purgeCtx, h.purgeAPI, alloc.ID); err != nil {
+		if err := h.purge.PurgeAllocation(purgeCtx, h.purgeAPI, fromUUID(alloc.ID)); err != nil {
 			// Revoke already landed; the sweeper retries the erase.
 			h.logger.Error("entity_delete_purge_failed", "error", err, "agent_id", agentID,
-				"allocation_id", uuidString(alloc.ID))
+				"allocation_id", alloc.ID.String())
 		}
 	}
 
@@ -441,9 +429,9 @@ func (h *entityHandlers) handleEnrollToken(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	alloc, err := h.queries.GetAllocationByAgent(r.Context(), pgtype.Text{String: agentID, Valid: true})
+	alloc, err := h.queries.GetAllocationByAgent(r.Context(), agentID)
 	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) {
 			writeOAuthError(w, http.StatusNotFound, "not_found", "")
 			return
 		}
@@ -456,10 +444,10 @@ func (h *entityHandlers) handleEnrollToken(w http.ResponseWriter, r *http.Reques
 	// the cert it is traded for) must be scoped to.
 	user, err := h.queries.GetUser(r.Context(), alloc.UserID)
 	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) {
 			// An allocation always has a user; a missing one is an internal
 			// inconsistency, not a client error.
-			h.logger.Error("enroll_token_user_missing", "agent_id", agentID, "user_id", uuidString(alloc.UserID))
+			h.logger.Error("enroll_token_user_missing", "agent_id", agentID, "user_id", alloc.UserID.String())
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 			return
 		}
@@ -472,10 +460,10 @@ func (h *entityHandlers) handleEnrollToken(w http.ResponseWriter, r *http.Reques
 	// re-parented agent's pod still mounts the agent's disk regardless of who now owns
 	// it. Fall back to the user's tenant for a legacy allocation with no per-agent one.
 	tenant := user.TenantID
-	if alloc.TenantID.Valid && alloc.TenantID.String != "" {
-		tenant = alloc.TenantID.String
+	if alloc.TenantID != "" {
+		tenant = alloc.TenantID
 	}
-	token, expiresAt, err := h.mintEnroll(r.Context(), alloc.UserID, tenant, alloc.ID)
+	token, expiresAt, err := h.mintEnroll(r.Context(), fromUUID(alloc.UserID), tenant, fromUUID(alloc.ID))
 	if err != nil {
 		h.logger.Error("enroll_token_mint_failed", "error", err, "agent_id", agentID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
@@ -484,9 +472,9 @@ func (h *entityHandlers) handleEnrollToken(w http.ResponseWriter, r *http.Reques
 
 	h.logger.Info("enroll_token_minted",
 		"agent_id", agentID,
-		"user_id", uuidString(alloc.UserID),
+		"user_id", alloc.UserID.String(),
 		"tenant_id", tenant,
-		"allocation_id", uuidString(alloc.ID))
+		"allocation_id", alloc.ID.String())
 
 	writeJSON(w, http.StatusOK, enrollTokenResponse{
 		Token:     token,
@@ -519,8 +507,8 @@ func (h *entityHandlers) handleReassign(w http.ResponseWriter, r *http.Request) 
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed body")
 		return
 	}
-	var newOwner pgtype.UUID
-	if err := newOwner.Scan(req.OwnerID); err != nil {
+	newOwner, err := uuid.Parse(req.OwnerID)
+	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "owner_id must be a uuid")
 		return
 	}
@@ -528,12 +516,12 @@ func (h *entityHandlers) handleReassign(w http.ResponseWriter, r *http.Request) 
 	// Ensure the new owner's dg user (+ its placeholder tenant) exists so the
 	// allocation's user_id FK resolves after the flip.
 	newTenant := tenantIDForOwner(req.OwnerID)
-	if err := h.queries.EnsureTenant(r.Context(), sqlcdb.EnsureTenantParams{ID: newTenant, Name: newTenant}); err != nil {
+	if err := h.queries.EnsureTenant(r.Context(), newTenant, newTenant); err != nil {
 		h.logger.Error("entity_reassign_ensure_tenant_failed", "error", err, "tenant_id", newTenant)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}
-	if err := h.queries.EnsureUserWithID(r.Context(), sqlcdb.EnsureUserWithIDParams{
+	if err := h.queries.EnsureUserWithID(r.Context(), storage.NewUser{
 		ID: newOwner, TenantID: newTenant, Email: syntheticUserEmail(req.OwnerID),
 	}); err != nil {
 		h.logger.Error("entity_reassign_ensure_user_failed", "error", err, "owner_id", req.OwnerID)
@@ -541,10 +529,7 @@ func (h *entityHandlers) handleReassign(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := h.queries.ReassignAgentAllocation(r.Context(), sqlcdb.ReassignAgentAllocationParams{
-		AgentID: pgtype.Text{String: agentID, Valid: true},
-		UserID:  newOwner,
-	}); err != nil {
+	if err := h.queries.ReassignAgentAllocation(r.Context(), agentID, newOwner); err != nil {
 		h.logger.Error("entity_reassign_failed", "error", err, "agent_id", agentID, "owner_id", req.OwnerID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
@@ -567,8 +552,8 @@ type setAccountBudgetRequest struct {
 // next cold enroll re-asserts the budget from the updated allocation size.
 func (h *entityHandlers) handleSetAccountBudget(w http.ResponseWriter, r *http.Request) {
 	owner := chi.URLParam(r, "owner")
-	var ownerUUID pgtype.UUID
-	if err := ownerUUID.Scan(owner); err != nil {
+	ownerUUID, err := uuid.Parse(owner)
+	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "owner must be a uuid")
 		return
 	}
@@ -593,10 +578,8 @@ func (h *entityHandlers) handleSetAccountBudget(w http.ResponseWriter, r *http.R
 
 	// (1) Re-stamp the budget on every allocation so future placements carry it.
 	for _, a := range allocs {
-		if _, err := h.queries.UpdateAllocationSize(r.Context(), sqlcdb.UpdateAllocationSizeParams{
-			ID: a.ID, UserID: a.UserID, SizeBytes: req.DiskBytes,
-		}); err != nil {
-			h.logger.Error("account_budget_update_alloc_failed", "error", err, "allocation_id", uuidString(a.ID))
+		if _, err := h.queries.UpdateAllocationSize(r.Context(), a.ID, a.UserID, req.DiskBytes); err != nil {
+			h.logger.Error("account_budget_update_alloc_failed", "error", err, "allocation_id", a.ID.String())
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 			return
 		}
@@ -607,22 +590,16 @@ func (h *entityHandlers) handleSetAccountBudget(w http.ResponseWriter, r *http.R
 		servers := map[string]struct{}{}
 		for _, a := range allocs {
 			tenant := ownerTenant
-			if a.TenantID.Valid && a.TenantID.String != "" {
-				tenant = a.TenantID.String
+			if a.TenantID != "" {
+				tenant = a.TenantID
 			}
 			// Resolve the tenant's ops addr (server_vms → server_pools), skipping any
 			// tenant not yet placed or whose lookup errors — a best-effort live resize.
-			// (Inline rather than the storage-backed resolveTenantOpsAddr until this
-			// handler migrates off sqlcdb.)
-			vm, vmErr := h.queries.GetServerVMByTenant(r.Context(), tenant)
-			if vmErr != nil {
+			opsAddr, placed, rErr := resolveTenantOpsAddr(r.Context(), h.queries, tenant)
+			if rErr != nil || !placed {
 				continue
 			}
-			pool, poolErr := h.queries.GetServerPoolByDataAddr(r.Context(), vm.DataAddr)
-			if poolErr != nil {
-				continue
-			}
-			servers[pool.OpsAddr] = struct{}{}
+			servers[opsAddr] = struct{}{}
 		}
 		for opsAddr := range servers {
 			if _, err := setter.SetAccountQuota(r.Context(), opsAddr, ownerTenant, req.DiskBytes); err != nil {
@@ -663,5 +640,5 @@ func RequireServiceToken(expected string) func(http.Handler) http.Handler {
 	}
 }
 
-// ensure db.Store satisfies entityQuerier at compile time.
-var _ entityQuerier = (db.Store)(nil)
+// ensure *postgres.Store satisfies entityQuerier at compile time.
+var _ entityQuerier = (*postgres.Store)(nil)
