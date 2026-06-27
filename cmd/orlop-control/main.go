@@ -477,7 +477,7 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	// DB-backed queries; the enroll-token minter additionally needs devAuth.
 	if deps.devAuth != nil && deps.queries != nil {
 		mountEntities(router, RequireServiceToken(cfg.ControlPlaneToken),
-			newEntityHandlers(logger, deps.queries, deps.devAuth.IssueAgentEnrollToken, deps.allocations, deps.serverResize, deps.allocations, deps.agentPurger, cfg.InitialGrantBytes))
+			newEntityHandlers(logger, deps.store, deps.devAuth.IssueAgentEnrollToken, deps.allocations, deps.serverResize, deps.allocations, deps.agentPurger, cfg.InitialGrantBytes))
 	}
 	// POST /v1/admin/purge-sweep: on-demand erase of revoked-but-unpurged
 	// allocations' backend data. Same service-token gate as /v1/entities.
