@@ -21,10 +21,10 @@ import (
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/secrets"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres/db/sqlcdb"
 )
 
 func TestAgentEnrollHappyPath(t *testing.T) {

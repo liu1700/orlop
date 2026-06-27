@@ -8,7 +8,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres/db"
 )
 
 const migrateUsage = `usage:

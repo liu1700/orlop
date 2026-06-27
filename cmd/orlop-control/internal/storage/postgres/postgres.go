@@ -1,5 +1,5 @@
 // Package postgres is the Postgres-backed implementation of the storage
-// interfaces. It adapts the sqlc-generated queries (internal/db/sqlcdb) to the
+// interfaces. It adapts the sqlc-generated queries (subpackage db/sqlcdb) to the
 // driver-agnostic domain types in package storage — this is the one place
 // pgx/pgtype is allowed to meet the domain.
 //
@@ -16,8 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres/db/sqlcdb"
 )
 
 // Store is the Postgres adapter backing the storage interfaces.
