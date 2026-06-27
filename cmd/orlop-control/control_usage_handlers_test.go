@@ -40,7 +40,6 @@ func startUsageServer(t *testing.T, pool *pgxpool.Pool, usage tenantUsageClient)
 	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
 		devAuth:     svc,
-		queries:     sqlcdb.New(pool),
 		store:       postgres.New(pool),
 		allocations: allocations.NewService(postgres.New(pool), nil),
 		serverUsage: usage,
