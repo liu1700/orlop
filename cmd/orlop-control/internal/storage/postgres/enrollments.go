@@ -3,8 +3,8 @@ package postgres
 import (
 	"context"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres/db/sqlcdb"
 )
 
 var _ storage.EnrollmentStore = (*Store)(nil)

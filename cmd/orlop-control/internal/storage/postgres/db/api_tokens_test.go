@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres/db/sqlcdb"
 )
 
 func TestAPITokens_CreateGetListRevoke(t *testing.T) {
