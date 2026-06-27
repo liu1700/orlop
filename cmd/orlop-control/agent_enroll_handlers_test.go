@@ -31,7 +31,7 @@ func TestAgentEnrollHappyPath(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	q := sqlcdb.New(pool)
 	token, userID := seedEnrollTenant(t, q, "acme", "active", false)
-	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), nil)
+	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), nil)
 
 	resp := postEnroll(t, srv.URL, token)
 	defer resp.Body.Close()
@@ -102,7 +102,7 @@ func TestAgentEnrollReturnsAllocation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), nil)
+	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), nil)
 
 	resp := postEnroll(t, srv.URL, token)
 	defer resp.Body.Close()
@@ -147,7 +147,7 @@ func TestAgentEnrollTokenSingleUse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), nil)
+	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), nil)
 
 	first := postEnroll(t, srv.URL, token)
 	defer first.Body.Close()
@@ -179,7 +179,7 @@ func TestAgentEnrollDeviceTokenMultiUse(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	q := sqlcdb.New(pool)
 	token, _ := seedEnrollTenant(t, q, "acme", "active", false) // PurposeDevice token
-	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), nil)
+	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), nil)
 
 	for i := 1; i <= 2; i++ {
 		resp := postEnroll(t, srv.URL, token)
@@ -209,7 +209,7 @@ func TestAgentEnrollRejectsDisallowedTenant(t *testing.T) {
 	seedEnrollTenant(t, q, "evilcorp", "active", false) // exists in DB, not pre-bootstrapped
 
 	denyAll := newEnrollCAWithPolicy(t, func(string) bool { return false })
-	srv := startEnrollServer(t, pool, q, denyAll, nil)
+	srv := startEnrollServer(t, pool, denyAll, nil)
 
 	resp := postEnroll(t, srv.URL, "test-token-evilcorp")
 	defer resp.Body.Close()
@@ -241,7 +241,7 @@ func TestAgentEnrollAllowsDynamicTenant(t *testing.T) {
 
 	policy := buildCATenantPolicy(config{CAAllowDynamicTenants: true})
 	caDyn := newEnrollCAWithPolicy(t, policy)
-	srv := startEnrollServer(t, pool, q, caDyn, nil)
+	srv := startEnrollServer(t, pool, caDyn, nil)
 
 	resp := postEnroll(t, srv.URL, "test-token-u_owner123")
 	defer resp.Body.Close()
@@ -256,8 +256,7 @@ func TestAgentEnrollAllowsDynamicTenant(t *testing.T) {
 
 func TestAgentEnrollRejectsInvalidToken(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	q := sqlcdb.New(pool)
-	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), nil)
+	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), nil)
 
 	resp := postEnroll(t, srv.URL, "bogus")
 	defer resp.Body.Close()
@@ -270,7 +269,7 @@ func TestAgentEnrollRejectsSuspendedTenant(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	q := sqlcdb.New(pool)
 	token, _ := seedEnrollTenant(t, q, "acme", "active", true)
-	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), nil)
+	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), nil)
 
 	resp := postEnroll(t, srv.URL, token)
 	defer resp.Body.Close()
@@ -300,7 +299,7 @@ func TestAgentEnrollReturns503WhenServerVMInactive(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	q := sqlcdb.New(pool)
 	token, _ := seedEnrollTenant(t, q, "acme", "provisioning", false)
-	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), nil)
+	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), nil)
 
 	resp := postEnroll(t, srv.URL, token)
 	defer resp.Body.Close()
@@ -316,7 +315,7 @@ func TestAgentEnrollRateLimit(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	q := sqlcdb.New(pool)
 	token, _ := seedEnrollTenant(t, q, "acme", "active", false)
-	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), newAgentEnrollLimiter(1, time.Hour))
+	srv := startEnrollServer(t, pool, newEnrollCA(t, "acme"), newAgentEnrollLimiter(1, time.Hour))
 
 	resp := postEnroll(t, srv.URL, token)
 	resp.Body.Close()
@@ -330,19 +329,18 @@ func TestAgentEnrollRateLimit(t *testing.T) {
 	}
 }
 
-func startEnrollServer(t *testing.T, pool *pgxpool.Pool, q *sqlcdb.Queries, agentCA *ca.CA, limit *agentEnrollLimiter) *httptest.Server {
+func startEnrollServer(t *testing.T, pool *pgxpool.Pool, agentCA *ca.CA, limit *agentEnrollLimiter) *httptest.Server {
 	t.Helper()
-	return startEnrollServerWithAdmin(t, pool, q, agentCA, limit, nil)
+	return startEnrollServerWithAdmin(t, pool, agentCA, limit, nil)
 }
 
-func startEnrollServerWithAdmin(t *testing.T, pool *pgxpool.Pool, q *sqlcdb.Queries, agentCA *ca.CA, limit *agentEnrollLimiter, serverAdmin allocations.ServerAdmin) *httptest.Server {
+func startEnrollServerWithAdmin(t *testing.T, pool *pgxpool.Pool, agentCA *ca.CA, limit *agentEnrollLimiter, serverAdmin allocations.ServerAdmin) *httptest.Server {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := devauth.NewService(postgres.New(pool), logger)
 	allocSvc := allocations.NewService(postgres.New(pool), nil)
 	router := newRouter(logger, runtimeDeps{
 		devAuth:     svc,
-		queries:     q,
 		store:       postgres.New(pool),
 		agentCA:     agentCA,
 		enrollLimit: limit,
@@ -582,7 +580,7 @@ func TestEnrollPlacesTenantWhenServerVMMissing(t *testing.T) {
 
 	fakeAdmin := &enrollFakeAdmin{}
 	agentCA := newEnrollCA(t, tenantID)
-	srv := startEnrollServerWithAdmin(t, pool, q, agentCA, nil, fakeAdmin)
+	srv := startEnrollServerWithAdmin(t, pool, agentCA, nil, fakeAdmin)
 
 	resp := postEnroll(t, srv.URL, token)
 	defer resp.Body.Close()

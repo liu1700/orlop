@@ -96,8 +96,8 @@ func TestCertRevocationReconcilePushesActiveSet(t *testing.T) {
 }
 
 // fakeRevStore implements storage.RevocationStore with no database — three
-// methods, the whole surface the reconciler needs. (Contrast with the old
-// db.Store, whose 84 methods a fake had to embed.)
+// methods, the whole surface the reconciler needs (the payoff of small,
+// à-la-carte role interfaces over one wide data-access type).
 type fakeRevStore struct {
 	revs  []storage.CertRevocation
 	addrs []string

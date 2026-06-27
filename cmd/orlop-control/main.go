@@ -21,8 +21,6 @@ import (
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/identity"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/secrets"
@@ -290,7 +288,6 @@ func main() {
 type runtimeDeps struct {
 	devAuth          *devauth.Service
 	allocations      *allocations.Service
-	queries          db.Store
 	store            *postgres.Store
 	agentCA          *ca.CA
 	enrollLimit      *agentEnrollLimiter
@@ -327,7 +324,6 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 			return fmt.Errorf("open pgxpool: %w", err)
 		}
 		defer pool.Close()
-		deps.queries = sqlcdb.New(pool)
 		deps.store = postgres.New(pool)
 		deps.devAuth = devauth.NewService(deps.store, logger)
 		deps.allocations = allocations.NewService(deps.store, logger)
@@ -429,8 +425,8 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 			"addr", cfg.Addr,
 			"database_url_configured", cfg.DatabaseURL != "",
 			"device_flow_enabled", deps.devAuth != nil,
-			"dashboard_enabled", deps.devAuth != nil && deps.queries != nil && deps.allocations != nil,
-			"agent_enroll_enabled", deps.devAuth != nil && deps.queries != nil && deps.agentCA != nil,
+			"dashboard_enabled", deps.devAuth != nil && deps.store != nil && deps.allocations != nil,
+			"agent_enroll_enabled", deps.devAuth != nil && deps.store != nil && deps.agentCA != nil,
 		)
 		errs <- server.ListenAndServe()
 	}()
@@ -464,38 +460,38 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	if deps.devAuth != nil {
 		mountDeviceFlow(router, newDevAuthHandlers(logger, deps.devAuth, deps.allocations, deps.cookieDomain))
 	}
-	if deps.devAuth != nil && deps.queries != nil && deps.allocations != nil {
+	if deps.devAuth != nil && deps.store != nil && deps.allocations != nil {
 		mountDashboard(router, newDashboardHandlers(logger, deps.devAuth, deps.store, deps.allocations, deps.serverUsage, deps.mountLeaseFencer))
 		mountLeaseRoutes(router, newMountLeaseHandlers(logger, deps.allocations, deps.store, deps.devAuth, deps.mountLeaseFencer))
 	}
-	if deps.devAuth != nil && deps.queries != nil {
+	if deps.devAuth != nil && deps.store != nil {
 		mountAPITokens(router, newAPITokenHandlers(logger, deps.devAuth, deps.store, cfg.APITokenTTL))
 	}
 	// /v1/entities + /v1/agents/{id}/enroll-token are control-plane→control-plane
 	// surfaces, gated by the static service token (RequireServiceToken fails
 	// closed when ORLOP_CONTROL_PLANE_TOKEN is unset). Entities needs the
 	// DB-backed queries; the enroll-token minter additionally needs devAuth.
-	if deps.devAuth != nil && deps.queries != nil {
+	if deps.devAuth != nil && deps.store != nil {
 		mountEntities(router, RequireServiceToken(cfg.ControlPlaneToken),
 			newEntityHandlers(logger, deps.store, deps.devAuth.IssueAgentEnrollToken, deps.allocations, deps.serverResize, deps.allocations, deps.agentPurger, cfg.InitialGrantBytes))
 	}
 	// POST /v1/admin/purge-sweep: on-demand erase of revoked-but-unpurged
 	// allocations' backend data. Same service-token gate as /v1/entities.
-	if deps.queries != nil && deps.allocations != nil {
+	if deps.store != nil && deps.allocations != nil {
 		mountPurgeSweep(router, RequireServiceToken(cfg.ControlPlaneToken),
 			newPurgeSweepHandlers(logger, deps.store, deps.allocations, deps.agentPurger))
 	}
 	// GET /v1/tenants/{owner}/usage: per-user disk usage for the control-plane's
 	// storage meter, same static-token gate as /v1/entities. serverUsage may be
 	// nil (no SecretsDir) — the handler then 503s rather than crashing.
-	if deps.queries != nil {
+	if deps.store != nil {
 		mountControlTenantUsage(router, RequireServiceToken(cfg.ControlPlaneToken),
 			newControlTenantUsageHandlers(logger, deps.store, deps.serverUsage))
 	}
-	if deps.devAuth != nil && deps.allocations != nil && deps.queries != nil && deps.journalQuerier != nil {
+	if deps.devAuth != nil && deps.allocations != nil && deps.store != nil && deps.journalQuerier != nil {
 		mountJournal(router, newJournalHandlers(deps.devAuth, deps.allocations, deps.journalQuerier))
 	}
-	if deps.devAuth != nil && deps.queries != nil && deps.agentCA != nil {
+	if deps.devAuth != nil && deps.store != nil && deps.agentCA != nil {
 		mountAgentEnroll(router, RequireEnrollBearer(deps.devAuth, deps.store), newAgentEnrollHandlers(logger, deps.store, deps.devAuth, deps.agentCA, deps.enrollLimit, deps.allocations, deps.serverAdmin))
 	}
 	// POST /control/sign-server-cert: orlop-server self-provisions its TLS
