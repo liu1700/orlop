@@ -14,6 +14,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 // fakeJournal is a test double for journalQuerier.
@@ -134,7 +135,7 @@ func (f *fakeJournal) RevertPath(
 
 func startJournalServer(t *testing.T, pool *pgxpool.Pool, jq journalQuerier) (*httptest.Server, *devauth.Service) {
 	t.Helper()
-	svc := devauth.NewService(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
 		devAuth:        svc,
 		queries:        sqlcdb.New(pool),

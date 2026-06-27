@@ -15,6 +15,7 @@ import (
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 // defaultOwnerID is the demo account a standalone `token issue` provisions
@@ -124,7 +125,7 @@ func runTokenIssue(ctx context.Context, out io.Writer, args []string) error {
 
 	// Scope the token (and the cert it's traded for) to the agent's own tenant,
 	// matching handleEnrollToken so /agent/enroll mints the per-agent SAN.
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	token, expiresAt, err := svc.IssueAgentEnrollToken(ctx, ownerUUID, agentTenant, alloc.ID)
 	if err != nil {
 		return fmt.Errorf("mint enroll token: %w", err)

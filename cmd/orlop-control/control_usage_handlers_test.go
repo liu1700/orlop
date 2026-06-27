@@ -16,6 +16,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 type fakeUsage struct {
@@ -36,7 +37,7 @@ func (f *fakeUsage) GetTenantUsage(_ context.Context, opsAddr, tenantID string) 
 
 func startUsageServer(t *testing.T, pool *pgxpool.Pool, usage tenantUsageClient) (*httptest.Server, *devauth.Service) {
 	t.Helper()
-	svc := devauth.NewService(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
 		devAuth:     svc,
 		queries:     sqlcdb.New(pool),

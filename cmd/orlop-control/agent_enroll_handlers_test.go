@@ -24,6 +24,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/secrets"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 func TestAgentEnrollHappyPath(t *testing.T) {
@@ -337,7 +338,7 @@ func startEnrollServer(t *testing.T, pool *pgxpool.Pool, q *sqlcdb.Queries, agen
 func startEnrollServerWithAdmin(t *testing.T, pool *pgxpool.Pool, q *sqlcdb.Queries, agentCA *ca.CA, limit *agentEnrollLimiter, serverAdmin allocations.ServerAdmin) *httptest.Server {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := devauth.NewService(pool, logger)
+	svc := devauth.NewService(postgres.New(pool), logger)
 	allocSvc := allocations.NewService(pool, nil)
 	router := newRouter(logger, runtimeDeps{
 		devAuth:     svc,
