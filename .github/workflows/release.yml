@@ -1,0 +1,111 @@
+name: release
+
+# Cuts cross-platform binaries for all three orlop programs on tag push.
+#
+#   git tag v1.0.0-rc.18 && git push origin v1.0.0-rc.18
+#
+# Each runner builds the two Go binaries (orlop-control, orlop-server) and the
+# Rust client (orlop) for its own OS/arch, tars them up, and a final job
+# publishes them to the GitHub Release for the tag. `workflow_dispatch` runs the
+# same build for a smoke test but uploads only to the Actions artifacts, never
+# to a release.
+#
+# Why no macFUSE on the macOS jobs: `fuser` is gated to Linux in Cargo.toml, so
+# the darwin build uses the in-process NFSv3 path and compiles without it. Only
+# the Linux jobs need libfuse3-dev. The Go binaries are pure Go (modernc SQLite +
+# pgx, no cgo), so CGO_ENABLED=0 builds them on every target without a C toolchain.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04,     os: linux,  arch: amd64, rust_target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, os: linux,  arch: arm64, rust_target: aarch64-unknown-linux-gnu }
+          - { runner: macos-13,         os: darwin, arch: amd64, rust_target: x86_64-apple-darwin }
+          - { runner: macos-14,         os: darwin, arch: arm64, rust_target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fuse3 dev headers (Linux only)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Go binaries
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o dist/orlop-control ./cmd/orlop-control
+          go build -trimpath -ldflags "-s -w" -o dist/orlop-server  ./cmd/orlop-server
+
+      - name: Build Rust binary
+        run: |
+          cargo build --release --locked --bin orlop --target "${{ matrix.rust_target }}"
+          cp "target/${{ matrix.rust_target }}/release/orlop" dist/orlop
+
+      - name: Package tarball + checksum
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_NAME" = "$version" ]; then
+            version="$(git rev-parse --short HEAD)"   # workflow_dispatch: no tag
+          fi
+          name="orlop_${version}_${{ matrix.os }}_${{ matrix.arch }}"
+          tar -C dist -czf "${name}.tar.gz" orlop orlop-control orlop-server
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          echo "tarball=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.tarball }}
+          path: |
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.tarball }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

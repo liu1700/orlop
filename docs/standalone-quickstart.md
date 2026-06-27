@@ -1,16 +1,33 @@
-# Standalone quickstart (single node)
+# Quickstart
 
-Run the whole stack on one machine and give an agent a durable disk, with **no
-external control plane**: Postgres, the control plane (CA + allocation), the
-data-plane server, and a mount client. You will write a file, unmount, remount,
-and watch the file survive because it lives in the server, not on the mount.
+Run the whole orlop stack on one machine and give an agent a durable disk:
+Postgres (or embedded SQLite), the control plane (CA + allocation), the
+data-plane server, and a mount client, all on one host. You will write a file,
+unmount, remount, and watch it survive, because the bytes live in the server,
+not on the mount.
 
-Every command below was run end to end on a single host. The flow is:
+Every command below was run end to end on a single host.
 
+## Fast path: hand it to your coding agent
+
+If a coding agent (Claude Code, Cursor, and the like) has a shell on this
+machine, paste the prompt below and let it drive the bring-up. It points the
+agent at this page, so the steps stay in sync with the source:
+
+```text
+Set up a local single-node orlop stack on this machine by following the guide
+at https://orlop.dev/reference/standalone-quickstart.md. Install the binaries
+with `curl -fsSL https://orlop.dev/install.sh | sh`, then bring up the database,
+the control plane, and the data-plane server, mint an enroll token, and mount a
+disk. Then write a file, unmount, and remount to prove the data survives. Before
+you start, check the prerequisites (Docker for the Postgres option, and FUSE on
+Linux or the built-in NFS client on macOS) and stop to tell me if any are
+missing.
 ```
-postgres → orlop-control (auto CA) → server register → orlop-server
-        → token issue → orlop mount --from-env → write → unmount → remount → data persists
-```
+
+Prefer to do it yourself? The rest of this page is the same bring-up, by hand.
+
+## How the pieces connect
 
 Three listeners are involved. Everything uses `localhost`, so one certificate
 covers all of them:
@@ -23,15 +40,32 @@ covers all of them:
 
 ## Prerequisites
 
-- Go and Rust (`cargo`) toolchains.
 - A database: either a Postgres instance (the snippet uses Docker) **or** nothing
   at all: the control plane ships an embedded SQLite backend for single-node use
   (see the SQLite option in step 1).
 - Local mount support: Linux uses FUSE (`/dev/fuse` + `fuse3`); macOS uses the
-  built-in NFSv3 client (no macFUSE needed). Check with `orlop doctor` after the
-  build step.
+  built-in NFSv3 client (no macFUSE needed). Check with `orlop doctor` after
+  step 0.
+- Only if you build from source instead of installing: Go and Rust (`cargo`)
+  toolchains.
 
-## 0. Build the three binaries
+## 0. Install the binaries
+
+The install script downloads prebuilt `orlop`, `orlop-control`, and
+`orlop-server` for your OS and architecture from the latest release and drops
+them in `~/.local/bin`:
+
+```bash
+curl -fsSL https://orlop.dev/install.sh | sh
+orlop doctor            # confirms this host can mount
+```
+
+Override the target dir with `ORLOP_BIN_DIR`, or pin a release with
+`ORLOP_VERSION=v1.0.0-rc.18`. If the install dir isn't on your `PATH`, the
+script prints the line to add.
+
+<details>
+<summary>Build from source instead (needs the Go and Rust toolchains)</summary>
 
 From the repo root:
 
@@ -43,6 +77,8 @@ export PATH="$PWD/bin:$PWD/target/release:$PATH"
 
 orlop doctor            # confirms this host can mount
 ```
+
+</details>
 
 ## 1. Database + schema
 

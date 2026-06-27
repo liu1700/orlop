@@ -38,8 +38,8 @@ jobs:
 
       - run: cargo test --locked
 
-# Note: macOS CI lives in release.yml (runs on tag push only) — it installs
-# macFUSE via brew so the `fuser` crate's pkg-config probe succeeds. Adding
-# a macos-latest job here burned ~12 billing-minutes per push (10x macOS
-# multiplier × ~70s failed compile) without producing signal: the job
-# failed 100% of runs because macFUSE wasn't installed.
+# Note: macOS builds live in release.yml (runs on tag push only). They need no
+# macFUSE: `fuser` is Linux-gated in Cargo.toml, so the darwin build uses the
+# in-process NFSv3 path and compiles without it. A macos job here would still
+# burn ~10x billing minutes per push for little PR signal, so PR CI stays
+# Linux-only on purpose.

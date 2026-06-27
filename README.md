@@ -47,6 +47,12 @@ zero idle compute.
 
 ## Quickstart
 
+Install the binaries (`orlop`, `orlop-control`, `orlop-server`) for your OS:
+
+```bash
+curl -fsSL https://orlop.dev/install.sh | sh
+```
+
 A complete single-node stack (control + server + one mounted disk) runs on one
 host with no external dependencies: the control plane can use its embedded
 SQLite backend (`DATABASE_URL=sqlite:./orlop.db`), so not even Postgres is
