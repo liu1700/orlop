@@ -103,8 +103,43 @@ func (s *Store) Close() error {
 	return nil
 }
 
-// Transactions (Begin/txStore) are added with the AllocationStore/SessionStore
-// slice, since storage.Tx embeds their full operation sets.
+// One *Store implements every role interface; *txStore additionally is a Tx.
+var (
+	_ storage.SessionStore    = (*Store)(nil)
+	_ storage.AllocationStore = (*Store)(nil)
+	_ storage.Tx              = (*txStore)(nil)
+)
+
+// --- transactions ---
+
+func (s *Store) Begin(ctx context.Context) (storage.Tx, error) {
+	if s.pool == nil {
+		return nil, errors.New("sqlite: nested transactions are not supported")
+	}
+	tx, err := s.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &txStore{Store: &Store{db: tx}, tx: tx}, nil
+}
+
+// txStore is a transaction-scoped Store: it reuses every adapter method through
+// the embedded *Store (whose db is the tx) and adds Commit/Rollback.
+type txStore struct {
+	*Store
+	tx *sql.Tx
+}
+
+func (t *txStore) Commit(context.Context) error { return t.tx.Commit() }
+
+// Rollback is safe to call after Commit (the defer-rollback idiom): a finished
+// transaction yields sql.ErrTxDone, which we treat as a no-op.
+func (t *txStore) Rollback(context.Context) error {
+	if err := t.tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		return err
+	}
+	return nil
+}
 
 // --- error mapping ---
 

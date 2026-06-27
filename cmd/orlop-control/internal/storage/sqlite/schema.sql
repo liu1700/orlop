@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS disk_allocations (
     size_bytes       INTEGER NOT NULL CHECK (size_bytes > 0),
     created_at       INTEGER NOT NULL,
     revoked_at       INTEGER,
-    bound_agent_id   TEXT,
+    -- Forward reference: agent_enrollments is created below. SQLite resolves a
+    -- foreign key's parent at enforcement time, not at CREATE TABLE.
+    bound_agent_id   TEXT REFERENCES agent_enrollments(id) ON DELETE SET NULL,
     bound_at         INTEGER,
     lease_expires_at INTEGER,
     expires_at       INTEGER,
@@ -61,9 +63,6 @@ CREATE TABLE IF NOT EXISTS agent_enrollments (
 );
 CREATE INDEX IF NOT EXISTS agent_enrollments_not_after_idx ON agent_enrollments (cert_not_after);
 CREATE INDEX IF NOT EXISTS agent_enrollments_user_id_idx ON agent_enrollments (user_id);
-
--- bound_agent_id references agent_enrollments(id); added after both tables exist.
-CREATE INDEX IF NOT EXISTS disk_allocations_bound_agent_fk_idx ON disk_allocations (bound_agent_id);
 
 CREATE TABLE IF NOT EXISTS access_tokens (
     id            TEXT PRIMARY KEY,
@@ -173,3 +172,5 @@ CREATE TABLE IF NOT EXISTS sessions_anonymous (
     claimed_at    INTEGER,
     claimed_by    TEXT REFERENCES users(id) ON DELETE SET NULL
 );
+CREATE INDEX IF NOT EXISTS sessions_anonymous_created_at_idx ON sessions_anonymous (created_at) WHERE (claimed_at IS NULL);
+CREATE INDEX IF NOT EXISTS sessions_anonymous_device_unclaimed_idx ON sessions_anonymous (device_id, created_at DESC) WHERE (claimed_at IS NULL);
