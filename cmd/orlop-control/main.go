@@ -328,7 +328,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		defer pool.Close()
 		deps.queries = sqlcdb.New(pool)
 		deps.devAuth = devauth.NewService(postgres.New(pool), logger)
-		deps.allocations = allocations.NewService(pool, logger)
+		deps.allocations = allocations.NewService(postgres.New(pool), logger)
 		deps.cookieDomain = cfg.CookieDomain
 		// CA storage backend: "postgres" keeps the root key + tenant intermediates
 		// in this shared DB (no block-storage PVC); otherwise the filesystem backend

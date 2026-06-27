@@ -1,9 +1,11 @@
 package postgres
 
 import (
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -49,4 +51,13 @@ func timePtr(t pgtype.Timestamptz) *time.Time {
 	}
 	tt := t.Time
 	return &tt
+}
+
+func ttlInterval(d time.Duration) pgtype.Interval {
+	return pgtype.Interval{Microseconds: d.Microseconds(), Valid: true}
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

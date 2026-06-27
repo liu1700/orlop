@@ -41,7 +41,7 @@ func startUsageServer(t *testing.T, pool *pgxpool.Pool, usage tenantUsageClient)
 	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
 		devAuth:     svc,
 		queries:     sqlcdb.New(pool),
-		allocations: allocations.NewService(pool, nil),
+		allocations: allocations.NewService(postgres.New(pool), nil),
 		serverUsage: usage,
 	}, config{})
 	srv := httptest.NewServer(router)

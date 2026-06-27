@@ -4,10 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 )
 
 // Allocate creates a Free disk for the user and returns it. Errors with
@@ -18,33 +15,31 @@ func (s *Service) Allocate(ctx context.Context, userID pgtype.UUID, sizeBytes in
 	if sizeBytes <= 0 {
 		return Allocation{}, fmt.Errorf("allocations: size_bytes must be positive, got %d", sizeBytes)
 	}
+	uid := toUUID(userID)
 
-	var out Allocation
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		qtx := s.q.WithTx(tx)
-		user, err := qtx.GetUserForUpdate(ctx, userID)
-		if err != nil {
-			return fmt.Errorf("get user: %w", err)
-		}
-		used, err := qtx.SumActiveAllocationBytes(ctx, userID)
-		if err != nil {
-			return fmt.Errorf("sum allocations: %w", err)
-		}
-		if used+sizeBytes > user.QuotaBytes {
-			return ErrQuotaExceeded
-		}
-		row, err := qtx.InsertAllocation(ctx, sqlcdb.InsertAllocationParams{
-			UserID:    userID,
-			SizeBytes: sizeBytes,
-		})
-		if err != nil {
-			return fmt.Errorf("insert allocation: %w", err)
-		}
-		out = fromRow(row)
-		return nil
-	})
+	tx, err := s.store.Begin(ctx)
 	if err != nil {
 		return Allocation{}, err
 	}
-	return out, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	user, err := tx.GetUserForUpdate(ctx, uid)
+	if err != nil {
+		return Allocation{}, fmt.Errorf("get user: %w", err)
+	}
+	used, err := tx.SumActiveAllocationBytes(ctx, uid)
+	if err != nil {
+		return Allocation{}, fmt.Errorf("sum allocations: %w", err)
+	}
+	if used+sizeBytes > user.QuotaBytes {
+		return Allocation{}, ErrQuotaExceeded
+	}
+	row, err := tx.InsertAllocation(ctx, uid, sizeBytes)
+	if err != nil {
+		return Allocation{}, fmt.Errorf("insert allocation: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Allocation{}, err
+	}
+	return fromStorage(row), nil
 }

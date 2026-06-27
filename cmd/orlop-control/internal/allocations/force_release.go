@@ -5,10 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
 
 // ForceReleaseMountLease clears bound_agent_id, bound_at, and lease_expires_at
@@ -23,33 +22,30 @@ import (
 func (s *Service) ForceReleaseMountLease(ctx context.Context, allocationID, userID pgtype.UUID) error {
 	// Capture the bound agent (if any) before the release clears bound_agent_id,
 	// so its leaf can be revoked on success (issue #5).
-	prior, priorErr := s.q.GetAllocation(ctx, allocationID)
+	prior, priorErr := s.store.GetAllocation(ctx, toUUID(allocationID))
 
-	_, err := s.q.ForceReleaseMountLease(ctx, sqlcdb.ForceReleaseMountLeaseParams{
-		ID:     allocationID,
-		UserID: userID,
-	})
+	err := s.store.ForceReleaseMountLease(ctx, toUUID(allocationID), toUUID(userID))
 	if err == nil {
-		if priorErr == nil && prior.BoundAgentID.Valid {
-			s.revokeReleasedAgentCert(ctx, prior.BoundAgentID, prior.TenantID)
+		if priorErr == nil && prior.BoundAgentID != nil {
+			s.revokeReleasedAgentCert(ctx, *prior.BoundAgentID, prior.TenantID)
 		}
 		return nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("force release: %w", err)
 	}
 
-	cur, gerr := s.q.GetAllocation(ctx, allocationID)
-	if errors.Is(gerr, pgx.ErrNoRows) {
+	cur, gerr := s.store.GetAllocation(ctx, toUUID(allocationID))
+	if errors.Is(gerr, storage.ErrNotFound) {
 		return ErrNotFound
 	}
 	if gerr != nil {
 		return fmt.Errorf("get after force release miss: %w", gerr)
 	}
-	if cur.UserID != userID {
+	if cur.UserID != toUUID(userID) {
 		return ErrWrongUser
 	}
-	if cur.RevokedAt.Valid {
+	if cur.RevokedAt != nil {
 		return ErrRevoked
 	}
 	return fmt.Errorf("force release: zero rows but no guard matched (state=%+v)", cur)

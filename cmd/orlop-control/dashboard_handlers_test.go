@@ -16,6 +16,7 @@ import (
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 const dashGiB = int64(1) << 30
@@ -39,7 +40,7 @@ func dashSeedAgent(t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID) pgtype.
 }
 
 func dashAllocSvc(pool *pgxpool.Pool) *allocations.Service {
-	return allocations.NewService(pool, nil)
+	return allocations.NewService(postgres.New(pool), nil)
 }
 
 func dashGetUserID(t *testing.T, cookie *http.Cookie, srvURL string) pgtype.UUID {

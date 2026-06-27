@@ -14,6 +14,7 @@ import (
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 // fakeServerAdmin implements allocations.ServerAdmin for tests.
@@ -76,7 +77,7 @@ func TestReserveIdempotent(t *testing.T) {
 	pool := openTestPool(t)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 	api := &fakeServerAdmin{}
 
 	seedReservePool(t, q, "t-idem", "srv-idem.example.com", 10*GiB, 10*GiB)
@@ -106,7 +107,7 @@ func TestReserveHappyPath(t *testing.T) {
 	pool := openTestPool(t)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 	api := &fakeServerAdmin{}
 
 	srv := seedReservePool(t, q, "t-happy", "srv-happy.example.com", 10*GiB, 10*GiB)
@@ -151,7 +152,7 @@ func TestReserveNoCapacity(t *testing.T) {
 	pool := openTestPool(t)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 	api := &fakeServerAdmin{}
 
 	if _, err := q.CreateTenant(ctx, sqlcdb.CreateTenantParams{ID: "t-nocap", Name: "t-nocap"}); err != nil {
@@ -180,7 +181,7 @@ func TestReserveNoCapacityEmptyPool(t *testing.T) {
 	pool := openTestPool(t)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 	api := &fakeServerAdmin{}
 
 	if _, err := q.CreateTenant(ctx, sqlcdb.CreateTenantParams{ID: "t-empty", Name: "t-empty"}); err != nil {
@@ -197,7 +198,7 @@ func TestReserveAdminAPIFails(t *testing.T) {
 	pool := openTestPool(t)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 	api := &fakeServerAdmin{err: fmt.Errorf("server down")}
 
 	srv := seedReservePool(t, q, "t-apifail", "srv-apifail.example.com", 10*GiB, 10*GiB)
@@ -232,7 +233,7 @@ func TestReserveCreateServerVMRaceLoses(t *testing.T) {
 	pool := openTestPool(t)
 	q := sqlcdb.New(pool)
 	ctx := context.Background()
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 
 	srv := seedReservePool(t, q, "t-race", "srv-race.example.com", 10*GiB, 10*GiB)
 
@@ -298,7 +299,7 @@ func TestReserveCompensationSurvivesContextCancel(t *testing.T) {
 
 	// Use a real logger wired to discard so compensate logging does not panic.
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := allocations.NewService(pool, logger)
+	svc := allocations.NewService(postgres.New(pool), logger)
 
 	srv := seedReservePool(t, q, "t-ctxcancel", "srv-ctxcancel.example.com", 10*GiB, 10*GiB)
 

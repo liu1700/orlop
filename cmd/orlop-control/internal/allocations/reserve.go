@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
 
 // ErrNoCapacity is returned by Reserve when no server_pool row has
@@ -48,24 +45,23 @@ func (s *Service) Reserve(
 	sizeBytes int64,
 ) (dataAddr string, err error) {
 	// --- Phase 0: idempotent check without a transaction ---
-	existing, err := s.q.GetServerVMByTenant(ctx, tenantID)
+	existing, err := s.store.GetServerVMByTenant(ctx, tenantID)
 	if err == nil {
 		// Already placed — fast path, no tx needed.
 		return existing.DataAddr, nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, storage.ErrNotFound) {
 		return "", fmt.Errorf("allocations: get server vm: %w", err)
 	}
 
 	// --- Phase 1: capacity reservation inside a transaction ---
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.store.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("allocations: begin tx: %w", err)
 	}
-	q := s.q.WithTx(tx)
 
-	chosen, err := q.PickBestAvailableServer(ctx, sizeBytes)
-	if errors.Is(err, pgx.ErrNoRows) {
+	chosen, err := tx.PickBestAvailableServer(ctx, sizeBytes)
+	if errors.Is(err, storage.ErrNotFound) {
 		_ = tx.Rollback(ctx)
 		return "", ErrNoCapacity
 	}
@@ -74,11 +70,8 @@ func (s *Service) Reserve(
 		return "", fmt.Errorf("allocations: pick server: %w", err)
 	}
 
-	_, err = q.ReserveCapacity(ctx, sqlcdb.ReserveCapacityParams{
-		FreeBytes: sizeBytes,
-		ID:        chosen.ID,
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	err = tx.ReserveCapacity(ctx, chosen.ID, sizeBytes)
+	if errors.Is(err, storage.ErrNotFound) {
 		// Lost a race with another reservation on this server.
 		_ = tx.Rollback(ctx)
 		return "", ErrNoCapacity
@@ -100,11 +93,7 @@ func (s *Service) Reserve(
 		// (e.g. client disconnect) does not prevent capacity from being restored.
 		compensateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		_, rErr := s.q.ReleaseCapacity(compensateCtx, sqlcdb.ReleaseCapacityParams{
-			FreeBytes: sizeBytes,
-			ID:        chosen.ID,
-		})
-		if rErr != nil {
+		if rErr := s.store.ReleaseCapacity(compensateCtx, chosen.ID, sizeBytes); rErr != nil {
 			s.logger.Error("allocations_reserve_compensate_failed",
 				"tenant_id", tenantID,
 				"server_id", chosen.ID,
@@ -123,19 +112,17 @@ func (s *Service) Reserve(
 	}
 
 	// --- Phase 3: record the server_vms binding (FUSE clients will use data_addr) ---
-	_, err = s.q.CreateServerVM(ctx, sqlcdb.CreateServerVMParams{
+	err = s.store.CreateServerVM(ctx, storage.NewServerVM{
 		TenantID: tenantID,
 		DataAddr: chosen.DataAddr,
 		Status:   "active",
 	})
 	if err != nil {
-		// Check for unique violation — a concurrent Reserve won the race.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			// Another goroutine inserted first; release our reservation and
-			// return the winner's data_addr.
+		// A concurrent Reserve won the race (unique violation on tenant_id).
+		if errors.Is(err, storage.ErrAlreadyExists) {
+			// Release our reservation and return the winner's data_addr.
 			compensate("unique_violation", err)
-			winner, getErr := s.q.GetServerVMByTenant(ctx, tenantID)
+			winner, getErr := s.store.GetServerVMByTenant(ctx, tenantID)
 			if getErr != nil {
 				return "", fmt.Errorf("allocations: get winner server vm: %w", getErr)
 			}
