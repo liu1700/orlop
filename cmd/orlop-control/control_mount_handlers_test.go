@@ -66,7 +66,7 @@ func mountSeedAgent(t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID) (pgtyp
 
 func TestMountLeaseAcquireConflictRefreshAndRelease(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -137,7 +137,7 @@ func TestMountLeaseAcquireConflictRefreshAndRelease(t *testing.T) {
 
 func TestMountLeaseExpiredLeaseCanMoveAgents(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -169,7 +169,7 @@ func TestMountLeaseExpiredLeaseCanMoveAgents(t *testing.T) {
 
 func TestUnmountByOwnerClearsLease(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -219,7 +219,7 @@ func TestUnmountByOwnerClearsLease(t *testing.T) {
 
 func TestUnmountByOwnerCrossUserReturns404(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	owner, _ := httpSeedAdmin(t, pool, svc)
 	other, _ := httpSeedAdmin(t, pool, svc)
 	ownerID := dashGetUserID(t, owner, srv.URL)
@@ -247,7 +247,7 @@ func TestUnmountByOwnerCrossUserReturns404(t *testing.T) {
 
 func TestUnmountByOwnerRevokedReturns410(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
@@ -277,7 +277,7 @@ func TestUnmountByOwnerRevokedReturns410(t *testing.T) {
 
 func TestUnmountByOwnerRequiresAuth(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, _, _ := httpStartServer(t, pool)
+	srv, _ := httpStartServer(t, pool)
 	resp, err := http.Post(
 		srv.URL+"/api/allocations/00000000-0000-0000-0000-000000000000/unmount",
 		"application/json", nil)
@@ -292,7 +292,7 @@ func TestUnmountByOwnerRequiresAuth(t *testing.T) {
 
 func TestMountLeaseRefreshRevokedReturnsGone(t *testing.T) {
 	pool := httpOpenTestPool(t)
-	srv, svc, _ := httpStartServer(t, pool)
+	srv, svc := httpStartServer(t, pool)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)

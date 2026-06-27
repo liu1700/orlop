@@ -21,41 +21,31 @@ import (
 )
 
 type devAuthHandlers struct {
-	svc                 *devauth.Service
-	allocations         *allocations.Service
-	logger              *slog.Logger
-	mailer              devauth.Mailer
-	cookieDomain        string
-	createCode          *devauth.RateLimiter
-	pollLimit           *devauth.RateLimiter
-	approveLim          *devauth.RateLimiter
-	otpIPLimit          *devauth.RateLimiter
-	otpEmailLimit       *devauth.RateLimiter
-	otpVerifyEmailLimit *devauth.RateLimiter
+	svc          *devauth.Service
+	allocations  *allocations.Service
+	logger       *slog.Logger
+	cookieDomain string
+	createCode   *devauth.RateLimiter
+	pollLimit    *devauth.RateLimiter
+	approveLim   *devauth.RateLimiter
 }
 
-func newDevAuthHandlers(logger *slog.Logger, svc *devauth.Service, allocationSvc *allocations.Service, mailer devauth.Mailer, cookieDomain string) *devAuthHandlers {
+func newDevAuthHandlers(logger *slog.Logger, svc *devauth.Service, allocationSvc *allocations.Service, cookieDomain string) *devAuthHandlers {
 	return &devAuthHandlers{
-		svc:                 svc,
-		allocations:         allocationSvc,
-		logger:              logger,
-		mailer:              mailer,
-		cookieDomain:        cookieDomain,
-		createCode:          devauth.NewRateLimiter(10, time.Minute),
-		pollLimit:           devauth.NewRateLimiter(60, time.Minute),
-		approveLim:          devauth.NewRateLimiter(30, time.Minute),
-		otpIPLimit:          devauth.NewRateLimiter(10, time.Hour),
-		otpEmailLimit:       devauth.NewRateLimiter(5, time.Hour),
-		otpVerifyEmailLimit: devauth.NewRateLimiter(10, time.Hour),
+		svc:          svc,
+		allocations:  allocationSvc,
+		logger:       logger,
+		cookieDomain: cookieDomain,
+		createCode:   devauth.NewRateLimiter(10, time.Minute),
+		pollLimit:    devauth.NewRateLimiter(60, time.Minute),
+		approveLim:   devauth.NewRateLimiter(30, time.Minute),
 	}
 }
 
-// mountDeviceFlow registers the four device-flow routes. Public
+// mountDeviceFlow registers the device-flow routes. Public
 // (createCode, poll, devicePage, approve) — auth is enforced inside
 // each handler as appropriate.
 func mountDeviceFlow(r chi.Router, h *devAuthHandlers) {
-	r.Post("/auth/otp/start", h.handleOTPStart)
-	r.Post("/auth/otp/verify", h.handleOTPVerify)
 	r.Post("/auth/logout", h.handleLogout)
 	r.Post("/auth/device/code", h.handleCreateCode)
 	r.Post("/auth/device/token", h.handleTokenPoll)
@@ -172,82 +162,6 @@ func IdentityFromRequest(r *http.Request) (devauth.Identity, bool) {
 }
 
 // --- handlers ---
-
-func (h *devAuthHandlers) handleOTPStart(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Email string `json:"email"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	normalized, err := devauth.NormalizeEmail(body.Email)
-	if err != nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if !h.otpIPLimit.Allow(clientIP(r)) || !h.otpEmailLimit.Allow(normalized) {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if err := h.svc.StartEmailOTP(r.Context(), normalized, h.mailer); err != nil {
-		h.logger.Error("email_otp_start_failed", "error", err)
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *devAuthHandlers) handleOTPVerify(w http.ResponseWriter, r *http.Request) {
-	// Decode the request body before any short-circuit response. Returning
-	// before draining the body causes upstream proxies streaming bodies via
-	// HTTP/1.1 keep-alive (notably undici's fetch with `duplex: 'half'`,
-	// used by the Vercel Next.js proxy) to throw "fetch failed" instead of
-	// surfacing the real status code, manifesting as a 502 to the browser.
-	var body struct {
-		Email string `json:"email"`
-		Code  string `json:"code"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "")
-		return
-	}
-	if !h.otpIPLimit.Allow(clientIP(r)) {
-		writeOAuthError(w, http.StatusTooManyRequests, "slow_down", "")
-		return
-	}
-	normalized, err := devauth.NormalizeEmail(body.Email)
-	if err != nil {
-		writeOAuthError(w, http.StatusUnauthorized, "invalid_grant", "")
-		return
-	}
-	if !h.otpVerifyEmailLimit.Allow(normalized) {
-		writeOAuthError(w, http.StatusTooManyRequests, "slow_down", "")
-		return
-	}
-	res, err := h.svc.VerifyEmailOTP(r.Context(), normalized, body.Code)
-	if err != nil {
-		switch {
-		case errors.Is(err, devauth.ErrUserSuspended):
-			writeOAuthError(w, http.StatusForbidden, "access_denied", "")
-		case errors.Is(err, devauth.ErrEmailOTPExpired):
-			writeOAuthError(w, http.StatusUnauthorized, "expired_token", "")
-		case errors.Is(err, devauth.ErrEmailOTPInvalid), errors.Is(err, devauth.ErrEmailOTPConsumed):
-			writeOAuthError(w, http.StatusUnauthorized, "invalid_grant", "")
-		default:
-			h.logger.Error("email_otp_verify_failed", "error", err)
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
-		}
-		return
-	}
-	h.setAdminCookie(w, r, res.SessionToken, int(time.Until(res.ExpiresAt).Seconds()))
-	writeJSON(w, http.StatusOK, map[string]any{
-		"user_id":     uuidString(res.UserID),
-		"tenant_id":   res.TenantID,
-		"expires_at":  res.ExpiresAt,
-		"is_new_user": res.IsNewUser,
-	})
-}
 
 func (h *devAuthHandlers) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, h.adminCookie(r, "", -1))

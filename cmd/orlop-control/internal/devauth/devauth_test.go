@@ -82,45 +82,6 @@ func TestRandomUserCodeShape(t *testing.T) {
 	}
 }
 
-func TestRandomEmailOTPShape(t *testing.T) {
-	s := &Service{rand: rand.Read}
-	for i := 0; i < 100; i++ {
-		code, err := s.randomEmailOTP()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(code) != 6 {
-			t.Fatalf("len = %d, want 6: %q", len(code), code)
-		}
-		for _, r := range code {
-			if r < '0' || r > '9' {
-				t.Fatalf("non-numeric code %q", code)
-			}
-		}
-	}
-}
-
-func TestNormalizeEmail(t *testing.T) {
-	cases := map[string]string{
-		"ALICE@example.test":   "alice@example.test",
-		" alice@example.test ": "alice@example.test",
-	}
-	for in, want := range cases {
-		got, err := NormalizeEmail(in)
-		if err != nil {
-			t.Fatalf("NormalizeEmail(%q) unexpected err: %v", in, err)
-		}
-		if got != want {
-			t.Fatalf("NormalizeEmail(%q) = %q, want %q", in, got, want)
-		}
-	}
-	for _, in := range []string{"", "not-email", "Alice <alice@example.test>"} {
-		if got, err := NormalizeEmail(in); err == nil {
-			t.Fatalf("NormalizeEmail(%q) = %q, want err", in, got)
-		}
-	}
-}
-
 func TestBearerToken(t *testing.T) {
 	cases := map[string]string{
 		"Bearer abc123":   "abc123",

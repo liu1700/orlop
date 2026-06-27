@@ -50,11 +50,6 @@ type config struct {
 	TrustDomain           string
 	OrgName               string
 	CookieDomain          string
-	ResendAPIKey          string
-	EmailFrom             string
-	// DevLogOTP logs email OTP codes in plaintext when no mailer is configured.
-	// DEV ONLY. ORLOP_DEV_LOG_OTP=1.
-	DevLogOTP bool
 	// ControlPlaneToken is the shared service token the orlop control-plane
 	// presents on /v1/entities (and future service-to-service routes).
 	// ORLOP_CONTROL_PLANE_TOKEN. RequireServiceToken fails closed when empty,
@@ -88,9 +83,6 @@ func loadConfig() config {
 		TrustDomain:           getenv("ORLOP_TRUST_DOMAIN", "orlop.example"),
 		OrgName:               getenv("ORLOP_ORG_NAME", "ORL"),
 		CookieDomain:          os.Getenv("ORLOP_COOKIE_DOMAIN"),
-		ResendAPIKey:          os.Getenv("RESEND_API_KEY"),
-		EmailFrom:             getenv("ORLOP_EMAIL_FROM", "Orlop <onboarding@resend.dev>"),
-		DevLogOTP:             os.Getenv("ORLOP_DEV_LOG_OTP") == "1",
 		ControlPlaneToken:     os.Getenv("ORLOP_CONTROL_PLANE_TOKEN"),
 		InitialGrantBytes:     atoi64Or(os.Getenv("ORLOP_INITIAL_GRANT_BYTES"), agentDiskInitialGrantBytes),
 		ServerCertFQDN:        getenv("ORLOP_DATAGW_SERVER_FQDN", defaultServerCertFQDN),
@@ -222,7 +214,6 @@ type runtimeDeps struct {
 	journalQuerier   journalQuerier
 	mountLeaseFencer mountLeaseFencer
 	agentPurger      allocations.AgentDataPurger
-	mailer           devauth.Mailer
 	cookieDomain     string
 }
 
@@ -239,11 +230,6 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		deps.queries = sqlcdb.New(pool)
 		deps.devAuth = devauth.NewService(pool, logger)
 		deps.allocations = allocations.NewService(pool, logger)
-		if cfg.ResendAPIKey != "" {
-			deps.mailer = newResendMailer(cfg.ResendAPIKey, cfg.EmailFrom)
-		} else {
-			deps.mailer = logMailer{logger: logger, logCode: cfg.DevLogOTP}
-		}
 		deps.cookieDomain = cfg.CookieDomain
 		// CA storage backend: "postgres" keeps the root key + tenant intermediates
 		// in this shared DB (no block-storage PVC); otherwise the filesystem backend
@@ -367,7 +353,7 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	router.Get("/healthz", healthz)
 
 	if deps.devAuth != nil {
-		mountDeviceFlow(router, newDevAuthHandlers(logger, deps.devAuth, deps.allocations, deps.mailer, deps.cookieDomain))
+		mountDeviceFlow(router, newDevAuthHandlers(logger, deps.devAuth, deps.allocations, deps.cookieDomain))
 	}
 	if deps.devAuth != nil && deps.queries != nil && deps.allocations != nil {
 		mountDashboard(router, newDashboardHandlers(logger, deps.devAuth, deps.queries, deps.allocations, deps.serverUsage, deps.mountLeaseFencer))

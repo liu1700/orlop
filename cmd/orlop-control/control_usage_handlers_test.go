@@ -42,7 +42,6 @@ func startUsageServer(t *testing.T, pool *pgxpool.Pool, usage tenantUsageClient)
 		queries:     sqlcdb.New(pool),
 		allocations: allocations.NewService(pool, nil),
 		serverUsage: usage,
-		mailer:      newFakeMailer(),
 	}, config{})
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)

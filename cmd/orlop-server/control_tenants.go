@@ -206,7 +206,7 @@ type resizeTenantRequest struct {
 // resizeTenant changes an existing tenant's hard size cap in place
 // (PATCH /control/tenants/{id}). It is the data-plane half of elastic storage:
 // orlop-control's storage autoscaler calls it to grow a tenant toward its
-// promised ceiling, and the email-OTP upgrade raises an anon trial's cap the
+// promised ceiling, and a cap upgrade raises an anon trial's cap the
 // same way. Idempotent: re-applying the current size returns 200 unchanged.
 //
 // Only the kernel quota (quota_state.json) is updated — registered_tenants.json

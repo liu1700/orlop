@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/mail"
 	"strings"
 	"time"
 
@@ -40,13 +39,7 @@ const (
 	AccessTokenTTL  = 1 * time.Hour
 	RefreshTokenTTL = 30 * 24 * time.Hour
 	AdminSessionTTL = 30 * 24 * time.Hour
-	EmailOTPTTL     = 10 * time.Minute
 	PollInterval    = 5 * time.Second
-
-	// maxEmailOTPAttempts caps wrong guesses per email OTP. After this many the
-	// code is consumed, so the 6-digit space can't be brute-forced within the
-	// TTL even if the per-email / per-IP rate limiters are bypassed or reset.
-	maxEmailOTPAttempts = 5
 
 	// AgentEnrollTokenTTL is the lifetime of a per-pod, agent-scoped enroll
 	// token minted by IssueAgentEnrollToken. It is short because the token is
@@ -86,17 +79,7 @@ var (
 	ErrUserCodeUnknown         = errors.New("unknown user_code")
 	ErrUserCodeExpired         = errors.New("user_code expired")
 	ErrUserCodeAlreadyResolved = errors.New("user_code already approved or denied")
-	ErrEmailInvalid            = errors.New("invalid email")
-	ErrEmailOTPInvalid         = errors.New("invalid email otp")
-	ErrEmailOTPExpired         = errors.New("email otp expired")
-	ErrEmailOTPConsumed        = errors.New("email otp already consumed")
 )
-
-// Mailer sends login codes. HTTP tests use a fake; production wiring
-// currently uses Resend with a logging fallback for local development.
-type Mailer interface {
-	SendOTP(ctx context.Context, email, code string, expiresAt time.Time) error
-}
 
 // Service owns the device-flow state machine. Safe for concurrent use.
 type Service struct {
@@ -182,129 +165,12 @@ type RefreshResult struct {
 	ExpiresIn        int
 }
 
-type EmailVerifyResult struct {
-	SessionToken string
-	ExpiresAt    time.Time
-	UserID       pgtype.UUID
-	TenantID     string
-	// IsNewUser is true when the verify call created the user record
-	// (i.e. the email had no prior account). The dashboard uses this for
-	// a one-time greeting and never to gate functionality.
-	IsNewUser bool
-}
-
 type DeviceLookupResult struct {
 	UserCode       string
 	ExpiresAt      time.Time
 	QuotaBytes     int64
 	UsedBytes      int64
 	RemainingBytes int64
-}
-
-// StartEmailOTP creates a six-digit, 10-minute, single-use login code
-// and sends it to the normalized email address.
-func (s *Service) StartEmailOTP(ctx context.Context, email string, mailer Mailer) error {
-	normalized, err := NormalizeEmail(email)
-	if err != nil {
-		return err
-	}
-	code, err := s.randomEmailOTP()
-	if err != nil {
-		return err
-	}
-	expiresAt := s.now().Add(EmailOTPTTL)
-	if _, err := s.q.CreateEmailOTP(ctx, sqlcdb.CreateEmailOTPParams{
-		Email:     normalized,
-		CodeHash:  emailOTPHash(normalized, code),
-		ExpiresAt: ts(expiresAt),
-	}); err != nil {
-		return fmt.Errorf("create email otp: %w", err)
-	}
-	if mailer != nil {
-		if err := mailer.SendOTP(ctx, normalized, code, expiresAt); err != nil {
-			return fmt.Errorf("send email otp: %w", err)
-		}
-	}
-	s.logger.Info("email_otp_started", "event", "email_otp_started", "email", normalized, "expires_at", expiresAt)
-	return nil
-}
-
-// VerifyEmailOTP consumes the latest OTP for email and returns an
-// admin-session cookie token. First successful login creates a user and
-// a per-user tenant for hosted-v1.
-func (s *Service) VerifyEmailOTP(ctx context.Context, email, code string) (EmailVerifyResult, error) {
-	normalized, err := NormalizeEmail(email)
-	if err != nil {
-		return EmailVerifyResult{}, ErrEmailOTPInvalid
-	}
-	code = strings.TrimSpace(code)
-	if len(code) != 6 {
-		return EmailVerifyResult{}, ErrEmailOTPInvalid
-	}
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return EmailVerifyResult{}, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	qx := s.q.WithTx(tx)
-	now := s.now()
-
-	otp, err := qx.GetLatestEmailOTPForUpdate(ctx, normalized)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return EmailVerifyResult{}, ErrEmailOTPInvalid
-	}
-	if err != nil {
-		return EmailVerifyResult{}, err
-	}
-	if otp.ConsumedAt.Valid {
-		return EmailVerifyResult{}, ErrEmailOTPConsumed
-	}
-	if !otp.ExpiresAt.Valid || now.After(otp.ExpiresAt.Time) {
-		return EmailVerifyResult{}, ErrEmailOTPExpired
-	}
-	if otp.CodeHash != emailOTPHash(normalized, code) {
-		// Per-code lockout: count the wrong guess and consume the code once the
-		// budget is spent, so the 6-digit space can't be ground down even if the
-		// email/IP rate limiters are bypassed or reset. Commit so the increment
-		// (and consume) persist — the default wrong-code path rolls the tx back.
-		attempts, incErr := qx.IncrementEmailOTPAttempts(ctx, otp.ID)
-		if incErr != nil {
-			return EmailVerifyResult{}, incErr
-		}
-		if attempts >= maxEmailOTPAttempts {
-			if _, consErr := qx.ConsumeEmailOTP(ctx, sqlcdb.ConsumeEmailOTPParams{ID: otp.ID, ConsumedAt: ts(now)}); consErr != nil {
-				return EmailVerifyResult{}, consErr
-			}
-		}
-		if commitErr := tx.Commit(ctx); commitErr != nil {
-			return EmailVerifyResult{}, commitErr
-		}
-		return EmailVerifyResult{}, ErrEmailOTPInvalid
-	}
-	if _, err := qx.ConsumeEmailOTP(ctx, sqlcdb.ConsumeEmailOTPParams{ID: otp.ID, ConsumedAt: ts(now)}); err != nil {
-		return EmailVerifyResult{}, err
-	}
-	user, err := qx.GetUserByEmail(ctx, normalized)
-	isNewUser := false
-	if errors.Is(err, pgx.ErrNoRows) {
-		user, err = s.createHostedUser(ctx, qx, normalized)
-		isNewUser = true
-	}
-	if err != nil {
-		return EmailVerifyResult{}, err
-	}
-	if user.SuspendedAt.Valid {
-		return EmailVerifyResult{}, ErrUserSuspended
-	}
-	token, expiresAt, err := s.issueAdminSession(ctx, qx, user.ID, user.TenantID, now)
-	if err != nil {
-		return EmailVerifyResult{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return EmailVerifyResult{}, err
-	}
-	s.logger.Info("email_otp_verified", "event", "email_otp_verified", "email", normalized, "tenant_id", user.TenantID, "user_id", uuidString(user.ID), "is_new_user", isNewUser)
-	return EmailVerifyResult{SessionToken: token, ExpiresAt: expiresAt, UserID: user.ID, TenantID: user.TenantID, IsNewUser: isNewUser}, nil
 }
 
 // Poll exchanges a device_code for an access_token (when approved) or
@@ -823,40 +689,6 @@ func (s *Service) randomUserCode() (string, error) {
 	return "ORL-" + string(out), nil
 }
 
-func (s *Service) randomEmailOTP() (string, error) {
-	var b [6]byte
-	if _, err := s.rand(b[:]); err != nil {
-		return "", err
-	}
-	out := make([]byte, 6)
-	for i, x := range b {
-		out[i] = '0' + (x % 10)
-	}
-	return string(out), nil
-}
-
-func (s *Service) createHostedUser(ctx context.Context, q *sqlcdb.Queries, email string) (sqlcdb.User, error) {
-	tenantID, err := s.hostedTenantID()
-	if err != nil {
-		return sqlcdb.User{}, err
-	}
-	if _, err := q.CreateTenant(ctx, sqlcdb.CreateTenantParams{
-		ID:   tenantID,
-		Name: email,
-	}); err != nil {
-		return sqlcdb.User{}, err
-	}
-	return q.CreateUser(ctx, sqlcdb.CreateUserParams{Email: email, TenantID: tenantID})
-}
-
-func (s *Service) hostedTenantID() (string, error) {
-	tok, err := s.randomToken()
-	if err != nil {
-		return "", err
-	}
-	return "user_" + tok, nil
-}
-
 // NormalizeUserCode upper-cases, strips spaces and dashes, and
 // re-inserts the canonical "ORL-" prefix when present. Lookup miss is
 // returned by the DB layer for invalid input.
@@ -870,27 +702,11 @@ func NormalizeUserCode(s string) string {
 	return s
 }
 
-func NormalizeEmail(s string) (string, error) {
-	s = strings.ToLower(strings.TrimSpace(s))
-	addr, err := mail.ParseAddress(s)
-	if err != nil {
-		return "", ErrEmailInvalid
-	}
-	if addr.Name != "" || addr.Address != s || !strings.Contains(addr.Address, "@") {
-		return "", ErrEmailInvalid
-	}
-	return addr.Address, nil
-}
-
 // hashCode is SHA-256 hex; constant-time index lookup via DB UNIQUE
 // makes timing attacks against the hash space unproductive.
 func hashCode(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
-}
-
-func emailOTPHash(email, code string) string {
-	return hashCode(email + "\n" + code)
 }
 
 func bearerToken(header string) string {

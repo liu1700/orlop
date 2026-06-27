@@ -34,7 +34,7 @@ type mountLeaseFencer interface {
 
 // dashboardHandlers serves the user-facing JSON the Next.js dashboard
 // reads. All routes are gated on the admin-session cookie set by the
-// device-flow / OTP login.
+// device-flow login.
 type dashboardHandlers struct {
 	logger  *slog.Logger
 	devAuth *devauth.Service

@@ -90,16 +90,6 @@ type DiskAllocation struct {
 	TenantID       pgtype.Text
 }
 
-type EmailOtp struct {
-	ID         pgtype.UUID
-	Email      string
-	CodeHash   string
-	ExpiresAt  pgtype.Timestamptz
-	ConsumedAt pgtype.Timestamptz
-	CreatedAt  pgtype.Timestamptz
-	Attempts   int32
-}
-
 type RefreshToken struct {
 	ID           pgtype.UUID
 	TokenHash    string

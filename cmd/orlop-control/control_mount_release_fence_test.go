@@ -32,7 +32,7 @@ func (r *recordingFencer) FenceAllocation(_ context.Context, tenantID, allocatio
 func TestMountLeaseReleaseFencesServerSideLease(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	fencer := &recordingFencer{}
-	srv, svc, _ := httpStartServerWithFencer(t, pool, fencer)
+	srv, svc := httpStartServerWithFencer(t, pool, fencer)
 	cookie, _ := httpSeedAdmin(t, pool, svc)
 	userID := dashGetUserID(t, cookie, srv.URL)
 	asvc := dashAllocSvc(pool)
