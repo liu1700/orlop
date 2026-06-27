@@ -14,8 +14,9 @@ Each agent receives a short-lived mTLS client certificate whose SPIFFE SAN
 encodes its tenant and agent id. The data-plane server is the trust boundary: it
 binds every connection to that certificate, confines all operations to the
 agent's own path prefix (canonicalized, traversal-proof), and never reads a
-tenant or path from the request body. Storage credentials (object store, Redis,
-JuiceFS) live behind the data plane and are never handed to the agent.
+tenant or path from the request body. Any storage credentials behind the data
+plane (the JuiceFS volume or object store that backs the chunk store in
+production) stay on the server and are never handed to the agent.
 
 ## What is guaranteed
 
@@ -48,10 +49,12 @@ These are not optional for a production deployment:
   that sets that header. Never expose its port directly.
 - **Consider an API-token TTL.** Set `ORLOP_API_TOKEN_TTL` (e.g. `2160h`) so
   `orlop_` tokens expire; the default is no expiry.
-- **Lock down lazy tenant bootstrap.** By default the control plane will
-  bootstrap a CA intermediate for any server-derived `u_`/`a_` tenant. Set
-  `ORLOP_CA_TENANT_ALLOWLIST` (and optionally `ORLOP_CA_ALLOW_DYNAMIC_TENANTS=false`)
-  to restrict which tenants may self-onboard (issue #8).
+- **Lock down lazy tenant bootstrap.** Lazy bootstrap means the control plane
+  creates a CA intermediate for a tenant the first time one of its agents
+  enrolls, instead of requiring an operator to pre-register the tenant. By default it does this for
+  any server-derived `u_`/`a_` tenant. Set `ORLOP_CA_TENANT_ALLOWLIST` (and
+  optionally `ORLOP_CA_ALLOW_DYNAMIC_TENANTS=false`) to restrict which tenants may
+  self-onboard.
 
 ## Hardening in place
 
@@ -59,10 +62,10 @@ The data plane bounds untrusted input and load: msgpack decoding is guarded
 against pre-allocation bombs, each request handler is panic-isolated (one bad
 request can't crash the server), and concurrent connections, in-flight requests,
 and per-chunk size are all capped. On the identity side: per-pod agent-enroll
-tokens are single-use (issue #6); a released or leaked agent leaf is revoked
-onto a data-plane serial deny-list checked at session start (issue #5); the
-cross-tenant cert-forgery check fails closed (issue #7); API tokens can expire;
-and cert issuance derives every SAN server-side and pins client/server usage.
+tokens are single-use; a released or leaked agent leaf is revoked onto a
+data-plane serial deny-list checked at session start; the cross-tenant
+cert-forgery check fails closed; API tokens can expire; and cert issuance derives
+every SAN server-side and pins client/server usage.
 
 ## Known limitations
 
@@ -71,20 +74,19 @@ Honest gaps a deployment should account for:
 - **Rate limiters are per-process and in-memory.** They reset on restart and are
   not shared across replicas. Running more than one control-plane replica, or a
   crash loop, weakens every rate-limit-dependent control (device-code, enroll).
-  Use a shared store (Redis is already in the stack) for multi-replica.
+  Multi-replica deployments would need a shared rate-limit store.
 - **Disk accounting when quota enforcement is off.** There is no in-process
   per-tenant byte accountant; the per-tenant cap depends entirely on the
   filesystem/JuiceFS quota (see "what the operator must do").
 - **Intermediate-key blast radius.** Tenant intermediates carry a
   `PermittedURIDomains` name constraint pinning them to the deployment trust
   domain, but that is host-scoped and cannot isolate tenants (which differ only
-  by SPIFFE URI *path*). The data-plane `checkTenantBinding` cross-check — now
-  fail-closed — is the gate that rejects a leaked intermediate key minting
+  by SPIFFE URI *path*). The data-plane `checkTenantBinding` cross-check, now
+  fail-closed, is the gate that rejects a leaked intermediate key minting
   another tenant's SAN; the control plane must still guard intermediate keys
   carefully.
 - **Device user_code entropy.** The device-flow user code is short; approval
-  requires an authenticated admin session, but widening it is a tracked
-  hardening item.
+  requires an authenticated admin session.
 
 ## Reporting a vulnerability
 

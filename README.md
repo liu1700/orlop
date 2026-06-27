@@ -1,6 +1,9 @@
-# orlop
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="brand/orlop-wordmark-dark.svg">
+  <img alt="orlop" src="brand/orlop-wordmark-light.svg" width="220">
+</picture>
 
-**Give each untrusted agent its own durable POSIX disk — without ever handing it your storage credentials.**
+**Give each untrusted agent its own durable POSIX disk, without ever handing it your storage credentials.**
 
 [![Go CI](https://github.com/liu1700/orlop/actions/workflows/go.yml/badge.svg)](https://github.com/liu1700/orlop/actions/workflows/go.yml)
 [![Rust CI](https://github.com/liu1700/orlop/actions/workflows/orlop-cli.yml/badge.svg)](https://github.com/liu1700/orlop/actions/workflows/orlop-cli.yml)
@@ -23,21 +26,21 @@ zero idle compute.
 
 ## Highlights
 
-- 🔒 **Zero-trust by construction** — per-agent mTLS identity, server-side path
+- 🔒 **Zero-trust by construction**: per-agent mTLS identity, server-side path
   confinement, no shared storage credential to leak.
-- 💾 **Survives the sandbox** — data lives in the remote chunk store and re-mounts
+- 💾 **Survives the sandbox**: data lives in the remote chunk store and re-mounts
   on the next run with zero idle compute.
-- 🧱 **Content-addressed & deduped** — bytes stored verbatim and deduped by hash, so
+- 🧱 **Content-addressed & deduped**: bytes stored verbatim and deduped by hash, so
   keeping full, uncompressed history is nearly free.
-- ⚡ **Incremental writes** — a single-byte edit ships one ~4 MiB chunk, not the
+- ⚡ **Incremental writes**: a single-byte edit ships one ~4 MiB chunk, not the
   whole file; a persistent client cache makes re-reads run at local-disk speed.
-- 🔁 **Atomic overwrites** — versioned, compare-and-swap manifests replace a stale
+- 🔁 **Atomic overwrites**: versioned, compare-and-swap manifests replace a stale
   fact in place instead of appending and hoping retrieval picks the latest.
-- 🧩 **Drop-in POSIX** — FUSE on Linux, in-process NFSv3 loopback on macOS; the
+- 🧩 **Drop-in POSIX**: FUSE on Linux, in-process NFSv3 loopback on macOS; the
   agent just sees a directory.
 
 > **Built for agent memory.** orlop is the *storage substrate* for an agent-memory
-> stack — durable, cheap to update, and safe under multi-tenancy — but it does no
+> stack (durable, cheap to update, and safe under multi-tenancy), but it does no
 > extraction, ranking, or semantic consolidation; the layer above does. See
 > [`docs/agent-memory.md`](docs/agent-memory.md) for what orlop gives that stack and
 > where it stops.
@@ -45,7 +48,7 @@ zero idle compute.
 ## Quickstart
 
 A complete single-node stack (control + server + one mounted disk) runs on one
-host with no external dependencies — the control plane can use its embedded
+host with no external dependencies: the control plane can use its embedded
 SQLite backend (`DATABASE_URL=sqlite:./orlop.db`), so not even Postgres is
 required. Follow [`docs/standalone-quickstart.md`](docs/standalone-quickstart.md)
 end to end; it walks `server register` → `token issue` → `orlop mount --from-env`
@@ -85,20 +88,21 @@ end to end; it walks `server register` → `token issue` → `orlop mount --from
 <summary><strong>Why Go <em>and</em> Rust</strong></summary>
 
 Each layer uses the language that's strongest for its job, and a clean network
-boundary (mTLS + QUIC + msgpack — no cgo, no FFI) makes that split essentially free:
+boundary (mTLS + msgpack over a long-lived connection, no cgo, no FFI) makes that
+split essentially free:
 
 - **Rust for the mount client** because it runs *inside the untrusted agent sandbox*,
   on the hot path of every filesystem syscall. No GC pauses to stall I/O, a small
   static binary, low memory footprint, and a mature FUSE/NFS/QUIC ecosystem
   (`fuser`, `nfsserve`, `quinn`).
 - **Go for the control and data planes** because they're network services where Go's
-  ecosystem and velocity shine (HTTP router, Postgres, migrations, metrics) — and the
+  ecosystem and velocity shine (HTTP router, Postgres, migrations, metrics), and the
   public [client SDK](client) is Go too, which is what host integrators orchestrating
   sandboxes actually want.
 
 The two halves are separate binaries that only share a wire protocol, so they build
 and ship independently. **Contributing to one side almost never requires the other's
-toolchain** — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+toolchain.** See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 </details>
 
 ## Build from source
@@ -133,10 +137,11 @@ A `client.Fake` in-memory implementation is provided for consumer tests.
 | Doc | What's inside |
 |---|---|
 | [`standalone-quickstart.md`](docs/standalone-quickstart.md) | Run the whole thing on one host |
-| [`database-backends.md`](docs/database-backends.md) | Postgres vs embedded SQLite — which to use and how |
+| [`database-backends.md`](docs/database-backends.md) | Postgres vs embedded SQLite: which to use and how |
 | [`design.md`](docs/design.md) | System overview and filesystem layout |
 | [`design-data-plane.md`](docs/design-data-plane.md) | Chunk store / journal design |
 | [`design-auth.md`](docs/design-auth.md) | Certificate / tenant isolation model |
+| [`design-identity.md`](docs/design-identity.md) | Host identity: verify a host-issued JWT and map it to a tenant |
 | [`control-plane.md`](docs/control-plane.md) | Control-plane API |
 | [`control-plane-runbook.md`](docs/control-plane-runbook.md) | Operator workflows (CA, admin seeding) |
 | [`agent-memory.md`](docs/agent-memory.md) | What orlop gives an agent-memory stack, and where it stops |
@@ -144,7 +149,7 @@ A `client.Fake` in-memory implementation is provided for consumer tests.
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) — including why the Go/Rust split means you
+See [`CONTRIBUTING.md`](CONTRIBUTING.md), including why the Go/Rust split means you
 rarely need both toolchains to contribute.
 
 ## Security

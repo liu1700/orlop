@@ -12,11 +12,20 @@ postgres → orlop-control (auto CA) → server register → orlop-server
         → token issue → orlop mount --from-env → write → unmount → remount → data persists
 ```
 
+Three listeners are involved. Everything uses `localhost`, so one certificate
+covers all of them:
+
+| Listener | Address | Bound by | Dialed by |
+|---|---|---|---|
+| Control plane | `:8080` | `orlop-control` | agents + the server (enroll, cert signing) |
+| Server ops | `:7878` | `orlop-server` | the control plane (mTLS) |
+| Server data | `:8443` | `orlop-server` | agents (the mTLS data path) |
+
 ## Prerequisites
 
 - Go and Rust (`cargo`) toolchains.
 - A database: either a Postgres instance (the snippet uses Docker) **or** nothing
-  at all — the control plane ships an embedded SQLite backend for single-node use
+  at all: the control plane ships an embedded SQLite backend for single-node use
   (see the SQLite option in step 1).
 - Local mount support: Linux uses FUSE (`/dev/fuse` + `fuse3`); macOS uses the
   built-in NFSv3 client (no macFUSE needed). Check with `orlop doctor` after the
@@ -37,7 +46,7 @@ orlop doctor            # confirms this host can mount
 
 ## 1. Database + schema
 
-Pick **one** backend — SQLite needs nothing external and is the shortest path;
+Pick **one** backend: SQLite needs nothing external and is the shortest path;
 Postgres is the production backend. The rest of the guide is identical either
 way; only `DATABASE_URL` and the CA-secrets backend (step 2) differ. See
 [`database-backends.md`](database-backends.md) for the full comparison and the
@@ -60,10 +69,10 @@ orlop-control migrate up
 
 ## 2. Start the control plane
 
-The CA is created automatically on first boot, so there is no separate `ca init`
-step for a dev node. **With Postgres** it lives in the DB
+The CA is created automatically on first boot, so a dev node skips the separate
+`ca init` step. **With Postgres** it lives in the DB
 (`ORLOP_SECRETS_BACKEND=postgres`); **with SQLite** the DB backend has no shared
-pool for the CA, so use the filesystem backend instead — set `ORLOP_SECRETS_DIR`
+pool for the CA, so use the filesystem backend instead, setting `ORLOP_SECRETS_DIR`
 and drop `ORLOP_SECRETS_BACKEND`:
 
 ```bash
@@ -115,7 +124,7 @@ tenant:
 store:   { type: local,  root: ./dg-data/objects }
 routes:  { type: sqlite, path: ./dg-data/routes.db }
 server:
-  ops_bind:  ":7878"         # dual-stack ":port", NOT 127.0.0.1 — see note
+  ops_bind:  ":7878"         # dual-stack ":port", NOT 127.0.0.1 (see note)
   data_bind: ":8443"         # must be set; the data plane is off by default
 tls:
   self_provision: true       # fetches its cert + the client CA from the control plane
@@ -164,9 +173,9 @@ echo "hello from a durable agent disk" > ./agent-disk/hello.txt
 mkdir -p ./agent-disk/sub && echo "nested" > ./agent-disk/sub/note.md
 cat ./agent-disk/hello.txt
 
-# unmount: the bytes are NOT local — the mount point goes empty
-kill -TERM %3            # the `orlop mount` job; its Drop unmounts cleanly
-ls ./agent-disk          # empty
+# unmount cleanly: the bytes are NOT local, so the mount point goes empty
+orlop unmount ./agent-disk   # tears down the mount; the `orlop mount` job then exits
+ls ./agent-disk              # empty
 
 # remount with a fresh token: the files are still there
 orlop-control token issue --agent demo --json    # grab a new token
