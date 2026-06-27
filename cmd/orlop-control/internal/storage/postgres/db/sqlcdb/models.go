@@ -64,20 +64,6 @@ type CertRevocation struct {
 	RevokedAt  pgtype.Timestamptz
 }
 
-type DeviceAuthorization struct {
-	ID             pgtype.UUID
-	DeviceCodeHash string
-	UserCodeHash   string
-	TenantID       pgtype.Text
-	UserID         pgtype.UUID
-	AllocationID   pgtype.UUID
-	Status         string
-	ExpiresAt      pgtype.Timestamptz
-	ApprovedAt     pgtype.Timestamptz
-	LastPolledAt   pgtype.Timestamptz
-	CreatedAt      pgtype.Timestamptz
-}
-
 type DgCaSecret struct {
 	Key       string
 	Value     []byte
@@ -97,19 +83,6 @@ type DiskAllocation struct {
 	AgentID        pgtype.Text
 	PurgedAt       pgtype.Timestamptz
 	TenantID       pgtype.Text
-}
-
-type RefreshToken struct {
-	ID           pgtype.UUID
-	TokenHash    string
-	FamilyID     pgtype.UUID
-	UserID       pgtype.UUID
-	TenantID     string
-	AllocationID pgtype.UUID
-	ExpiresAt    pgtype.Timestamptz
-	RevokedAt    pgtype.Timestamptz
-	RotatedAt    pgtype.Timestamptz
-	CreatedAt    pgtype.Timestamptz
 }
 
 type ServerPool struct {

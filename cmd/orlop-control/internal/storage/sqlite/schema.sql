@@ -78,20 +78,6 @@ CREATE TABLE IF NOT EXISTS access_tokens (
 );
 CREATE INDEX IF NOT EXISTS access_tokens_purpose_user_id_idx ON access_tokens (purpose, user_id);
 
-CREATE TABLE IF NOT EXISTS refresh_tokens (
-    id            TEXT PRIMARY KEY,
-    token_hash    TEXT NOT NULL UNIQUE,
-    family_id     TEXT NOT NULL,
-    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    tenant_id     TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
-    allocation_id TEXT REFERENCES disk_allocations(id) ON DELETE RESTRICT,
-    expires_at    INTEGER NOT NULL,
-    revoked_at    INTEGER,
-    rotated_at    INTEGER,
-    created_at    INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS refresh_tokens_family_id_idx ON refresh_tokens (family_id);
-CREATE INDEX IF NOT EXISTS refresh_tokens_user_id_idx ON refresh_tokens (user_id);
 
 CREATE TABLE IF NOT EXISTS api_tokens (
     id           TEXT PRIMARY KEY,
@@ -107,20 +93,6 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_token_hash_idx ON api_tokens (token_hash);
 CREATE INDEX IF NOT EXISTS api_tokens_user_id_active_idx ON api_tokens (user_id) WHERE (revoked_at IS NULL);
 
-CREATE TABLE IF NOT EXISTS device_authorizations (
-    id               TEXT PRIMARY KEY,
-    device_code_hash TEXT NOT NULL UNIQUE,
-    user_code_hash   TEXT NOT NULL UNIQUE,
-    tenant_id        TEXT REFERENCES tenants(id) ON DELETE RESTRICT,
-    user_id          TEXT REFERENCES users(id) ON DELETE RESTRICT,
-    allocation_id    TEXT REFERENCES disk_allocations(id) ON DELETE RESTRICT,
-    status           TEXT NOT NULL,
-    expires_at       INTEGER NOT NULL,
-    approved_at      INTEGER,
-    last_polled_at   INTEGER,
-    created_at       INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS device_authorizations_status_idx ON device_authorizations (status);
 
 CREATE TABLE IF NOT EXISTS cert_revocations (
     cert_serial TEXT PRIMARY KEY,
