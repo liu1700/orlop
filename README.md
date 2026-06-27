@@ -44,11 +44,12 @@ zero idle compute.
 
 ## Quickstart
 
-A complete single-node stack (Postgres + control + server + one mounted disk) runs
-on one host with no external dependencies. Follow
-[`docs/standalone-quickstart.md`](docs/standalone-quickstart.md) end to end; it walks
-`server register` → `token issue` → `orlop mount --from-env` → write a file →
-unmount → remount and watch the data persist.
+A complete single-node stack (control + server + one mounted disk) runs on one
+host with no external dependencies — the control plane can use its embedded
+SQLite backend (`DATABASE_URL=sqlite:./orlop.db`), so not even Postgres is
+required. Follow [`docs/standalone-quickstart.md`](docs/standalone-quickstart.md)
+end to end; it walks `server register` → `token issue` → `orlop mount --from-env`
+→ write a file → unmount → remount and watch the data persist.
 
 ## How it works
 

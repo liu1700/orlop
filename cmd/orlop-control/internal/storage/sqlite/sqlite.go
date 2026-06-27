@@ -103,11 +103,10 @@ func (s *Store) Close() error {
 	return nil
 }
 
-// One *Store implements every role interface; *txStore additionally is a Tx.
+// One *Store implements every role interface (storage.Store); *txStore is a Tx.
 var (
-	_ storage.SessionStore    = (*Store)(nil)
-	_ storage.AllocationStore = (*Store)(nil)
-	_ storage.Tx              = (*txStore)(nil)
+	_ storage.Store = (*Store)(nil)
+	_ storage.Tx    = (*txStore)(nil)
 )
 
 // --- transactions ---

@@ -9,10 +9,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 // defaultServerTotalBytes is the capacity a standalone `server register` claims
@@ -78,12 +75,11 @@ func runServerRegister(ctx context.Context, out io.Writer, args []string) error 
 		*totalBytes = defaultServerTotalBytes
 	}
 
-	pool, err := pgxpool.New(ctx, *databaseURL)
+	store, _, closeStore, err := openStore(ctx, *databaseURL)
 	if err != nil {
-		return fmt.Errorf("open pgxpool: %w", err)
+		return err
 	}
-	defer pool.Close()
-	store := postgres.New(pool)
+	defer closeStore()
 
 	// Fresh registration starts fully free; re-registering resets free_bytes to
 	// total, which is correct for a single-node demo (no concurrent reservations

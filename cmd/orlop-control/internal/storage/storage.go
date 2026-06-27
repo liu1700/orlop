@@ -2,8 +2,8 @@
 //
 // It defines domain types and small *role* interfaces that HTTP/business code
 // depends on, so the concrete database lives entirely behind an adapter
-// (storage/postgres today; storage/sqlite, storage/redis later). The rules that
-// make a second backend possible:
+// (storage/postgres for production; storage/sqlite is the embedded single-node
+// backend). The rules that keep backends interchangeable:
 //
 //   - No driver types cross this boundary. Methods take and return plain Go /
 //     domain types (string, time.Time, *time.Time, domain structs) — never
@@ -34,6 +34,23 @@ import (
 // driver's "no rows" sentinel onto this so callers stay driver-agnostic
 // (`errors.Is(err, storage.ErrNotFound)`).
 var ErrNotFound = errors.New("storage: not found")
+
+// Store is the full data-access surface — every role interface, implemented by a
+// single backend value (postgres.Store or sqlite.Store). The composition root
+// holds one Store and hands each consumer the narrow role interface it needs, so
+// no business code depends on Store directly. Overlapping methods across the
+// embedded interfaces (GetUser, AddCertRevocation, Begin, …) share one identical
+// signature, which Go merges.
+type Store interface {
+	SessionStore
+	AllocationStore
+	RevocationStore
+	APITokenStore
+	ProvisioningStore
+	TenantStore
+	EnrollmentStore
+	AdminStore
+}
 
 // CertRevocation is a revoked agent-leaf serial on the data-plane deny-list
 // (issue #5). Serial is uppercase hex; ExpiresAt is the cert's NotAfter.

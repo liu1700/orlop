@@ -15,7 +15,9 @@ postgres → orlop-control (auto CA) → server register → orlop-server
 ## Prerequisites
 
 - Go and Rust (`cargo`) toolchains.
-- A Postgres instance (the snippet uses Docker).
+- A database: either a Postgres instance (the snippet uses Docker) **or** nothing
+  at all — the control plane ships an embedded SQLite backend for single-node use
+  (see the SQLite option in step 1).
 - Local mount support: Linux uses FUSE (`/dev/fuse` + `fuse3`); macOS uses the
   built-in NFSv3 client (no macFUSE needed). Check with `orlop doctor` after the
   build step.
@@ -33,7 +35,12 @@ export PATH="$PWD/bin:$PWD/target/release:$PATH"
 orlop doctor            # confirms this host can mount
 ```
 
-## 1. Postgres + schema
+## 1. Database + schema
+
+Pick **one** backend. The rest of the guide is identical either way — only
+`DATABASE_URL` and the CA-secrets backend in step 2 differ.
+
+**Option A — Postgres:**
 
 ```bash
 docker run -d --name dg-pg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=dg -p 5432:5432 postgres:16-alpine
@@ -42,10 +49,30 @@ export DATABASE_URL="postgres://postgres:pw@localhost:5432/dg?sslmode=disable"
 orlop-control migrate up
 ```
 
+**Option B — SQLite (zero external dependencies):**
+
+```bash
+export DATABASE_URL="sqlite:./orlop.db"   # also: sqlite::memory:, sqlite:///abs/path.db
+
+orlop-control migrate up                  # creates ./orlop.db and applies the schema
+```
+
+The embedded SQLite backend is pure Go (no cgo, no server). It's meant for a
+single node — local dev, a self-hosted box, a CI fixture — not multi-replica
+production.
+
 ## 2. Start the control plane
 
-The CA is created automatically on first boot (`ORLOP_SECRETS_BACKEND=postgres`
-stores it in the DB), so there is no separate `ca init` step for a dev node.
+The CA is created automatically on first boot, so there is no separate `ca init`
+step for a dev node. **With Postgres** it lives in the DB
+(`ORLOP_SECRETS_BACKEND=postgres`); **with SQLite** the DB backend has no shared
+pool for the CA, so use the filesystem backend instead — set `ORLOP_SECRETS_DIR`
+and drop `ORLOP_SECRETS_BACKEND`:
+
+```bash
+# SQLite: store the CA on disk instead of in the database
+export ORLOP_SECRETS_DIR=./dg-secrets
+```
 
 Three values are the operator's to choose, and **two of them must match the
 data-plane server's config later** (called out in step 4):
@@ -55,7 +82,9 @@ export ORLOP_CONTROL_PLANE_TOKEN=$(openssl rand -hex 16)   # shared service toke
 export ORLOP_TRUST_DOMAIN=demo.example                     # must match server tls.trust_domain
 export ORLOP_DATAGW_SERVER_FQDN=localhost                  # must match server tls.fqdn (cert SAN)
 
-ORLOP_SECRETS_BACKEND=postgres PORT=8080 orlop-control &
+# Postgres: ORLOP_SECRETS_BACKEND=postgres PORT=8080 orlop-control &
+# SQLite:   ORLOP_SECRETS_DIR=./dg-secrets    PORT=8080 orlop-control &
+PORT=8080 orlop-control &
 # wait for: GET /healthz → 200
 ```
 
@@ -169,7 +198,8 @@ sync:
 
 ```bash
 kill %1 %2 %3 2>/dev/null     # orlop mount, orlop-server, orlop-control
-docker rm -f dg-pg
+docker rm -f dg-pg            # Postgres only
+rm -f ./orlop.db*             # SQLite only
 ```
 
 ## What this is not

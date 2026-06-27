@@ -31,6 +31,8 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool, q: sqlcdb.New(pool)}
 }
 
+var _ storage.Store = (*Store)(nil)
+
 // mapErr translates pgx sentinels to storage-level domain errors so callers
 // never import the driver to interpret a result.
 func mapErr(err error) error {
