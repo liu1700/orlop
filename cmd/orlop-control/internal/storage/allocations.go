@@ -51,6 +51,13 @@ type Server struct {
 	Status   string
 }
 
+// PurgePendingAllocation is one entry in the purge sweeper's work queue: a
+// revoked agent allocation whose backend data has not been erased yet.
+type PurgePendingAllocation struct {
+	AllocationID uuid.UUID
+	AgentID      string // "" if the row has no agent_id
+}
+
 // ChosenServer is the placement target PickBestAvailableServer returns.
 type ChosenServer struct {
 	ID       uuid.UUID
@@ -78,6 +85,7 @@ type AllocationOps interface {
 	UpdateAllocationSize(ctx context.Context, allocID, userID uuid.UUID, sizeBytes int64) (Allocation, error)
 	CountActiveAllocationsForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 	SumActiveAllocationBytes(ctx context.Context, userID uuid.UUID) (int64, error)
+	ListPurgePendingAllocations(ctx context.Context, limit int32) ([]PurgePendingAllocation, error)
 
 	// Mount leases.
 	AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (Allocation, error)

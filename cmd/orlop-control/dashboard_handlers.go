@@ -8,12 +8,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 // tenantUsageClient is the subset of *serverapi.Client this handler needs.
@@ -31,21 +33,34 @@ type mountLeaseFencer interface {
 	FenceAllocation(ctx context.Context, tenantID, allocationID string) error
 }
 
+// dashboardStore is the slice of the storage layer the dashboard reads:
+// user/quota lookups and the allocation→tenant→server placement chain the
+// usage and fence paths walk. *postgres.Store satisfies it.
+type dashboardStore interface {
+	GetUser(ctx context.Context, id uuid.UUID) (storage.User, error)
+	SumActiveAllocationBytes(ctx context.Context, userID uuid.UUID) (int64, error)
+	GetAllocation(ctx context.Context, id uuid.UUID) (storage.Allocation, error)
+	GetServerVMByTenant(ctx context.Context, tenantID string) (storage.ServerVM, error)
+	GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (storage.Server, error)
+}
+
 // dashboardHandlers serves the user-facing JSON the Next.js dashboard
 // reads. All routes are gated on the admin-session cookie set by the
 // device-flow login.
 type dashboardHandlers struct {
 	logger  *slog.Logger
 	devAuth *devauth.Service
-	queries db.Store
+	store   dashboardStore
 	alloc   *allocations.Service
 	usage   tenantUsageClient // nil when the server admin client is not configured (no SecretsDir)
 	fencer  mountLeaseFencer  // nil when no serverapi client; revoke skips the fence call
 }
 
-func newDashboardHandlers(logger *slog.Logger, svc *devauth.Service, q db.Store, alloc *allocations.Service, usage tenantUsageClient, fencer mountLeaseFencer) *dashboardHandlers {
-	return &dashboardHandlers{logger: logger, devAuth: svc, queries: q, alloc: alloc, usage: usage, fencer: fencer}
+func newDashboardHandlers(logger *slog.Logger, svc *devauth.Service, store dashboardStore, alloc *allocations.Service, usage tenantUsageClient, fencer mountLeaseFencer) *dashboardHandlers {
+	return &dashboardHandlers{logger: logger, devAuth: svc, store: store, alloc: alloc, usage: usage, fencer: fencer}
 }
+
+var _ dashboardStore = (*postgres.Store)(nil)
 
 // mountDashboard registers routes on both bare and /api-prefixed paths.
 // Direct callers (CLI, tests, healthchecks) hit the bare path; the Next.js
@@ -69,13 +84,13 @@ func (h *dashboardHandlers) handleMe(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 		return
 	}
-	user, err := h.queries.GetUser(r.Context(), ident.UserID)
+	user, err := h.store.GetUser(r.Context(), toUUID(ident.UserID))
 	if err != nil {
 		h.logger.Error("dashboard_me_get_user_failed", "error", err, "user_id", uuidString(ident.UserID))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}
-	used, err := h.queries.SumActiveAllocationBytes(r.Context(), ident.UserID)
+	used, err := h.store.SumActiveAllocationBytes(r.Context(), toUUID(ident.UserID))
 	if err != nil {
 		h.logger.Error("dashboard_me_sum_failed", "error", err, "user_id", uuidString(ident.UserID))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
@@ -180,12 +195,12 @@ func (h *dashboardHandlers) fenceAllocationBestEffort(ctx context.Context, alloc
 	if h.fencer == nil {
 		return
 	}
-	alloc, err := h.queries.GetAllocation(ctx, allocID)
+	alloc, err := h.store.GetAllocation(ctx, toUUID(allocID))
 	if err != nil {
 		h.logger.Warn("fence_lookup_alloc_failed", "error", err, "allocation_id", uuidString(allocID), "reason", reason)
 		return
 	}
-	user, err := h.queries.GetUser(ctx, alloc.UserID)
+	user, err := h.store.GetUser(ctx, alloc.UserID)
 	if err != nil {
 		h.logger.Warn("fence_lookup_user_failed", "error", err, "allocation_id", uuidString(allocID), "reason", reason)
 		return
@@ -256,16 +271,16 @@ func (h *dashboardHandlers) handleAllocationUsage(w http.ResponseWriter, r *http
 		return
 	}
 
-	user, err := h.queries.GetUser(r.Context(), ident.UserID)
+	user, err := h.store.GetUser(r.Context(), toUUID(ident.UserID))
 	if err != nil {
 		h.logger.Error("dashboard_usage_get_user_failed", "error", err, "user_id", uuidString(ident.UserID))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}
 
-	vm, err := h.queries.GetServerVMByTenant(r.Context(), user.TenantID)
+	vm, err := h.store.GetServerVMByTenant(r.Context(), user.TenantID)
 	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) {
 			// Allocation exists but tenant has never been placed on a server
 			// (i.e. no `orlop mount` since allocation was created). Surface
 			// zero usage so the dashboard / CLI can render something sensible.
@@ -280,7 +295,7 @@ func (h *dashboardHandlers) handleAllocationUsage(w http.ResponseWriter, r *http
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}
-	pool, err := h.queries.GetServerPoolByDataAddr(r.Context(), vm.DataAddr)
+	pool, err := h.store.GetServerPoolByDataAddr(r.Context(), vm.DataAddr)
 	if err != nil {
 		h.logger.Error("dashboard_usage_get_server_pool_failed", "error", err, "data_addr", vm.DataAddr)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")

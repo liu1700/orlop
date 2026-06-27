@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,24 +12,37 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
+
+// mountLeaseStore is the slice of the storage layer the mount-lease routes
+// read: the agent cert→enrollment lookup plus the allocation/user pair the
+// ownership check and fence path need. *postgres.Store satisfies it.
+type mountLeaseStore interface {
+	GetActiveEnrollmentByFingerprint(ctx context.Context, fingerprint string) (storage.AgentEnrollment, error)
+	GetAllocation(ctx context.Context, id uuid.UUID) (storage.Allocation, error)
+	GetUser(ctx context.Context, id uuid.UUID) (storage.User, error)
+}
 
 type mountLeaseHandlers struct {
 	logger  *slog.Logger
 	alloc   *allocations.Service
-	q       db.Store
+	store   mountLeaseStore
 	devAuth *devauth.Service
 	fencer  mountLeaseFencer
 }
 
-func newMountLeaseHandlers(logger *slog.Logger, alloc *allocations.Service, q db.Store, dev *devauth.Service, fencer mountLeaseFencer) *mountLeaseHandlers {
-	return &mountLeaseHandlers{logger: logger, alloc: alloc, q: q, devAuth: dev, fencer: fencer}
+func newMountLeaseHandlers(logger *slog.Logger, alloc *allocations.Service, store mountLeaseStore, dev *devauth.Service, fencer mountLeaseFencer) *mountLeaseHandlers {
+	return &mountLeaseHandlers{logger: logger, alloc: alloc, store: store, devAuth: dev, fencer: fencer}
 }
+
+var _ mountLeaseStore = (*postgres.Store)(nil)
 
 func mountLeaseRoutes(r chi.Router, h *mountLeaseHandlers) {
 	for _, prefix := range []string{"", "/api"} {
@@ -114,11 +128,11 @@ func (h *mountLeaseHandlers) fenceAllocation(r *http.Request, allocID pgtype.UUI
 	if h.fencer == nil {
 		return
 	}
-	alloc, err := h.q.GetAllocation(r.Context(), allocID)
+	alloc, err := h.store.GetAllocation(r.Context(), toUUID(allocID))
 	if err != nil {
 		return
 	}
-	user, err := h.q.GetUser(r.Context(), alloc.UserID)
+	user, err := h.store.GetUser(r.Context(), alloc.UserID)
 	if err != nil {
 		return
 	}
@@ -155,8 +169,8 @@ func (h *mountLeaseHandlers) resolveMountRequest(w http.ResponseWriter, r *http.
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "agent certificate or agent_fingerprint is required")
 		return pgtype.UUID{}, pgtype.UUID{}, false
 	}
-	agent, err := h.q.GetActiveEnrollmentByFingerprint(r.Context(), fingerprint)
-	if errors.Is(err, db.ErrNotFound) {
+	agent, err := h.store.GetActiveEnrollmentByFingerprint(r.Context(), fingerprint)
+	if errors.Is(err, storage.ErrNotFound) {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "")
 		return pgtype.UUID{}, pgtype.UUID{}, false
 	}
@@ -169,8 +183,8 @@ func (h *mountLeaseHandlers) resolveMountRequest(w http.ResponseWriter, r *http.
 	// authenticated cert's user to own the allocation, and the allocation to be bound to
 	// an agent (only bound disks are mountable). A revoked allocation is NOT rejected
 	// here — it flows to the lease op, which returns ErrRevoked (mapped to 410 Gone).
-	alloc, err := h.q.GetAllocation(r.Context(), allocID)
-	if errors.Is(err, db.ErrNotFound) {
+	alloc, err := h.store.GetAllocation(r.Context(), toUUID(allocID))
+	if errors.Is(err, storage.ErrNotFound) {
 		writeOAuthError(w, http.StatusNotFound, "not_found", "")
 		return pgtype.UUID{}, pgtype.UUID{}, false
 	}
@@ -179,14 +193,14 @@ func (h *mountLeaseHandlers) resolveMountRequest(w http.ResponseWriter, r *http.
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return pgtype.UUID{}, pgtype.UUID{}, false
 	}
-	if alloc.UserID != agent.UserID || !alloc.AgentID.Valid {
+	if alloc.UserID != agent.UserID || alloc.AgentID == "" {
 		writeOAuthError(w, http.StatusForbidden, "access_denied", "")
 		return pgtype.UUID{}, pgtype.UUID{}, false
 	}
 	// bound_agent_id is an FK into agent_enrollments, so the lease binds to the
 	// authenticated enrollment; the takeover (below) is what bridges across the
 	// per-turn enrollment churn.
-	return allocID, agent.ID, true
+	return allocID, fromUUID(agent.ID), true
 }
 
 func agentFingerprintFromRequest(r *http.Request) (string, error) {

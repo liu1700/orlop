@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,14 +10,15 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/time/rate"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 const (
@@ -25,9 +27,20 @@ const (
 	serverStatusActive = "active"
 )
 
+// agentEnrollStore is the slice of the storage layer the enroll route reads
+// and writes: the tenant suspension gate, the allocation/placement lookups
+// that drive cert minting, and the enrollment record written once the leaf is
+// issued. *postgres.Store satisfies it.
+type agentEnrollStore interface {
+	GetTenant(ctx context.Context, id string) (storage.Tenant, error)
+	GetAllocation(ctx context.Context, id uuid.UUID) (storage.Allocation, error)
+	GetServerVMByTenant(ctx context.Context, tenantID string) (storage.ServerVM, error)
+	CreateAgentEnrollment(ctx context.Context, in storage.NewAgentEnrollment) error
+}
+
 type agentEnrollHandlers struct {
 	logger      *slog.Logger
-	q           db.Store
+	store       agentEnrollStore
 	devAuth     *devauth.Service
 	ca          *ca.CA
 	limit       *agentEnrollLimiter
@@ -37,7 +50,7 @@ type agentEnrollHandlers struct {
 
 func newAgentEnrollHandlers(
 	logger *slog.Logger,
-	q db.Store,
+	store agentEnrollStore,
 	devAuth *devauth.Service,
 	agentCA *ca.CA,
 	limit *agentEnrollLimiter,
@@ -49,7 +62,7 @@ func newAgentEnrollHandlers(
 	}
 	return &agentEnrollHandlers{
 		logger:      logger,
-		q:           q,
+		store:       store,
 		devAuth:     devAuth,
 		ca:          agentCA,
 		limit:       limit,
@@ -57,6 +70,8 @@ func newAgentEnrollHandlers(
 		serverAPI:   serverAPI,
 	}
 }
+
+var _ agentEnrollStore = (*postgres.Store)(nil)
 
 type agentEnrollLimiter struct {
 	mu      sync.Mutex
@@ -99,8 +114,8 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	tenant, err := h.q.GetTenant(r.Context(), ident.TenantID)
-	if errors.Is(err, db.ErrNotFound) {
+	tenant, err := h.store.GetTenant(r.Context(), ident.TenantID)
+	if errors.Is(err, storage.ErrNotFound) {
 		writeOAuthError(w, http.StatusForbidden, "access_denied", "tenant_not_found")
 		return
 	}
@@ -109,7 +124,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}
-	if tenant.SuspendedAt.Valid {
+	if tenant.Suspended {
 		writeOAuthError(w, http.StatusForbidden, "access_denied", "tenant_suspended")
 		return
 	}
@@ -117,18 +132,18 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 	userID := uuidString(ident.UserID)
 
 	// Pull allocation up so we have size_bytes available for placement.
-	var allocation *sqlcdb.DiskAllocation
+	var allocation *storage.Allocation
 	if ident.AllocationID.Valid {
-		alloc, err := h.q.GetAllocation(r.Context(), ident.AllocationID)
+		alloc, err := h.store.GetAllocation(r.Context(), toUUID(ident.AllocationID))
 		if err != nil {
 			h.logger.Error("agent_enroll_allocation_lookup_failed", "error", err, "tenant_id", ident.TenantID, "user_id", userID, "allocation_id", uuidString(ident.AllocationID))
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 			return
 		}
-		if alloc.UserID != ident.UserID || alloc.RevokedAt.Valid {
+		if alloc.UserID != toUUID(ident.UserID) || alloc.RevokedAt != nil {
 			h.logger.Error("agent_enroll_allocation_invalid", "tenant_id", ident.TenantID, "user_id", userID, "allocation_id", uuidString(ident.AllocationID))
 			desc := "allocation_not_found"
-			if alloc.RevokedAt.Valid {
+			if alloc.RevokedAt != nil {
 				desc = "allocation_revoked"
 			}
 			writeOAuthError(w, http.StatusForbidden, "access_denied", desc)
@@ -140,14 +155,14 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 	// Resolve (or place) the server assigned to this tenant.
 	var serverAddr string
 	{
-		vm, vmErr := h.q.GetServerVMByTenant(r.Context(), ident.TenantID)
+		vm, vmErr := h.store.GetServerVMByTenant(r.Context(), ident.TenantID)
 		if vmErr == nil {
 			if vm.Status != serverStatusActive {
 				writeRetryableEnrollError(w, "server_vm_unavailable")
 				return
 			}
 			serverAddr = vm.DataAddr
-		} else if !errors.Is(vmErr, db.ErrNotFound) {
+		} else if !errors.Is(vmErr, storage.ErrNotFound) {
 			h.logger.Error("agent_enroll_server_vm_lookup_failed", "error", vmErr, "tenant_id", ident.TenantID)
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 			return
@@ -159,7 +174,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 			// The tenant nests under its account's owner tenant (u_<owner>), and the
 			// shared account quota — allocation.SizeBytes carries the account budget —
 			// is applied to the owner dir, capping all the account's agents together.
-			ownerTenant := tenantIDForOwner(uuidString(allocation.UserID))
+			ownerTenant := tenantIDForOwner(allocation.UserID.String())
 			placed, placementErr := h.allocations.Reserve(r.Context(), h.serverAPI, ident.TenantID, ownerTenant, tenant.Name, allocation.SizeBytes)
 			if errors.Is(placementErr, allocations.ErrNoCapacity) {
 				h.logger.Info("agent_enroll_no_capacity", "tenant_id", ident.TenantID)
@@ -202,12 +217,12 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 	// (control-plane → /v1/entities) for registered AND anonymous users alike, so
 	// this never trips in normal operation; it is the hard guarantee behind the
 	// single policy.
-	if allocation == nil || !allocation.AgentID.Valid || allocation.AgentID.String == "" {
+	if allocation == nil || allocation.AgentID == "" {
 		h.logger.Info("agent_enroll_no_agent_scope", "tenant_id", ident.TenantID, "user_id", userID)
 		writeOAuthError(w, http.StatusForbidden, "access_denied", "agent_scope_required")
 		return
 	}
-	agentID := allocation.AgentID.String
+	agentID := allocation.AgentID
 	certPEM, keyPEM, chainPEM, serial, err := h.ca.MintAgentCert(ident.TenantID, userID, agentID, agentCertTTL)
 	if err != nil {
 		h.logger.Error("agent_cert_mint_failed", "error", err, "tenant_id", ident.TenantID, "user_id", userID)
@@ -240,10 +255,10 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	if _, err := h.q.CreateAgentEnrollment(r.Context(), sqlcdb.CreateAgentEnrollmentParams{
-		UserID:       ident.UserID,
+	if err := h.store.CreateAgentEnrollment(r.Context(), storage.NewAgentEnrollment{
+		UserID:       toUUID(ident.UserID),
 		CertSerial:   serial,
-		CertNotAfter: pgtype.Timestamptz{Time: leaf.NotAfter, Valid: true},
+		CertNotAfter: leaf.NotAfter,
 	}); err != nil {
 		h.logger.Error("agent_enrollment_record_failed", "error", err, "tenant_id", ident.TenantID, "user_id", userID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
@@ -259,7 +274,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 		"expires_at":      leaf.NotAfter.UTC().Format(time.RFC3339),
 	}
 	if allocation != nil {
-		resp["allocation_id"] = uuidString(allocation.ID)
+		resp["allocation_id"] = allocation.ID.String()
 		resp["size_bytes"] = allocation.SizeBytes
 	}
 	writeJSON(w, http.StatusOK, resp)
