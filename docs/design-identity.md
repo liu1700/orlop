@@ -201,8 +201,8 @@ JWT-SVID is the natural fit.
 Deleted (the symbols/files below no longer exist in the tree): the email-OTP
 start/verify + first-login auto-provision flow (`StartEmailOTP`/`VerifyEmailOTP`/
 `createHostedUser` and their handlers), the Resend mailer (`resend-go` dep), and
-the OTP storage (`email_otps` table — added in `0009`, dropped in migration
-`0010` — plus its queries, generated code, and rate limiters).
+the OTP storage (the `email_otps` table — absent from the squashed schema
+baseline — plus its queries, generated code, and rate limiters).
 
 **Kept** as the operator path: the seeded admin session — `orlop-control user
 seed` and the `?session=TOK` cookie path in `devauth_handlers.go`. A self-hoster
