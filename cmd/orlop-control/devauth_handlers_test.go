@@ -71,6 +71,7 @@ func httpStartServerWithFencer(t *testing.T, pool *pgxpool.Pool, fencer mountLea
 	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
 		devAuth:          svc,
 		queries:          sqlcdb.New(pool),
+		store:            postgres.New(pool),
 		allocations:      allocations.NewService(postgres.New(pool), nil),
 		mountLeaseFencer: fencer,
 	}, config{})
@@ -234,7 +235,7 @@ func TestHTTPHappyPath(t *testing.T) {
 	}
 
 	// 5. Token resolves through middleware to expected tenant.
-	wrapped := RequireBearer(svc, sqlcdb.New(pool))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	wrapped := RequireBearer(svc, postgres.New(pool))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ident, ok := IdentityFromRequest(r)
 		if !ok {
 			t.Fatal("identity missing")
@@ -334,7 +335,7 @@ func TestHTTPDeviceSessionQueryParamSetsCookie(t *testing.T) {
 func TestHTTPBearerRejectsMissing(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	_, svc := httpStartServer(t, pool)
-	wrapped := RequireBearer(svc, sqlcdb.New(pool))(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	wrapped := RequireBearer(svc, postgres.New(pool))(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 	}))
 	rec := httptest.NewRecorder()

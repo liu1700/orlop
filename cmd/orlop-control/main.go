@@ -291,6 +291,7 @@ type runtimeDeps struct {
 	devAuth          *devauth.Service
 	allocations      *allocations.Service
 	queries          db.Store
+	store            *postgres.Store
 	agentCA          *ca.CA
 	enrollLimit      *agentEnrollLimiter
 	serverAdmin      allocations.ServerAdmin
@@ -327,8 +328,9 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		}
 		defer pool.Close()
 		deps.queries = sqlcdb.New(pool)
-		deps.devAuth = devauth.NewService(postgres.New(pool), logger)
-		deps.allocations = allocations.NewService(postgres.New(pool), logger)
+		deps.store = postgres.New(pool)
+		deps.devAuth = devauth.NewService(deps.store, logger)
+		deps.allocations = allocations.NewService(deps.store, logger)
 		deps.cookieDomain = cfg.CookieDomain
 		// CA storage backend: "postgres" keeps the root key + tenant intermediates
 		// in this shared DB (no block-storage PVC); otherwise the filesystem backend
@@ -397,7 +399,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 				queries: deps.queries,
 			}
 			deps.agentPurger = serverapiAgentPurger{client: adminClient}
-			deps.certRevReconcile = newCertRevocationReconciler(postgres.New(pool), adminClient, logger)
+			deps.certRevReconcile = newCertRevocationReconciler(deps.store, adminClient, logger)
 		}
 	}
 
@@ -467,7 +469,7 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 		mountLeaseRoutes(router, newMountLeaseHandlers(logger, deps.allocations, deps.queries, deps.devAuth, deps.mountLeaseFencer))
 	}
 	if deps.devAuth != nil && deps.queries != nil {
-		mountAPITokens(router, newAPITokenHandlers(logger, deps.devAuth, deps.queries, cfg.APITokenTTL))
+		mountAPITokens(router, newAPITokenHandlers(logger, deps.devAuth, deps.store, cfg.APITokenTTL))
 	}
 	// /v1/entities + /v1/agents/{id}/enroll-token are control-plane→control-plane
 	// surfaces, gated by the static service token (RequireServiceToken fails
@@ -494,7 +496,7 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 		mountJournal(router, newJournalHandlers(deps.devAuth, deps.allocations, deps.queries, deps.journalQuerier))
 	}
 	if deps.devAuth != nil && deps.queries != nil && deps.agentCA != nil {
-		mountAgentEnroll(router, RequireEnrollBearer(deps.devAuth, deps.queries), newAgentEnrollHandlers(logger, deps.queries, deps.devAuth, deps.agentCA, deps.enrollLimit, deps.allocations, deps.serverAdmin))
+		mountAgentEnroll(router, RequireEnrollBearer(deps.devAuth, deps.store), newAgentEnrollHandlers(logger, deps.queries, deps.devAuth, deps.agentCA, deps.enrollLimit, deps.allocations, deps.serverAdmin))
 	}
 	// POST /control/sign-server-cert: orlop-server self-provisions its TLS
 	// cert at boot by sending a CSR here (private key stays in its pod). Same

@@ -8,11 +8,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/tokens"
 )
 
@@ -29,14 +28,14 @@ const apiTokenNameMaxLen = 50
 type apiTokenHandlers struct {
 	logger  *slog.Logger
 	devAuth *devauth.Service
-	queries db.Store
+	store   storage.APITokenStore
 	// ttl, when > 0, sets an expiry on newly minted tokens. 0 = never expires
 	// (the historical default). Configured via ORLOP_API_TOKEN_TTL.
 	ttl time.Duration
 }
 
-func newAPITokenHandlers(logger *slog.Logger, svc *devauth.Service, q db.Store, ttl time.Duration) *apiTokenHandlers {
-	return &apiTokenHandlers{logger: logger, devAuth: svc, queries: q, ttl: ttl}
+func newAPITokenHandlers(logger *slog.Logger, svc *devauth.Service, store storage.APITokenStore, ttl time.Duration) *apiTokenHandlers {
+	return &apiTokenHandlers{logger: logger, devAuth: svc, store: store, ttl: ttl}
 }
 
 // mountAPITokens registers token routes at the post-Caddy-strip path
@@ -86,12 +85,13 @@ func (h *apiTokenHandlers) handleCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var expiresAt pgtype.Timestamptz
+	var expiresAt *time.Time
 	if h.ttl > 0 {
-		expiresAt = pgtype.Timestamptz{Time: time.Now().Add(h.ttl), Valid: true}
+		t := time.Now().Add(h.ttl)
+		expiresAt = &t
 	}
-	row, err := h.queries.CreateAPIToken(r.Context(), sqlcdb.CreateAPITokenParams{
-		UserID:    ident.UserID,
+	row, err := h.store.CreateAPIToken(r.Context(), storage.NewAPIToken{
+		UserID:    toUUID(ident.UserID),
 		Name:      name,
 		TokenHash: tok.Hash,
 		Prefix:    tok.Prefix,
@@ -105,15 +105,15 @@ func (h *apiTokenHandlers) handleCreate(w http.ResponseWriter, r *http.Request) 
 
 	h.logger.Info("api_token_created",
 		"user_id", uuidString(ident.UserID),
-		"token_id", uuidString(row.ID),
+		"token_id", row.ID.String(),
 		"prefix", row.Prefix,
 		"name", row.Name)
 
 	writeJSON(w, http.StatusCreated, createTokenResponse{
-		ID:        uuidString(row.ID),
+		ID:        row.ID.String(),
 		Name:      row.Name,
 		Prefix:    row.Prefix,
-		CreatedAt: row.CreatedAt.Time,
+		CreatedAt: row.CreatedAt,
 		Token:     tok.Raw,
 	})
 }
@@ -135,7 +135,7 @@ func (h *apiTokenHandlers) handleList(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 		return
 	}
-	rows, err := h.queries.ListAPITokensByUser(r.Context(), ident.UserID)
+	rows, err := h.store.ListAPITokensByUser(r.Context(), toUUID(ident.UserID))
 	if err != nil {
 		h.logger.Error("api_token_list_failed", "error", err, "user_id", uuidString(ident.UserID))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
@@ -143,17 +143,13 @@ func (h *apiTokenHandlers) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]listTokenItem, 0, len(rows))
 	for _, row := range rows {
-		item := listTokenItem{
-			ID:        uuidString(row.ID),
-			Name:      row.Name,
-			Prefix:    row.Prefix,
-			CreatedAt: row.CreatedAt.Time,
-		}
-		if row.LastUsedAt.Valid {
-			t := row.LastUsedAt.Time
-			item.LastUsedAt = &t
-		}
-		out = append(out, item)
+		out = append(out, listTokenItem{
+			ID:         row.ID.String(),
+			Name:       row.Name,
+			Prefix:     row.Prefix,
+			CreatedAt:  row.CreatedAt,
+			LastUsedAt: row.LastUsedAt,
+		})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -165,8 +161,8 @@ func (h *apiTokenHandlers) handleRevoke(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var id pgtype.UUID
-	if err := id.Scan(chi.URLParam(r, "id")); err != nil {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "id must be a uuid")
 		return
 	}
@@ -174,23 +170,21 @@ func (h *apiTokenHandlers) handleRevoke(w http.ResponseWriter, r *http.Request) 
 	// Confirm the token exists AND belongs to the authenticated user.
 	// Returns 404 (not 403) when the row is missing or belongs to a different
 	// user, to avoid leaking which token IDs exist.
-	row, err := h.queries.GetAPITokenByID(r.Context(), id)
-	if err != nil || row.UserID != ident.UserID {
+	row, err := h.store.GetAPITokenByID(r.Context(), id)
+	if err != nil || row.UserID != toUUID(ident.UserID) {
 		writeOAuthError(w, http.StatusNotFound, "not_found", "")
 		return
 	}
 
-	if err := h.queries.RevokeAPIToken(r.Context(), sqlcdb.RevokeAPITokenParams{
-		ID: id, UserID: ident.UserID,
-	}); err != nil {
-		h.logger.Error("api_token_revoke_failed", "error", err, "id", uuidString(id), "user_id", uuidString(ident.UserID))
+	if err := h.store.RevokeAPIToken(r.Context(), id, toUUID(ident.UserID)); err != nil {
+		h.logger.Error("api_token_revoke_failed", "error", err, "id", id.String(), "user_id", uuidString(ident.UserID))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}
 
 	h.logger.Info("api_token_revoked",
 		"user_id", uuidString(ident.UserID),
-		"token_id", uuidString(id),
+		"token_id", id.String(),
 		"prefix", row.Prefix,
 		"name", row.Name)
 

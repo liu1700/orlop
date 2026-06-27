@@ -15,8 +15,8 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/tokens"
 )
 
@@ -72,8 +72,8 @@ const apiTokenTouchInterval = 60 * time.Second
 //     revoked, or belongs to a suspended user or suspended tenant.
 //   - everything else: short-lived device-flow access token, validated
 //     by devauth.Service (existing OAuth path, unchanged).
-func RequireBearer(svc *devauth.Service, q db.Store) func(http.Handler) http.Handler {
-	return requireBearer(q, svc.AuthenticateBearer)
+func RequireBearer(svc *devauth.Service, store storage.APITokenStore) func(http.Handler) http.Handler {
+	return requireBearer(store, svc.AuthenticateBearer)
 }
 
 // RequireEnrollBearer is RequireBearer for the /agent/enroll route. It is
@@ -81,34 +81,34 @@ func RequireBearer(svc *devauth.Service, q db.Store) func(http.Handler) http.Han
 // agent-scoped enroll token (devauth.PurposeAgentEnroll, minted by
 // IssueAgentEnrollToken). The widened purpose set is confined to this
 // middleware so /agent/run and other RequireBearer surfaces stay device-only.
-func RequireEnrollBearer(svc *devauth.Service, q db.Store) func(http.Handler) http.Handler {
-	return requireBearer(q, svc.AuthenticateEnrollBearer)
+func RequireEnrollBearer(svc *devauth.Service, store storage.APITokenStore) func(http.Handler) http.Handler {
+	return requireBearer(store, svc.AuthenticateEnrollBearer)
 }
 
 // requireBearer is the shared body for RequireBearer / RequireEnrollBearer.
 // authenticate validates the OAuth-style (non-"orlop_") token and resolves an
 // Identity; the API-token ("orlop_") shape is handled identically for both.
-func requireBearer(q db.Store, authenticate func(context.Context, string) (devauth.Identity, error)) func(http.Handler) http.Handler {
+func requireBearer(store storage.APITokenStore, authenticate func(context.Context, string) (devauth.Identity, error)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			raw := bearerToken(r.Header.Get("Authorization"))
 			if strings.HasPrefix(raw, tokens.Prefix) {
-				row, err := q.GetAPITokenByHash(r.Context(), tokens.Hash(raw))
-				if err != nil || row.RevokedAt.Valid {
+				auth, err := store.GetAPITokenByHash(r.Context(), tokens.Hash(raw))
+				if err != nil || auth.Revoked {
 					writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 					return
 				}
 				// Optional expiry (set when ORLOP_API_TOKEN_TTL is configured at
-				// mint time). NULL = never expires (the historical behavior).
-				if row.ExpiresAt.Valid && time.Now().After(row.ExpiresAt.Time) {
+				// mint time). nil = never expires (the historical behavior).
+				if auth.ExpiresAt != nil && time.Now().After(*auth.ExpiresAt) {
 					writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "expired")
 					return
 				}
-				if row.TenantSuspendedAt.Valid {
+				if auth.TenantSuspended {
 					writeOAuthError(w, http.StatusForbidden, "access_denied", "tenant_suspended")
 					return
 				}
-				if row.UserSuspendedAt.Valid {
+				if auth.UserSuspended {
 					writeOAuthError(w, http.StatusForbidden, "access_denied", "user_suspended")
 					return
 				}
@@ -116,12 +116,12 @@ func requireBearer(q db.Store, authenticate func(context.Context, string) (devau
 				// so a busy agent doesn't issue a write per request. Synchronous
 				// (the UPDATE is a single indexed-PK touch and ~1ms; goroutine
 				// would add lifetime-management complexity for no measurable win).
-				if !row.LastUsedAt.Valid || time.Since(row.LastUsedAt.Time) > apiTokenTouchInterval {
-					_ = q.TouchAPITokenLastUsed(r.Context(), row.ID)
+				if auth.LastUsedAt == nil || time.Since(*auth.LastUsedAt) > apiTokenTouchInterval {
+					_ = store.TouchAPITokenLastUsed(r.Context(), auth.ID)
 				}
 				ident := devauth.Identity{
-					UserID:   row.UserID,
-					TenantID: row.UserTenantID,
+					UserID:   fromUUID(auth.UserID),
+					TenantID: auth.TenantID,
 					Purpose:  devauth.PurposeAPIToken,
 				}
 				ctx := context.WithValue(r.Context(), identityCtxKey{}, ident)
