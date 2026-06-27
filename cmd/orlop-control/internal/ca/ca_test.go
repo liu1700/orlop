@@ -99,6 +99,93 @@ func TestMintAgentCertVerifiesAgainstChain(t *testing.T) {
 	}
 }
 
+// TestIntermediateCarriesTrustDomainConstraint covers issue #7: tenant
+// intermediates are constrained to the deployment trust domain, and a leaf
+// minted under the constrained intermediate must still verify against the root
+// (i.e. the constraint does not break the legitimate chain).
+func TestIntermediateCarriesTrustDomainConstraint(t *testing.T) {
+	ctx := context.Background()
+	c, _ := newTestCA(t)
+	if err := c.BootstrapTenant(ctx, "acme"); err != nil {
+		t.Fatal(err)
+	}
+
+	certPEM, _, chainPEM, _, err := c.MintAgentCert("acme", "alice@example.com", "agent-1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := parseAllCertsPEM(t, chainPEM)
+	if len(chain) != 2 {
+		t.Fatalf("chain len = %d, want 2", len(chain))
+	}
+	intermediate := chain[0]
+
+	// The intermediate constrains issuance to the trust-domain host.
+	if got := intermediate.PermittedURIDomains; len(got) != 1 || got[0] != "test.example" {
+		t.Fatalf("intermediate PermittedURIDomains = %v, want [test.example]", got)
+	}
+
+	// The legitimate leaf (SANs under spiffe://test.example/...) still verifies
+	// against the root through the constrained intermediate — exactly the path
+	// validation orlop-server runs at handshake.
+	leaf := parseAllCertsPEM(t, certPEM)[0]
+	roots := x509.NewCertPool()
+	roots.AddCert(chain[1])
+	intermediates := x509.NewCertPool()
+	intermediates.AddCert(intermediate)
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		t.Fatalf("constrained chain must still verify: %v", err)
+	}
+}
+
+// TestBootstrapTenantAllowlist covers issue #8: BootstrapTenant refuses a
+// tenant the Env.AllowBootstrap predicate rejects, and an idempotent re-bootstrap
+// of an already-loaded tenant is unaffected by the gate.
+func TestBootstrapTenantAllowlist(t *testing.T) {
+	ctx := context.Background()
+	backend := secrets.NewMemory()
+	c, err := LoadOrInit(ctx, backend, Env{
+		TrustDomain: "test.example",
+		OrgName:     "Test",
+		AllowBootstrap: func(tenantID string) bool {
+			return tenantID == "allowed"
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.BootstrapTenant(ctx, "denied"); !errors.Is(err, ErrTenantNotAllowed) {
+		t.Fatalf("BootstrapTenant(denied) error = %v, want ErrTenantNotAllowed", err)
+	}
+	if c.HasTenant("denied") {
+		t.Fatal("denied tenant must not be created")
+	}
+
+	if err := c.BootstrapTenant(ctx, "allowed"); err != nil {
+		t.Fatalf("BootstrapTenant(allowed) = %v, want nil", err)
+	}
+	// Idempotent re-bootstrap of an already-loaded tenant is allowed even if the
+	// predicate would now reject it (the gate only blocks creating NEW material).
+	if err := c.BootstrapTenant(ctx, "allowed"); err != nil {
+		t.Fatalf("idempotent re-bootstrap = %v, want nil", err)
+	}
+}
+
+// TestBootstrapTenantNilPredicateAllowsAll confirms the operator-CLI path (no
+// predicate) bootstraps any tenant id.
+func TestBootstrapTenantNilPredicateAllowsAll(t *testing.T) {
+	ctx := context.Background()
+	c, _ := newTestCA(t) // newTestCA sets no AllowBootstrap
+	if err := c.BootstrapTenant(ctx, "any-operator-tenant"); err != nil {
+		t.Fatalf("nil predicate must allow all: %v", err)
+	}
+}
+
 func TestMintAgentCertEncodesAgentSAN(t *testing.T) {
 	ctx := context.Background()
 	c, _ := newTestCA(t)

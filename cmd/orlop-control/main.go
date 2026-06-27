@@ -81,6 +81,17 @@ type config struct {
 	IdentityPublicKeyFile   string // ORLOP_IDENTITY_PUBLIC_KEY_FILE (PKIX PEM)
 	IdentityTenantClaim     string // ORLOP_IDENTITY_TENANT_CLAIM (default "tenant")
 	IdentityTenantAllowlist string // ORLOP_IDENTITY_TENANT_ALLOWLIST (comma-separated, fail-closed)
+
+	// CATenantAllowlist gates lazy tenant-intermediate bootstrap (issue #8):
+	// comma-separated tenant ids that may be bootstrapped on first enroll, on top
+	// of the server-derived dynamic per-user/per-agent tenants (see
+	// CAAllowDynamicTenants). ORLOP_CA_TENANT_ALLOWLIST.
+	CATenantAllowlist string
+	// CAAllowDynamicTenants permits lazy bootstrap of the server-derived dynamic
+	// per-user ("u_") and per-agent ("a_") tenants. Default true (the hosted-MVP
+	// enroll flow relies on it); set ORLOP_CA_ALLOW_DYNAMIC_TENANTS=false to lock
+	// bootstrap down to CATenantAllowlist only.
+	CAAllowDynamicTenants bool
 }
 
 func loadConfig() config {
@@ -106,6 +117,50 @@ func loadConfig() config {
 		IdentityPublicKeyFile:   os.Getenv("ORLOP_IDENTITY_PUBLIC_KEY_FILE"),
 		IdentityTenantClaim:     os.Getenv("ORLOP_IDENTITY_TENANT_CLAIM"),
 		IdentityTenantAllowlist: os.Getenv("ORLOP_IDENTITY_TENANT_ALLOWLIST"),
+
+		CATenantAllowlist:     os.Getenv("ORLOP_CA_TENANT_ALLOWLIST"),
+		CAAllowDynamicTenants: envBoolDefault("ORLOP_CA_ALLOW_DYNAMIC_TENANTS", true),
+	}
+}
+
+// envBoolDefault parses a boolean env var, returning fallback when unset/blank.
+// Accepts "1"/"true"/"yes"/"on" (case-insensitive) as true and the obvious
+// negatives as false; an unrecognized value falls back.
+func envBoolDefault(key string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "":
+		return fallback
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+// buildCATenantPolicy builds the predicate that gates lazy tenant-intermediate
+// bootstrap (issue #8). A tenant id may be bootstrapped if it is explicitly
+// listed in ORLOP_CA_TENANT_ALLOWLIST, or — when dynamic tenants are enabled —
+// if it is a server-derived per-user ("u_") or per-agent ("a_") tenant. Any
+// other id (e.g. an arbitrary value mapped from a future BYO-IdP claim) is
+// refused, so it cannot self-onboard a tenant the operator never registered.
+func buildCATenantPolicy(cfg config) func(string) bool {
+	allow := map[string]struct{}{}
+	for _, t := range strings.Split(cfg.CATenantAllowlist, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			allow[t] = struct{}{}
+		}
+	}
+	allowDynamic := cfg.CAAllowDynamicTenants
+	return func(tenantID string) bool {
+		if _, ok := allow[tenantID]; ok {
+			return true
+		}
+		if allowDynamic && (strings.HasPrefix(tenantID, tenantPrefixUser) || strings.HasPrefix(tenantID, tenantPrefixAgent)) {
+			return true
+		}
+		return false
 	}
 }
 
@@ -232,6 +287,7 @@ type runtimeDeps struct {
 	journalQuerier   journalQuerier
 	mountLeaseFencer mountLeaseFencer
 	agentPurger      allocations.AgentDataPurger
+	certRevReconcile *certRevocationReconciler
 	hostIdentity     identity.Verifier
 	cookieDomain     string
 }
@@ -291,8 +347,9 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		}
 		if caBackend != nil {
 			agentCA, err := ca.LoadOrInit(ctx, caBackend, ca.Env{
-				TrustDomain: cfg.TrustDomain,
-				OrgName:     cfg.OrgName,
+				TrustDomain:    cfg.TrustDomain,
+				OrgName:        cfg.OrgName,
+				AllowBootstrap: buildCATenantPolicy(cfg),
 			})
 			if err != nil {
 				return fmt.Errorf("load ca: %w", err)
@@ -328,6 +385,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 				queries: deps.queries,
 			}
 			deps.agentPurger = serverapiAgentPurger{client: adminClient}
+			deps.certRevReconcile = newCertRevocationReconciler(deps.queries, adminClient, logger)
 		}
 	}
 
@@ -340,6 +398,12 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Fan the cert deny-list out to data-plane servers and keep them converged
+	// (issue #5). Stops when ctx is cancelled on shutdown.
+	if deps.certRevReconcile != nil {
+		go deps.certRevReconcile.Run(ctx)
+	}
 
 	// (Storage auto-grow removed: an account's disk is a fixed budget — included +
 	// purchased — enforced as one shared JuiceFS quota on the owner tenant dir, set at
@@ -418,7 +482,7 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 		mountJournal(router, newJournalHandlers(deps.devAuth, deps.allocations, deps.queries, deps.journalQuerier))
 	}
 	if deps.devAuth != nil && deps.queries != nil && deps.agentCA != nil {
-		mountAgentEnroll(router, RequireEnrollBearer(deps.devAuth, deps.queries), newAgentEnrollHandlers(logger, deps.queries, deps.agentCA, deps.enrollLimit, deps.allocations, deps.serverAdmin))
+		mountAgentEnroll(router, RequireEnrollBearer(deps.devAuth, deps.queries), newAgentEnrollHandlers(logger, deps.queries, deps.devAuth, deps.agentCA, deps.enrollLimit, deps.allocations, deps.serverAdmin))
 	}
 	// POST /control/sign-server-cert: orlop-server self-provisions its TLS
 	// cert at boot by sending a CSR here (private key stays in its pod). Same

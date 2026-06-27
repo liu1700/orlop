@@ -124,9 +124,17 @@ across all tenants. There is no online procedure: distribute a new root
 to every server VM and re-bootstrap every tenant intermediate against
 the new root. Plan on a maintenance window and announce it.
 
-## Revocation by rotation
+## Revocation
 
-The MVP has no CRL or OCSP. Revocation = rotation.
+There is no CRL or OCSP, but there is a per-serial **deny-list kill switch**
+(issue #5). Releasing a mount lease records the bound agent leaf's serial in the
+`cert_revocations` table; a reconcile loop pushes the active set to every
+data-plane server (`PUT /control/cert-revocations`), and `orlop-server` refuses a
+matching client cert at session start. Propagation is bounded by the reconcile
+interval (~60s), and entries age out automatically at the cert's own expiry. This
+kills a single leaked/released leaf mid-TTL without a tenant-wide rotation.
+
+For a broader cut-off, rotation is still the blunt instrument.
 
 To cut a single tenant off immediately:
 

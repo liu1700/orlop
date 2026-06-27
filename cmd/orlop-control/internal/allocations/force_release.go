@@ -21,11 +21,18 @@ import (
 //   - ErrWrongUser: row belongs to a different user.
 //   - ErrRevoked: row is soft-deleted.
 func (s *Service) ForceReleaseMountLease(ctx context.Context, allocationID, userID pgtype.UUID) error {
+	// Capture the bound agent (if any) before the release clears bound_agent_id,
+	// so its leaf can be revoked on success (issue #5).
+	prior, priorErr := s.q.GetAllocation(ctx, allocationID)
+
 	_, err := s.q.ForceReleaseMountLease(ctx, sqlcdb.ForceReleaseMountLeaseParams{
 		ID:     allocationID,
 		UserID: userID,
 	})
 	if err == nil {
+		if priorErr == nil && prior.BoundAgentID.Valid {
+			s.revokeReleasedAgentCert(ctx, prior.BoundAgentID, prior.TenantID)
+		}
 		return nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {

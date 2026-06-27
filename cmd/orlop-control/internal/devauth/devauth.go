@@ -73,6 +73,7 @@ var (
 	ErrTokenUnknown            = errors.New("unknown token")
 	ErrTokenWrongPurpose       = errors.New("token purpose mismatch")
 	ErrTokenRevoked            = errors.New("token revoked")
+	ErrTokenConsumed           = errors.New("token already consumed")
 	ErrTokenExpired            = errors.New("token expired")
 	ErrUserSuspended           = errors.New("user suspended")
 	ErrTenantSuspended         = errors.New("tenant suspended")
@@ -554,6 +555,30 @@ func (s *Service) IssueAgentEnrollToken(ctx context.Context, userID pgtype.UUID,
 	return token, expiresAt, nil
 }
 
+// ConsumeAgentEnrollToken atomically marks a single-use agent-enroll token
+// spent, given the raw "Authorization: Bearer <token>" header. It returns true
+// when this call consumed the token, and false when the token was already
+// consumed — a replay, or the loser of a concurrent race — in which case the
+// caller MUST reject the enroll rather than hand out a second cert.
+//
+// The underlying UPDATE matches only purpose='agent_enroll' rows, so device-
+// session enrolls (the CLI path) never match and return false; the enroll
+// handler therefore calls this only for PurposeAgentEnroll identities and
+// leaves multi-use device sessions untouched.
+func (s *Service) ConsumeAgentEnrollToken(ctx context.Context, header string) (bool, error) {
+	raw := bearerToken(header)
+	if raw == "" {
+		return false, ErrBearerMissing
+	}
+	if _, err := s.q.ConsumeAgentEnrollToken(ctx, hashCode(raw)); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // authenticateRaw resolves an Identity from an opaque token, requiring the
 // stored purpose to match one of acceptedPurposes. Passing a single purpose
 // preserves the original exact-equality semantics; passing more than one (the
@@ -581,6 +606,14 @@ func (s *Service) authenticateRaw(ctx context.Context, raw string, acceptedPurpo
 	}
 	if row.RevokedAt.Valid {
 		return Identity{}, ErrTokenRevoked
+	}
+	// Single-use enroll tokens (issue #6): once an agent-enroll token has been
+	// spent on a successful /agent/enroll, consumed_at is set and any replay is
+	// rejected here, cheaply, before the handler does any minting work. Device/
+	// admin/api tokens are multi-use and never carry consumed_at, so this is a
+	// no-op for them.
+	if row.ConsumedAt.Valid {
+		return Identity{}, ErrTokenConsumed
 	}
 	if !row.ExpiresAt.Valid || s.now().After(row.ExpiresAt.Time) {
 		return Identity{}, ErrTokenExpired

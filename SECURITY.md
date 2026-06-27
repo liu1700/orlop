@@ -71,9 +71,12 @@ Honest gaps a deployment should account for:
 - **Disk accounting when quota enforcement is off.** There is no in-process
   per-tenant byte accountant; the per-tenant cap depends entirely on the
   filesystem/JuiceFS quota (see "what the operator must do").
-- **Intermediate-key blast radius.** Tenant intermediates have no X.509
-  NameConstraints; the cross-check above mitigates a leaked intermediate key at
-  the data plane, but the control plane must still guard intermediate keys
+- **Intermediate-key blast radius.** Tenant intermediates carry a
+  `PermittedURIDomains` name constraint pinning them to the deployment trust
+  domain, but that is host-scoped and cannot isolate tenants (which differ only
+  by SPIFFE URI *path*). The data-plane `checkTenantBinding` cross-check — now
+  fail-closed — is the gate that rejects a leaked intermediate key minting
+  another tenant's SAN; the control plane must still guard intermediate keys
   carefully.
 - **Device user_code entropy.** The device-flow user code is short; approval
   requires an authenticated admin session, but widening it is a tracked

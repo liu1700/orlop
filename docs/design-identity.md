@@ -232,27 +232,48 @@ the `POST /agent/enroll` token-for-cert shape (the credential-broker pattern).
 These are independent of the identity refactor but load-bearing for the
 zero-trust claim. Severity is calibrated to the current code, not worst case.
 
-1. **No revocation on the data plane.** `orlop-server` records the leaf serial in
-   audit logs but never checks `agent_enrollments.cert_serial` against a
-   deny-list at handshake (the data plane is stateless and cannot read the
-   table). A leaked 1h leaf is valid for the full hour. *Fix:* a serial deny-list
-   pushed from the control plane, checked at connect; lease release adds the
-   serial. **(Real gap.)**
-2. **Enroll token is not single-use / replayable.** `authenticateRaw`
-   (`internal/devauth/devauth.go:695`) validates the token but never consumes the
-   row, so it is reusable until its 10-minute expiry. *Fix:* sender-constrain
-   (DPoP RFC 9449 / mTLS RFC 8705) + consume-on-use. **(Real hardening gap.)**
-3. **`checkTenantBinding` fails open + intermediates have no NameConstraints.**
-   `cert_tenant_binding.go:30,35` returns `true` on an unrecognized chain shape;
-   `generateIntermediate` (`internal/ca/ca.go`) emits no `PermittedURIDomains`.
-   *Fix:* add NameConstraints so RFC 5280 path validation rejects cross-tenant
-   SANs in `crypto/x509` itself, and make the binding check fail closed. **(Real,
-   but defense-in-depth: not exploitable today since agents never hold an
-   intermediate key; primary isolation is `checkAgentPath`.)**
-4. **Lazy tenant bootstrap.** `agent_enroll_handlers.go:177` bootstraps a tenant
-   intermediate the first time a tenant id is seen. *Fix:* gate on the operator
-   allowlist so a verified-but-attacker-influenced claim cannot self-onboard.
-   **(Mainly a prerequisite for the Mode B/C designs above.)**
+1. **Data-plane revocation (issue #5).** Closed: `orlop-server` checks each
+   client leaf's serial against an in-memory deny-list at session start
+   (`serveFrames` → `certRevocationRegistry`), before any frame is served.
+   Releasing a mount lease records the bound leaf's serial in the
+   `cert_revocations` table (`revokeReleasedAgentCert`), and a control-plane
+   reconcile loop pushes the active set (`PUT /control/cert-revocations`) to
+   every server every ~minute, repopulating any that restarted (merge semantics;
+   entries age out at the cert's own expiry). So a leaked or released leaf dies
+   within the reconcile window instead of surviving its full hour. *Residual:*
+   the cold-start / propagation lag is bounded by `certRevocationReconcileInterval`
+   (~60s); an immediate synchronous push on release is a possible follow-up.
+2. **Enroll token sender-constraint.** Single-use is now enforced (issue #6):
+   `/agent/enroll` spends a `PurposeAgentEnroll` token on a successful mint
+   (`ConsumeAgentEnrollToken`, atomic `UPDATE … SET consumed_at = now() WHERE
+   consumed_at IS NULL`), and `authenticateRaw` rejects an already-consumed token
+   on replay — one token mints exactly one cert. *Remaining follow-up:*
+   sender-constrain the token (DPoP RFC 9449 / mTLS RFC 8705) so an observer
+   cannot race the legitimate pod to the first use within the 10-minute TTL.
+   **(Partially closed — single-use landed; sender-constraint pending.)**
+3. **Cross-tenant cert forgery gate (issue #7).** Closed: `checkTenantBinding`
+   now fails **closed** on any unrecognized chain shape or missing tenant OU —
+   safe because every legitimate agent leaf is presented with its tenant
+   intermediate (the server's `ClientCAs` is the org root alone, so the
+   handshake cannot verify without it). Tenant intermediates also now carry
+   `PermittedURIDomains = [trust-domain]`, so a leaked intermediate cannot mint
+   for a different trust domain. *Note on the original "NameConstraints isolate
+   tenants" idea:* that does **not** work here — every tenant's SPIFFE SAN shares
+   the same trust-domain host and differs only by URI path (`/tenant/<id>`), and
+   `crypto/x509` name constraints are host-scoped, not path-scoped. So the
+   per-tenant gate is `checkTenantBinding` (OU vs SAN), not path validation.
+   *Follow-up for true chain-level isolation:* per-tenant `ClientCAs` via
+   `GetConfigForClient` (SNI-selected), or per-tenant trust-domain hosts.
+4. **Lazy tenant bootstrap (issue #8).** Gated: `BootstrapTenant` now refuses any
+   tenant id the operator policy (`ca.Env.AllowBootstrap`) rejects, and the lazy
+   enroll path returns 403 `tenant_not_allowed` rather than the retryable 503.
+   The policy permits explicit `ORLOP_CA_TENANT_ALLOWLIST` entries plus the
+   server-derived dynamic per-user (`u_`) / per-agent (`a_`) tenants (on by
+   default; `ORLOP_CA_ALLOW_DYNAMIC_TENANTS=false` locks down). So a
+   verified-but-attacker-influenced claim that maps to an arbitrary tenant id
+   cannot self-onboard CA material. The operator CLI (`ca init`) passes no
+   predicate and is unaffected. **(Prerequisite for the Mode B/C designs above,
+   now in place.)**
 
 ## 7. Comparison table
 

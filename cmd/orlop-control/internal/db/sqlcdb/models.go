@@ -20,6 +20,7 @@ type AccessToken struct {
 	ExpiresAt    pgtype.Timestamptz
 	RevokedAt    pgtype.Timestamptz
 	CreatedAt    pgtype.Timestamptz
+	ConsumedAt   pgtype.Timestamptz
 }
 
 type AgentEnrollment struct {
@@ -53,6 +54,14 @@ type ApiToken struct {
 	LastUsedAt pgtype.Timestamptz
 	RevokedAt  pgtype.Timestamptz
 	ExpiresAt  pgtype.Timestamptz
+}
+
+type CertRevocation struct {
+	CertSerial string
+	TenantID   string
+	ExpiresAt  pgtype.Timestamptz
+	Reason     string
+	RevokedAt  pgtype.Timestamptz
 }
 
 type DeviceAuthorization struct {

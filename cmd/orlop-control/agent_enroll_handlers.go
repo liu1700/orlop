@@ -16,6 +16,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 )
 
 const (
@@ -27,6 +28,7 @@ const (
 type agentEnrollHandlers struct {
 	logger      *slog.Logger
 	q           *sqlcdb.Queries
+	devAuth     *devauth.Service
 	ca          *ca.CA
 	limit       *agentEnrollLimiter
 	allocations *allocations.Service
@@ -36,6 +38,7 @@ type agentEnrollHandlers struct {
 func newAgentEnrollHandlers(
 	logger *slog.Logger,
 	q *sqlcdb.Queries,
+	devAuth *devauth.Service,
 	agentCA *ca.CA,
 	limit *agentEnrollLimiter,
 	allocSvc *allocations.Service,
@@ -47,6 +50,7 @@ func newAgentEnrollHandlers(
 	return &agentEnrollHandlers{
 		logger:      logger,
 		q:           q,
+		devAuth:     devAuth,
 		ca:          agentCA,
 		limit:       limit,
 		allocations: allocSvc,
@@ -176,6 +180,15 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 	// don't, so MintAgentCert would otherwise fail with "unknown tenant".
 	if !h.ca.HasTenant(ident.TenantID) {
 		if err := h.ca.BootstrapTenant(r.Context(), ident.TenantID); err != nil {
+			// Operator allowlist gate (issue #8): an unrecognized tenant id is a
+			// client-side authorization failure, not a transient server fault —
+			// reject with 403 rather than the retryable 503 used for real CA
+			// outages, so a disallowed tenant cannot self-onboard by retrying.
+			if errors.Is(err, ca.ErrTenantNotAllowed) {
+				h.logger.Warn("agent_enroll_tenant_not_allowed", "tenant_id", ident.TenantID)
+				writeOAuthError(w, http.StatusForbidden, "access_denied", "tenant_not_allowed")
+				return
+			}
 			h.logger.Error("agent_ca_bootstrap_failed", "error", err, "tenant_id", ident.TenantID)
 			writeRetryableEnrollError(w, "tenant_ca_unavailable")
 			return
@@ -206,6 +219,26 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 		h.logger.Error("agent_cert_parse_failed", "error", err, "tenant_id", ident.TenantID, "user_id", userID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
+	}
+	// Single-use per-pod enroll tokens (issue #6): spend the token now that the
+	// cert is minted. This is the serialization point — it runs only after every
+	// retryable placement/bootstrap/mint step above has succeeded, so a transient
+	// 503 earlier leaves the token live for the sidecar's retry, while a replay
+	// or the loser of a concurrent race finds it already consumed and is rejected
+	// without a second cert leaving the building. Device-session enrolls (the CLI
+	// path) are multi-use and skip this entirely.
+	if ident.Purpose == devauth.PurposeAgentEnroll {
+		consumed, err := h.devAuth.ConsumeAgentEnrollToken(r.Context(), r.Header.Get("Authorization"))
+		if err != nil {
+			h.logger.Error("agent_enroll_token_consume_failed", "error", err, "tenant_id", ident.TenantID, "user_id", userID)
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
+			return
+		}
+		if !consumed {
+			h.logger.Warn("agent_enroll_token_replay", "tenant_id", ident.TenantID, "user_id", userID)
+			writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "token_consumed")
+			return
+		}
 	}
 	if _, err := h.q.CreateAgentEnrollment(r.Context(), sqlcdb.CreateAgentEnrollmentParams{
 		UserID:       ident.UserID,

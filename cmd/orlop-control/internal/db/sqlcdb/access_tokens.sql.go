@@ -11,10 +11,32 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const consumeAgentEnrollToken = `-- name: ConsumeAgentEnrollToken :one
+UPDATE access_tokens
+SET consumed_at = now()
+WHERE token_hash = $1
+  AND purpose = 'agent_enroll'
+  AND consumed_at IS NULL
+RETURNING id
+`
+
+// Atomically spend a single-use agent-enroll token (issue #6). Matches only an
+// un-consumed 'agent_enroll' row; a replay or a lost concurrent race matches
+// zero rows and returns pgx.ErrNoRows, which the caller treats as "already
+// spent" and rejects. The purpose filter keeps device/admin/api multi-use
+// sessions out — they are never consumed here even when presented on the
+// enroll route. The literal mirrors devauth.PurposeAgentEnroll.
+func (q *Queries) ConsumeAgentEnrollToken(ctx context.Context, tokenHash string) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, consumeAgentEnrollToken, tokenHash)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const createAccessToken = `-- name: CreateAccessToken :one
 INSERT INTO access_tokens (token_hash, purpose, user_id, tenant_id, expires_at, allocation_id)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, token_hash, purpose, user_id, tenant_id, allocation_id, expires_at, revoked_at, created_at
+RETURNING id, token_hash, purpose, user_id, tenant_id, allocation_id, expires_at, revoked_at, created_at, consumed_at
 `
 
 type CreateAccessTokenParams struct {
@@ -46,6 +68,7 @@ func (q *Queries) CreateAccessToken(ctx context.Context, arg CreateAccessTokenPa
 		&i.ExpiresAt,
 		&i.RevokedAt,
 		&i.CreatedAt,
+		&i.ConsumedAt,
 	)
 	return i, err
 }
@@ -59,6 +82,7 @@ SELECT
     t.tenant_id,
     t.expires_at,
     t.revoked_at,
+    t.consumed_at,
     t.created_at,
     t.allocation_id,
     u.suspended_at AS user_suspended_at,
@@ -77,6 +101,7 @@ type GetAccessTokenByHashRow struct {
 	TenantID          string
 	ExpiresAt         pgtype.Timestamptz
 	RevokedAt         pgtype.Timestamptz
+	ConsumedAt        pgtype.Timestamptz
 	CreatedAt         pgtype.Timestamptz
 	AllocationID      pgtype.UUID
 	UserSuspendedAt   pgtype.Timestamptz
@@ -94,6 +119,7 @@ func (q *Queries) GetAccessTokenByHash(ctx context.Context, tokenHash string) (G
 		&i.TenantID,
 		&i.ExpiresAt,
 		&i.RevokedAt,
+		&i.ConsumedAt,
 		&i.CreatedAt,
 		&i.AllocationID,
 		&i.UserSuspendedAt,

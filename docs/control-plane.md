@@ -32,6 +32,8 @@ Service environment:
 | `ORLOP_IDENTITY_ISSUER` | Optional; when set, required to equal the JWT `iss`. |
 | `ORLOP_IDENTITY_TENANT_CLAIM` | Claim mapped onto the tenant subject. Default `tenant`. |
 | `ORLOP_IDENTITY_TENANT_ALLOWLIST` | Comma-separated fail-closed allowlist of tenant ids that may be provisioned. Required when audience is set. |
+| `ORLOP_CA_TENANT_ALLOWLIST` | Comma-separated tenant ids that may have a CA intermediate lazily bootstrapped at first enroll, on top of the dynamic prefixes below. Anything else is refused with 403 `tenant_not_allowed`. |
+| `ORLOP_CA_ALLOW_DYNAMIC_TENANTS` | Allow lazy bootstrap of server-derived per-user (`u_`) / per-agent (`a_`) tenants. Default `true`; set `false` to restrict bootstrap to `ORLOP_CA_TENANT_ALLOWLIST` only. |
 
 ## Host identity (Mode B)
 
