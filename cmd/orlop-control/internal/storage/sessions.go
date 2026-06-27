@@ -133,14 +133,5 @@ type SessionOps interface {
 // SessionStore is the sessions data layer plus transaction control.
 type SessionStore interface {
 	SessionOps
-	// Begin starts a transaction. The returned SessionTx is bound to it; call
-	// Commit to persist or Rollback (safe after Commit) to discard.
-	Begin(ctx context.Context) (SessionTx, error)
-}
-
-// SessionTx is a transaction-scoped SessionOps with Commit/Rollback.
-type SessionTx interface {
-	SessionOps
-	Commit(ctx context.Context) error
-	Rollback(ctx context.Context) error
+	beginner
 }

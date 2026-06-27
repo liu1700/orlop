@@ -16,12 +16,13 @@ import (
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 func TestForceReleaseMountLeaseClearsActiveLease(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 
 	user := seedUser(t, pool, "force-release-clear@example.com", 10*GiB)
 	alloc, err := svc.Allocate(ctx, user.ID, GiB)
@@ -59,7 +60,7 @@ func TestForceReleaseMountLeaseClearsActiveLease(t *testing.T) {
 func TestForceReleaseMountLeaseIdempotent(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 
 	user := seedUser(t, pool, "force-release-idem@example.com", 10*GiB)
 	alloc, err := svc.Allocate(ctx, user.ID, GiB)
@@ -78,7 +79,7 @@ func TestForceReleaseMountLeaseIdempotent(t *testing.T) {
 func TestForceReleaseMountLeaseRevoked(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 
 	user := seedUser(t, pool, "force-release-revoked@example.com", 10*GiB)
 	alloc, err := svc.Allocate(ctx, user.ID, GiB)
@@ -97,7 +98,7 @@ func TestForceReleaseMountLeaseRevoked(t *testing.T) {
 func TestForceReleaseMountLeaseWrongUser(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 
 	owner := seedUser(t, pool, "force-release-owner@example.com", 10*GiB)
 	other := seedUser(t, pool, "force-release-other@example.com", 10*GiB)
@@ -114,7 +115,7 @@ func TestForceReleaseMountLeaseWrongUser(t *testing.T) {
 func TestForceReleaseMountLeaseNotFound(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
-	svc := allocations.NewService(pool, nil)
+	svc := allocations.NewService(postgres.New(pool), nil)
 
 	user := seedUser(t, pool, "force-release-notfound@example.com", 10*GiB)
 	var randBytes [16]byte

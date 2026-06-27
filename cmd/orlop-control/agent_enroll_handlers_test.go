@@ -339,7 +339,7 @@ func startEnrollServerWithAdmin(t *testing.T, pool *pgxpool.Pool, q *sqlcdb.Quer
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := devauth.NewService(postgres.New(pool), logger)
-	allocSvc := allocations.NewService(pool, nil)
+	allocSvc := allocations.NewService(postgres.New(pool), nil)
 	router := newRouter(logger, runtimeDeps{
 		devAuth:     svc,
 		queries:     q,

@@ -6,18 +6,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
-
-func ttlInterval(ttl time.Duration) pgtype.Interval {
-	return pgtype.Interval{
-		Microseconds: ttl.Microseconds(),
-		Valid:        true,
-	}
-}
 
 // AcquireMountLease atomically claims the allocation for agentID and sets a fresh mount
 // lease, UNCONDITIONALLY taking over any existing lease (only a revoked/missing allocation
@@ -27,15 +20,11 @@ func ttlInterval(ttl time.Duration) pgtype.Interval {
 // the prior pod's lease — including one a crashed pod leaked, without waiting out the TTL.
 // Mount exclusivity is enforced by the handler's ownership check + the data-plane cert.
 func (s *Service) AcquireMountLease(ctx context.Context, allocationID, agentID pgtype.UUID, ttl time.Duration) (Allocation, error) {
-	row, err := s.q.AcquireMountLease(ctx, sqlcdb.AcquireMountLeaseParams{
-		ID:           allocationID,
-		BoundAgentID: pgtype.UUID{Bytes: agentID.Bytes, Valid: true},
-		Ttl:          ttlInterval(ttl),
-	})
+	row, err := s.store.AcquireMountLease(ctx, toUUID(allocationID), toUUID(agentID), ttl)
 	if err == nil {
-		return fromRow(row), nil
+		return fromStorage(row), nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, storage.ErrNotFound) {
 		return Allocation{}, fmt.Errorf("acquire: %w", err)
 	}
 	return Allocation{}, s.classifyLeaseMiss(ctx, allocationID, agentID, true)
@@ -47,18 +36,19 @@ func (s *Service) AcquireMountLease(ctx context.Context, allocationID, agentID p
 // acquired=false means the call was a Refresh (live lease is the success
 // case, so this branch should not happen).
 func (s *Service) classifyLeaseMiss(ctx context.Context, allocationID, agentID pgtype.UUID, acquired bool) error {
-	cur, err := s.q.GetAllocation(ctx, allocationID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	cur, err := s.store.GetAllocation(ctx, toUUID(allocationID))
+	if errors.Is(err, storage.ErrNotFound) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("get after lease miss: %w", err)
 	}
-	if cur.RevokedAt.Valid {
+	agent := toUUID(agentID)
+	if cur.RevokedAt != nil {
 		return ErrRevoked
 	}
-	if cur.LeaseExpiresAt.Valid && cur.LeaseExpiresAt.Time.After(time.Now()) {
-		if !cur.BoundAgentID.Valid || cur.BoundAgentID.Bytes != agentID.Bytes {
+	if cur.LeaseExpiresAt != nil && cur.LeaseExpiresAt.After(time.Now()) {
+		if cur.BoundAgentID == nil || *cur.BoundAgentID != agent {
 			return ErrWrongAgent
 		}
 		if acquired {
@@ -67,7 +57,7 @@ func (s *Service) classifyLeaseMiss(ctx context.Context, allocationID, agentID p
 		// Refresh would succeed in this state, so this branch is unreachable.
 		return fmt.Errorf("classify: refresh miss with live lease (state=%+v)", cur)
 	}
-	if !cur.BoundAgentID.Valid || cur.BoundAgentID.Bytes != agentID.Bytes {
+	if cur.BoundAgentID == nil || *cur.BoundAgentID != agent {
 		if acquired {
 			return fmt.Errorf("classify: acquire miss without live lease (state=%+v)", cur)
 		}
@@ -88,15 +78,11 @@ func (s *Service) classifyLeaseMiss(ctx context.Context, allocationID, agentID p
 // binding, ErrRevoked if the allocation was revoked, or ErrNotFound if the
 // allocation id is unknown.
 func (s *Service) RefreshMountLease(ctx context.Context, allocationID, agentID pgtype.UUID, ttl time.Duration) (Allocation, error) {
-	row, err := s.q.RefreshMountLease(ctx, sqlcdb.RefreshMountLeaseParams{
-		ID:           allocationID,
-		BoundAgentID: pgtype.UUID{Bytes: agentID.Bytes, Valid: true},
-		Ttl:          ttlInterval(ttl),
-	})
+	row, err := s.store.RefreshMountLease(ctx, toUUID(allocationID), toUUID(agentID), ttl)
 	if err == nil {
-		return fromRow(row), nil
+		return fromStorage(row), nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, storage.ErrNotFound) {
 		return Allocation{}, fmt.Errorf("refresh: %w", err)
 	}
 	return Allocation{}, s.classifyLeaseMiss(ctx, allocationID, agentID, false)
@@ -107,27 +93,24 @@ func (s *Service) RefreshMountLease(ctx context.Context, allocationID, agentID p
 // already-Free allocation is a no-op.
 // Errors with ErrWrongAgent if the binding belongs to a different agent.
 func (s *Service) ReleaseMountLease(ctx context.Context, allocationID, agentID pgtype.UUID) error {
-	row, err := s.q.ReleaseMountLease(ctx, sqlcdb.ReleaseMountLeaseParams{
-		ID:           allocationID,
-		BoundAgentID: pgtype.UUID{Bytes: agentID.Bytes, Valid: true},
-	})
+	row, err := s.store.ReleaseMountLease(ctx, toUUID(allocationID), toUUID(agentID))
 	if err == nil {
 		// Revoke the released agent's leaf so a leaked copy can't keep mounting
 		// until its TTL lapses (issue #5).
-		s.revokeReleasedAgentCert(ctx, agentID, row.TenantID)
+		s.revokeReleasedAgentCert(ctx, toUUID(agentID), row.TenantID)
 		return nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("release: %w", err)
 	}
-	cur, gerr := s.q.GetAllocation(ctx, allocationID)
-	if errors.Is(gerr, pgx.ErrNoRows) {
+	cur, gerr := s.store.GetAllocation(ctx, toUUID(allocationID))
+	if errors.Is(gerr, storage.ErrNotFound) {
 		return ErrNotFound
 	}
 	if gerr != nil {
 		return fmt.Errorf("get after release miss: %w", gerr)
 	}
-	if cur.BoundAgentID.Valid && cur.BoundAgentID.Bytes != agentID.Bytes {
+	if cur.BoundAgentID != nil && *cur.BoundAgentID != toUUID(agentID) {
 		return ErrWrongAgent
 	}
 	return fmt.Errorf("release: zero rows but no guard matched (state=%+v)", cur)
@@ -138,26 +121,22 @@ func (s *Service) ReleaseMountLease(ctx context.Context, allocationID, agentID p
 // of surviving its full TTL. Best-effort: a missing enrollment or DB failure is
 // logged, never fatal to the release. The serial is recorded with the cert's
 // own expiry so it can be pruned once the cert would lapse anyway.
-func (s *Service) revokeReleasedAgentCert(ctx context.Context, enrollmentID pgtype.UUID, tenant pgtype.Text) {
-	if !enrollmentID.Valid {
+func (s *Service) revokeReleasedAgentCert(ctx context.Context, enrollmentID uuid.UUID, tenantID string) {
+	if enrollmentID == (uuid.UUID{}) {
 		return
 	}
-	enr, err := s.q.GetAgentEnrollment(ctx, enrollmentID)
+	enr, err := s.store.GetAgentEnrollment(ctx, enrollmentID)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
+		if !errors.Is(err, storage.ErrNotFound) {
 			s.logger.Warn("cert_revocation_lookup_failed", "error", err)
 		}
 		return
 	}
-	tenantID := ""
-	if tenant.Valid {
-		tenantID = tenant.String
-	}
-	if err := s.q.AddCertRevocation(ctx, sqlcdb.AddCertRevocationParams{
-		CertSerial: enr.CertSerial,
-		TenantID:   tenantID,
-		ExpiresAt:  enr.CertNotAfter,
-		Reason:     "lease_released",
+	if err := s.store.AddCertRevocation(ctx, storage.CertRevocation{
+		Serial:    enr.CertSerial,
+		TenantID:  tenantID,
+		ExpiresAt: enr.CertNotAfter,
+		Reason:    "lease_released",
 	}); err != nil {
 		s.logger.Warn("cert_revocation_add_failed", "error", err, "cert_serial", enr.CertSerial)
 		return

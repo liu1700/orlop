@@ -14,7 +14,7 @@ import (
 
 var (
 	_ storage.SessionStore = (*Store)(nil)
-	_ storage.SessionTx    = (*txStore)(nil)
+	_ storage.Tx           = (*txStore)(nil)
 )
 
 // --- device authorizations ---
@@ -200,7 +200,7 @@ func (s *Store) SumActiveAllocationBytes(ctx context.Context, userID uuid.UUID) 
 
 // --- transactions ---
 
-func (s *Store) Begin(ctx context.Context) (storage.SessionTx, error) {
+func (s *Store) Begin(ctx context.Context) (storage.Tx, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err

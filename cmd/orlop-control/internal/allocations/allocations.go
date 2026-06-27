@@ -17,10 +17,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
 
 // LeaseTTL is the server-side mount-lease window. The agent (#62) refreshes
@@ -52,46 +52,48 @@ type Allocation struct {
 	LeaseExpiresAt *time.Time
 }
 
-// Service provides the allocations workflow. Holds a pgxpool because every
-// public method either runs in a single statement or opens a short-lived tx.
+// Service provides the allocations workflow over a storage backend.
 type Service struct {
-	pool   *pgxpool.Pool
-	q      *sqlcdb.Queries
+	store  storage.AllocationStore
 	logger *slog.Logger
 }
 
-// NewService wires the service to a pgxpool. The pool must already have run
-// migrations through 0004. If logger is nil, logs are discarded.
-func NewService(pool *pgxpool.Pool, logger *slog.Logger) *Service {
+// NewService wires the service to a storage backend. If logger is nil, logs are
+// discarded.
+func NewService(store storage.AllocationStore, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Service{pool: pool, q: sqlcdb.New(pool), logger: logger}
+	return &Service{store: store, logger: logger}
 }
 
-// fromRow projects an sqlcdb row into the public Allocation type.
-func fromRow(r sqlcdb.DiskAllocation) Allocation {
-	a := Allocation{
-		ID:        r.ID,
-		UserID:    r.UserID,
-		SizeBytes: r.SizeBytes,
-		CreatedAt: r.CreatedAt.Time,
+// fromStorage projects a storage.Allocation into the public Allocation type,
+// which still speaks pgtype.UUID for its handler consumers.
+func fromStorage(a storage.Allocation) Allocation {
+	out := Allocation{
+		ID:             fromUUID(a.ID),
+		UserID:         fromUUID(a.UserID),
+		SizeBytes:      a.SizeBytes,
+		CreatedAt:      a.CreatedAt,
+		RevokedAt:      a.RevokedAt,
+		BoundAt:        a.BoundAt,
+		LeaseExpiresAt: a.LeaseExpiresAt,
 	}
-	if r.RevokedAt.Valid {
-		t := r.RevokedAt.Time
-		a.RevokedAt = &t
+	if a.BoundAgentID != nil {
+		p := fromUUID(*a.BoundAgentID)
+		out.BoundAgentID = &p
 	}
-	if r.BoundAgentID.Valid {
-		id := r.BoundAgentID
-		a.BoundAgentID = &id
-	}
-	if r.BoundAt.Valid {
-		t := r.BoundAt.Time
-		a.BoundAt = &t
-	}
-	if r.LeaseExpiresAt.Valid {
-		t := r.LeaseExpiresAt.Time
-		a.LeaseExpiresAt = &t
-	}
-	return a
+	return out
 }
+
+// Boundary conversions: the public API still speaks pgtype.UUID (handlers
+// consume it); storage speaks uuid.UUID.
+
+func toUUID(u pgtype.UUID) uuid.UUID {
+	if !u.Valid {
+		return uuid.UUID{}
+	}
+	return uuid.UUID(u.Bytes)
+}
+
+func fromUUID(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true} }

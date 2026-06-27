@@ -139,7 +139,7 @@ func startJournalServer(t *testing.T, pool *pgxpool.Pool, jq journalQuerier) (*h
 	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
 		devAuth:        svc,
 		queries:        sqlcdb.New(pool),
-		allocations:    allocations.NewService(pool, nil),
+		allocations:    allocations.NewService(postgres.New(pool), nil),
 		journalQuerier: jq,
 	}, config{})
 	srv := httptest.NewServer(router)

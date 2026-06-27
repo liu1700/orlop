@@ -16,6 +16,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 const (
@@ -99,7 +100,7 @@ func seedAgent(t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID) pgtype.UUID
 func withSvc(t *testing.T) (*allocations.Service, *pgxpool.Pool) {
 	t.Helper()
 	pool := openTestPool(t)
-	return allocations.NewService(pool, nil), pool
+	return allocations.NewService(postgres.New(pool), nil), pool
 }
 
 func TestAllocateHappyPath(t *testing.T) {
