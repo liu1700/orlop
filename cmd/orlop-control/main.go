@@ -396,7 +396,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 			}
 			deps.mountLeaseFencer = &serverapiMountLeaseFencer{
 				client:  adminClient,
-				queries: deps.queries,
+				queries: deps.store,
 			}
 			deps.agentPurger = serverapiAgentPurger{client: adminClient}
 			deps.certRevReconcile = newCertRevocationReconciler(deps.store, adminClient, logger)
@@ -723,15 +723,15 @@ func fromServerJournalEntry(e serverapi.JournalEntry) journalEntryJSON {
 // at call time via the DB so the adapter carries no per-tenant state.
 type serverapiMountLeaseFencer struct {
 	client  *serverapi.Client
-	queries interface {
-		GetServerVMByTenant(ctx context.Context, tenantID string) (sqlcdb.ServerVm, error)
-		GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (sqlcdb.ServerPool, error)
-	}
+	queries tenantPlacementQuerier
 }
 
 func (a *serverapiMountLeaseFencer) FenceAllocation(ctx context.Context, tenantID, allocationID string) error {
-	vm, err := a.queries.GetServerVMByTenant(ctx, tenantID)
-	if errors.Is(err, db.ErrNotFound) {
+	opsAddr, placed, err := resolveTenantOpsAddr(ctx, a.queries, tenantID)
+	if err != nil {
+		return fmt.Errorf("fence: %w", err)
+	}
+	if !placed {
 		// No server-pool placement for this tenant (single-node / no populated server_pool):
 		// there is no remote data-plane registry to clear, so fencing is a clean no-op rather
 		// than an error. The local dg-server's stale active-lease slot is instead taken over
@@ -739,14 +739,7 @@ func (a *serverapiMountLeaseFencer) FenceAllocation(ctx context.Context, tenantI
 		// takeover that already happens unconditionally one layer up.
 		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("fence: get server vm: %w", err)
-	}
-	pool, err := a.queries.GetServerPoolByDataAddr(ctx, vm.DataAddr)
-	if err != nil {
-		return fmt.Errorf("fence: get server pool: %w", err)
-	}
-	return a.client.ClearActiveMountLease(ctx, pool.OpsAddr, tenantID, allocationID)
+	return a.client.ClearActiveMountLease(ctx, opsAddr, tenantID, allocationID)
 }
 
 // serverapiAgentPurger adapts *serverapi.Client to allocations.AgentDataPurger

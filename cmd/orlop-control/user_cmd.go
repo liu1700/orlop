@@ -11,9 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
@@ -73,14 +72,14 @@ func runUserSeed(ctx context.Context, out io.Writer, args []string) error {
 		return fmt.Errorf("open pgxpool: %w", err)
 	}
 	defer pool.Close()
-	q := sqlcdb.New(pool)
+	store := postgres.New(pool)
 
 	// Tenant: idempotent create.
-	if _, err := q.GetTenant(ctx, *tenantID); err != nil {
-		if !errors.Is(err, db.ErrNotFound) {
+	if _, err := store.GetTenant(ctx, *tenantID); err != nil {
+		if !errors.Is(err, storage.ErrNotFound) {
 			return fmt.Errorf("get tenant: %w", err)
 		}
-		if _, err := q.CreateTenant(ctx, sqlcdb.CreateTenantParams{ID: *tenantID, Name: *tenantName}); err != nil {
+		if err := store.CreateTenant(ctx, *tenantID, *tenantName); err != nil {
 			return fmt.Errorf("create tenant: %w", err)
 		}
 		fmt.Fprintf(out, "created tenant %s\n", *tenantID)
@@ -88,9 +87,9 @@ func runUserSeed(ctx context.Context, out io.Writer, args []string) error {
 
 	// User: idempotent create. CreateUser relies on the SQL DEFAULT
 	// 'admin' role; admin is the only role under MVP.
-	user, err := q.GetUserByEmail(ctx, *email)
-	if errors.Is(err, db.ErrNotFound) {
-		user, err = q.CreateUser(ctx, sqlcdb.CreateUserParams{Email: *email, TenantID: *tenantID})
+	user, err := store.GetUserByEmail(ctx, *email)
+	if errors.Is(err, storage.ErrNotFound) {
+		user, err = store.CreateUser(ctx, *email, *tenantID)
 		if err != nil {
 			return fmt.Errorf("create user: %w", err)
 		}
@@ -102,8 +101,8 @@ func runUserSeed(ctx context.Context, out io.Writer, args []string) error {
 	}
 
 	// Mint admin session token.
-	svc := devauth.NewService(postgres.New(pool), nil)
-	tok, expires, err := svc.IssueAdminSession(ctx, user.ID, *tenantID)
+	svc := devauth.NewService(store, nil)
+	tok, expires, err := svc.IssueAdminSession(ctx, fromUUID(user.ID), *tenantID)
 	if err != nil {
 		return fmt.Errorf("issue admin session: %w", err)
 	}
@@ -144,13 +143,13 @@ func runUserSuspend(ctx context.Context, out io.Writer, args []string) error {
 		return fmt.Errorf("open pgxpool: %w", err)
 	}
 	defer pool.Close()
-	q := sqlcdb.New(pool)
+	store := postgres.New(pool)
 
-	user, err := q.GetUserByEmail(ctx, *email)
+	user, err := store.GetUserByEmail(ctx, *email)
 	if err != nil {
 		return fmt.Errorf("get user: %w", err)
 	}
-	if err := q.SuspendUser(ctx, user.ID); err != nil {
+	if err := store.SuspendUser(ctx, user.ID); err != nil {
 		return fmt.Errorf("suspend user: %w", err)
 	}
 	fmt.Fprintf(out, "suspended user %s\n", *email)
