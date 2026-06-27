@@ -17,6 +17,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -208,9 +210,11 @@ impl MountedFs {
     /// Linux: enters the FUSE dispatch loop via `Session::run`; returns when
     /// the kernel sees the unmount syscall (e.g. `fusermount3 -u`).
     ///
-    /// macOS: blocks on a SIGINT handler — the kernel NFS client keeps
-    /// servicing RPCs from the spawned tokio task in the background; on
-    /// Ctrl-C we fall through to `Drop` which runs `umount`.
+    /// macOS: blocks on SIGINT/SIGTERM *and* polls the mountpoint so an
+    /// out-of-band `umount` (e.g. `orlop unmount` in another shell) also wakes
+    /// it. The kernel NFS client services RPCs from the spawned tokio task in
+    /// the background; on any of those signals — or once the mount disappears —
+    /// we fall through to `Drop`, which runs `umount` and releases the lease.
     pub fn wait(mut self) -> Result<()> {
         match &mut self.inner {
             #[cfg(target_os = "linux")]
@@ -222,19 +226,69 @@ impl MountedFs {
             }
             #[cfg(target_os = "macos")]
             Inner::Nfs { rt } => {
-                rt.block_on(async {
+                // self.mountpoint and self.inner are disjoint fields, so this
+                // borrow coexists with the `&mut self.inner` match above.
+                let mountpoint = self.mountpoint.clone();
+                rt.block_on(async move {
                     use tokio::signal::unix::{signal, SignalKind};
                     let mut term =
                         signal(SignalKind::terminate()).expect("install SIGTERM handler");
                     let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-                    tokio::select! {
-                        _ = term.recv() => {},
-                        _ = int.recv() => {},
+                    // Poll for an out-of-band unmount. A foreground / `--from-env`
+                    // mount writes no PID file, so `orlop unmount` can't signal
+                    // it; it only runs the kernel `umount`. Without this the NFS
+                    // server task and the lease-refresh loop keep running after
+                    // the filesystem is gone, leaving a process that holds the
+                    // mount lease until it expires (the zombie supervisor bug).
+                    let mut poll = tokio::time::interval(UMOUNT_POLL_INTERVAL);
+                    poll.tick().await; // first tick is immediate; skip it
+                    let mut misses: u8 = 0;
+                    loop {
+                        tokio::select! {
+                            _ = term.recv() => break,
+                            _ = int.recv() => break,
+                            _ = poll.tick() => {
+                                let mp = mountpoint.clone();
+                                // `/sbin/mount` shell-out is blocking; keep it off
+                                // the runtime worker. A probe failure (Err) is
+                                // treated as "still mounted" so we never unmount
+                                // spuriously.
+                                let active = tokio::task::spawn_blocking(move || {
+                                    crate::daemon::is_mountpoint_active(&mp)
+                                })
+                                .await
+                                .unwrap_or(true);
+                                let (next, stop) = umount_poll_step(active, misses);
+                                misses = next;
+                                if stop {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 });
             }
         }
         Ok(())
+    }
+}
+
+/// How often [`MountedFs::wait`] (macOS) re-checks whether the filesystem is
+/// still mounted, to catch an out-of-band `umount`.
+#[cfg(target_os = "macos")]
+const UMOUNT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Decide whether the macOS wait loop should stop, given the latest mount
+/// liveness sample and the running count of consecutive "not mounted" samples.
+/// Requires two consecutive misses before stopping so a transient `/sbin/mount`
+/// hiccup can't tear down a healthy mount. Returns `(updated_misses, stop)`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn umount_poll_step(active: bool, misses: u8) -> (u8, bool) {
+    if active {
+        (0, false)
+    } else {
+        let misses = misses.saturating_add(1);
+        (misses, misses >= 2)
     }
 }
 
@@ -337,7 +391,32 @@ pub fn unmount(mountpoint: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::probe_mount;
+    use super::{probe_mount, umount_poll_step};
+
+    #[test]
+    fn umount_poll_active_resets_and_continues() {
+        // A live mount never stops the wait loop and clears any prior misses.
+        assert_eq!(umount_poll_step(true, 0), (0, false));
+        assert_eq!(umount_poll_step(true, 1), (0, false));
+    }
+
+    #[test]
+    fn umount_poll_stops_only_after_two_consecutive_misses() {
+        // One miss is not enough (tolerates a transient `/sbin/mount` hiccup).
+        let (misses, stop) = umount_poll_step(false, 0);
+        assert_eq!((misses, stop), (1, false));
+        // A second consecutive miss tears the mount down.
+        let (misses, stop) = umount_poll_step(false, misses);
+        assert_eq!((misses, stop), (2, true));
+    }
+
+    #[test]
+    fn umount_poll_miss_then_recover_does_not_stop() {
+        let (misses, stop) = umount_poll_step(false, 0);
+        assert_eq!((misses, stop), (1, false));
+        // Mount reappears before the second miss → counter resets, keep waiting.
+        assert_eq!(umount_poll_step(true, misses), (0, false));
+    }
 
     // Exercised against a plain directory rather than a live FUSE/NFS mount —
     // it validates the probe's own read/write/cleanup logic; the threading vs.
