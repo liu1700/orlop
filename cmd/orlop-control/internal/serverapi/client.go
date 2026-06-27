@@ -747,6 +747,49 @@ func (c *Client) ClearActiveMountLease(ctx context.Context, opsAddr, tenantID, a
 	return ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
 }
 
+// CertRevocation is one entry pushed to a data-plane server's deny-list (issue #5).
+type CertRevocation struct {
+	Serial    string    `json:"serial"`     // uppercase hex
+	ExpiresAt time.Time `json:"expires_at"` // cert NotAfter
+}
+
+// PushCertRevocations PUTs the active serial deny-list to a server's
+// /control/cert-revocations endpoint (issue #5). The server merges, so this is
+// idempotent and safe to re-send every reconcile interval. An empty list is a
+// no-op (no request issued).
+func (c *Client) PushCertRevocations(ctx context.Context, opsAddr string, revs []CertRevocation) error {
+	if len(revs) == 0 {
+		return nil
+	}
+	body, err := json.Marshal(map[string]any{"revocations": revs})
+	if err != nil {
+		return fmt.Errorf("serverapi: marshal revocations: %w", err)
+	}
+	url := "https://" + opsAddr + "/control/cert-revocations"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("serverapi: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("serverapi: do request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	var env adminErrorEnvelope
+	_ = json.NewDecoder(resp.Body).Decode(&env)
+	e := env.Error
+	c.logger.Error("push_cert_revocations_failed",
+		"ops_addr", opsAddr,
+		"status", resp.StatusCode,
+		"code", e.Code,
+	)
+	return ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+}
+
 // AgentPurgeResult is the decoded response from PurgeAgentData.
 type AgentPurgeResult struct {
 	ManifestsDeleted int64  `json:"manifests_deleted"`

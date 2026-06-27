@@ -130,14 +130,22 @@ func mountEntities(r chi.Router, svc func(http.Handler) http.Handler, h *entityH
 	}
 }
 
+// Dynamic tenant-id prefixes. These tenants are derived server-side from an
+// authenticated user/agent id (never from an external claim), which is why the
+// CA bootstrap allowlist may trust them by prefix (issue #8).
+const (
+	tenantPrefixUser  = "u_" // per-owner (user) tenant
+	tenantPrefixAgent = "a_" // per-agent storage tenant
+)
+
 // tenantIDForOwner derives the deterministic dg-tenant id from a orlop owner
 // (user) UUID. Idempotent ensure keys on this id.
-func tenantIDForOwner(ownerID string) string { return "u_" + ownerID }
+func tenantIDForOwner(ownerID string) string { return tenantPrefixUser + ownerID }
 
 // tenantForAgent derives the per-agent storage tenant id from a orlop agent id.
 // Each agent's disk lives in its own tenant so it can be re-homed to a different
 // billing owner without moving data (docs/design/per-agent-tenant.md).
-func tenantForAgent(agentID string) string { return "a_" + agentID }
+func tenantForAgent(agentID string) string { return tenantPrefixAgent + agentID }
 
 // syntheticUserEmail is the email stored on the reused dg user row. The dg user
 // id is the orlop user UUID; the email column is NOT NULL UNIQUE so we mint a

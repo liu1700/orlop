@@ -38,6 +38,10 @@ type serverState struct {
 	// pushed from orlop-control. Writes whose session_id does not match the
 	// registered lease are rejected — see mount_lease_registry.go and #175.
 	mountLeases *mountLeaseRegistry
+	// certRevocations is the in-memory serial deny-list pushed from orlop-control
+	// (issue #5). A revoked client leaf is refused at session start, before any
+	// frame is served — the data-plane kill switch. See cert_revocation_registry.go.
+	certRevocations *certRevocationRegistry
 
 	// connSem bounds concurrent framed sessions; reqSem bounds concurrent
 	// in-flight request handlers. Both are buffered-channel semaphores sized at
@@ -169,9 +173,10 @@ func newServerState(cfg Config, identifier Identifier, logger *slog.Logger) (*se
 		logger:      logger,
 		quota:       qm,
 		quotaApply:  quotaApply,
-		trustDomain: cfg.TrustDomain,
-		mountLeases: newMountLeaseRegistry(),
-		connSem:     make(chan struct{}, maxDataPlaneSessions),
+		trustDomain:     cfg.TrustDomain,
+		mountLeases:     newMountLeaseRegistry(),
+		certRevocations: newCertRevocationRegistry(),
+		connSem:         make(chan struct{}, maxDataPlaneSessions),
 		reqSem:      make(chan struct{}, maxInFlightRequests),
 		adminCfg: adminConfig{
 			TenantsRoot:           cfg.TenantsRoot,
@@ -274,6 +279,7 @@ func newRouter(state *serverState) http.Handler {
 	})
 	r.Group(func(r chi.Router) {
 		r.Use(controlPlaneOnlyMiddleware(state))
+		r.Put("/control/cert-revocations", state.pushCertRevocations)
 		r.Post("/control/tenants", state.registerTenant)
 		r.Patch("/control/tenants/{id}", state.resizeTenant)
 		r.Patch("/control/accounts/{owner}/quota", state.setAccountQuota)

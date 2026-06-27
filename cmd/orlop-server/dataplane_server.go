@@ -167,6 +167,17 @@ func serveFrames(logger *slog.Logger, state *serverState, conn io.ReadWriteClose
 	if !ok {
 		return
 	}
+	// Revocation kill switch (issue #5): refuse a leaf whose serial is on the
+	// deny-list pushed from orlop-control, so a leaked or lease-released cert
+	// dies mid-TTL instead of staying valid for its full hour. Checked before
+	// any frame is served.
+	if state.certRevocations != nil {
+		if serial := formatSerialHex(cert.SerialNumber); state.certRevocations.IsRevoked(serial) {
+			logger.Warn("data-plane session rejected: revoked client certificate",
+				"serial", serial, "tenant", ident.TenantID, "agent", ident.AgentID)
+			return
+		}
+	}
 	// Defense-in-depth: confirm the intermediate that signed this leaf is scoped
 	// to the same tenant as the leaf's SAN, so a leaked tenant-intermediate key
 	// can't forge a cross-tenant cert against the shared root.

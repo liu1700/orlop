@@ -54,6 +54,25 @@ func (q *Queries) GetActiveEnrollmentByFingerprint(ctx context.Context, lower st
 	return i, err
 }
 
+const getAgentEnrollment = `-- name: GetAgentEnrollment :one
+SELECT id, user_id, cert_serial, cert_not_after, enrolled_at FROM agent_enrollments WHERE id = $1
+`
+
+// Resolve a single enrollment by its id (a disk_allocations.bound_agent_id FK),
+// used to revoke the bound leaf's serial on lease release (issue #5).
+func (q *Queries) GetAgentEnrollment(ctx context.Context, id pgtype.UUID) (AgentEnrollment, error) {
+	row := q.db.QueryRow(ctx, getAgentEnrollment, id)
+	var i AgentEnrollment
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.CertSerial,
+		&i.CertNotAfter,
+		&i.EnrolledAt,
+	)
+	return i, err
+}
+
 const listActiveEnrollmentsForUser = `-- name: ListActiveEnrollmentsForUser :many
 SELECT id, user_id, cert_serial, cert_not_after, enrolled_at FROM agent_enrollments
 WHERE user_id = $1 AND cert_not_after > now()

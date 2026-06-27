@@ -112,7 +112,9 @@ func (s *Service) ReleaseMountLease(ctx context.Context, allocationID, agentID p
 		BoundAgentID: pgtype.UUID{Bytes: agentID.Bytes, Valid: true},
 	})
 	if err == nil {
-		_ = row
+		// Revoke the released agent's leaf so a leaked copy can't keep mounting
+		// until its TTL lapses (issue #5).
+		s.revokeReleasedAgentCert(ctx, agentID, row.TenantID)
 		return nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -129,4 +131,36 @@ func (s *Service) ReleaseMountLease(ctx context.Context, allocationID, agentID p
 		return ErrWrongAgent
 	}
 	return fmt.Errorf("release: zero rows but no guard matched (state=%+v)", cur)
+}
+
+// revokeReleasedAgentCert adds the released agent's leaf serial to the cert
+// deny-list (issue #5), so a leaked copy is killed at the next handshake instead
+// of surviving its full TTL. Best-effort: a missing enrollment or DB failure is
+// logged, never fatal to the release. The serial is recorded with the cert's
+// own expiry so it can be pruned once the cert would lapse anyway.
+func (s *Service) revokeReleasedAgentCert(ctx context.Context, enrollmentID pgtype.UUID, tenant pgtype.Text) {
+	if !enrollmentID.Valid {
+		return
+	}
+	enr, err := s.q.GetAgentEnrollment(ctx, enrollmentID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			s.logger.Warn("cert_revocation_lookup_failed", "error", err)
+		}
+		return
+	}
+	tenantID := ""
+	if tenant.Valid {
+		tenantID = tenant.String
+	}
+	if err := s.q.AddCertRevocation(ctx, sqlcdb.AddCertRevocationParams{
+		CertSerial: enr.CertSerial,
+		TenantID:   tenantID,
+		ExpiresAt:  enr.CertNotAfter,
+		Reason:     "lease_released",
+	}); err != nil {
+		s.logger.Warn("cert_revocation_add_failed", "error", err, "cert_serial", enr.CertSerial)
+		return
+	}
+	s.logger.Info("cert_revoked", "cert_serial", enr.CertSerial, "reason", "lease_released")
 }

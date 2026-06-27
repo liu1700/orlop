@@ -56,6 +56,10 @@ const (
 	tenantPrefix = "ca/tenant/"
 )
 
+// ErrTenantNotAllowed is returned by BootstrapTenant when Env.AllowBootstrap
+// rejects the tenant id — the operator allowlist gate (issue #8).
+var ErrTenantNotAllowed = errors.New("ca: tenant not allowed for bootstrap")
+
 // Env carries CA-wide configuration. Now and Rand are injectable for
 // deterministic tests; both fall back to the standard sources.
 type Env struct {
@@ -63,6 +67,13 @@ type Env struct {
 	OrgName     string
 	Now         func() time.Time
 	Rand        io.Reader
+	// AllowBootstrap, when non-nil, gates BootstrapTenant: it must return true
+	// for a tenant id before any new intermediate is minted for it (issue #8).
+	// A nil predicate allows all bootstraps — used by the operator CLI
+	// (`orlop-control ca init`), where the tenant id is operator-chosen, not
+	// claim-derived. The runtime control plane supplies a predicate so a
+	// verified-but-attacker-influenced tenant claim cannot self-onboard.
+	AllowBootstrap func(tenantID string) bool
 }
 
 func (e Env) now() time.Time {
@@ -234,6 +245,13 @@ func (c *CA) BootstrapTenant(ctx context.Context, tenantID string) error {
 	defer c.mu.Unlock()
 	if _, ok := c.tenants[tenantID]; ok {
 		return nil
+	}
+	// Operator allowlist gate (issue #8): refuse to mint CA material for a
+	// tenant the operator has not permitted. Checked after the idempotent
+	// "already loaded" return so an already-provisioned tenant is never broken;
+	// it only blocks creating a NEW intermediate for an unrecognized tenant.
+	if c.env.AllowBootstrap != nil && !c.env.AllowBootstrap(tenantID) {
+		return fmt.Errorf("%w: %q", ErrTenantNotAllowed, tenantID)
 	}
 	if c.rootKey == nil {
 		return errors.New("ca: root key not loaded; cannot sign tenant intermediate")
@@ -598,6 +616,17 @@ func (c *CA) generateIntermediate(tenantID string) (*x509.Certificate, ed25519.P
 		IsCA:                  true,
 		MaxPathLen:            0,
 		MaxPathLenZero:        true,
+		// Constrain issuance to this deployment's trust domain (issue #7): a
+		// leaked intermediate key cannot mint a leaf for a DIFFERENT SPIFFE
+		// trust domain, because crypto/x509 path validation rejects a URI SAN
+		// whose host falls outside PermittedURIDomains. NOTE this does NOT
+		// isolate tenants from each other: every tenant's SPIFFE SAN shares this
+		// same trust-domain host and differs only by the URI path (/tenant/<id>),
+		// which URI name constraints (host-scoped) cannot distinguish. The
+		// cross-tenant forgery gate is the data plane's fail-closed
+		// checkTenantBinding, which matches the signing intermediate's tenant OU
+		// against the leaf's SAN path.
+		PermittedURIDomains: []string{c.env.TrustDomain},
 	}
 	der, err := x509.CreateCertificate(c.env.randR(), tmpl, c.rootCert, pub, c.rootKey)
 	if err != nil {

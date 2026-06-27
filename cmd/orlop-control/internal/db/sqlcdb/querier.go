@@ -21,10 +21,20 @@ type Querier interface {
 	// enforced by the handler's ownership check + the data-plane agent cert, and the acquire
 	// handler fences any stale server-side session so the new mount's hex is accepted.
 	AcquireMountLease(ctx context.Context, arg AcquireMountLeaseParams) (DiskAllocation, error)
+	// Record a revoked cert serial (issue #5). Idempotent: a serial already on the
+	// deny-list is left untouched (the first revocation's reason/expiry win).
+	AddCertRevocation(ctx context.Context, arg AddCertRevocationParams) error
 	ApproveDeviceAuthorization(ctx context.Context, arg ApproveDeviceAuthorizationParams) (DeviceAuthorization, error)
 	BindAllocation(ctx context.Context, arg BindAllocationParams) (DiskAllocation, error)
 	// Two-step: promote allocations, then mark sessions claimed.
 	ClaimAnonymousAllocations(ctx context.Context, arg ClaimAnonymousAllocationsParams) ([]pgtype.UUID, error)
+	// Atomically spend a single-use agent-enroll token (issue #6). Matches only an
+	// un-consumed 'agent_enroll' row; a replay or a lost concurrent race matches
+	// zero rows and returns pgx.ErrNoRows, which the caller treats as "already
+	// spent" and rejects. The purpose filter keeps device/admin/api multi-use
+	// sessions out — they are never consumed here even when presented on the
+	// enroll route. The literal mirrors devauth.PurposeAgentEnroll.
+	ConsumeAgentEnrollToken(ctx context.Context, tokenHash string) (pgtype.UUID, error)
 	// Live (non-revoked) allocations a user still has. The purge path uses this
 	// to decide between a per-agent subtree purge (other agents share the tenant
 	// dir) and a whole-tenant unregister (this was the last one).
@@ -39,6 +49,8 @@ type Querier interface {
 	CreateServerVM(ctx context.Context, arg CreateServerVMParams) (ServerVm, error)
 	CreateTenant(ctx context.Context, arg CreateTenantParams) (Tenant, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
+	// Housekeeping: drop rows whose certs have already expired.
+	DeleteExpiredCertRevocations(ctx context.Context) error
 	// Remove a tenant's placement after its data-plane tenant was unregistered
 	// (last-allocation purge). The next enroll for this tenant re-Reserves a
 	// placement from the pool.
@@ -58,6 +70,9 @@ type Querier interface {
 	GetAPITokenByID(ctx context.Context, id pgtype.UUID) (GetAPITokenByIDRow, error)
 	GetAccessTokenByHash(ctx context.Context, tokenHash string) (GetAccessTokenByHashRow, error)
 	GetActiveEnrollmentByFingerprint(ctx context.Context, lower string) (AgentEnrollment, error)
+	// Resolve a single enrollment by its id (a disk_allocations.bound_agent_id FK),
+	// used to revoke the bound leaf's serial on lease release (issue #5).
+	GetAgentEnrollment(ctx context.Context, id pgtype.UUID) (AgentEnrollment, error)
 	GetAllocation(ctx context.Context, id pgtype.UUID) (DiskAllocation, error)
 	// Resolve an agent's live (non-revoked) allocation. agent_id is the orlop
 	// agent id, a globally-unique UUID, so a lookup by agent_id alone resolves to
@@ -79,7 +94,13 @@ type Querier interface {
 	InsertAnonymousAllocation(ctx context.Context, arg InsertAnonymousAllocationParams) (DiskAllocation, error)
 	InsertAnonymousSession(ctx context.Context, arg InsertAnonymousSessionParams) (AnonymousSession, error)
 	ListAPITokensByUser(ctx context.Context, userID pgtype.UUID) ([]ListAPITokensByUserRow, error)
+	// The deny-list the reconcile loop pushes to data-plane servers: serials whose
+	// certs have not yet expired (an expired cert fails verification anyway).
+	ListActiveCertRevocations(ctx context.Context) ([]ListActiveCertRevocationsRow, error)
 	ListActiveEnrollmentsForUser(ctx context.Context, userID pgtype.UUID) ([]AgentEnrollment, error)
+	// Distinct orlop-server ops addresses that currently host at least one placed
+	// tenant — the push targets for the deny-list reconcile.
+	ListActiveServerOpsAddrs(ctx context.Context) ([]string, error)
 	ListAllocationsForUser(ctx context.Context, userID pgtype.UUID) ([]DiskAllocation, error)
 	ListExpiredAnonymousSessions(ctx context.Context) ([]AnonymousSession, error)
 	// Active, placed, registered allocations that still have room to grow toward

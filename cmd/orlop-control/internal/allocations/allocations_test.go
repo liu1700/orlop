@@ -47,7 +47,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(),
-			"TRUNCATE TABLE server_pool, disk_allocations, refresh_tokens, access_tokens, device_authorizations, agent_enrollments, server_vms, users, tenants RESTART IDENTITY CASCADE")
+			"TRUNCATE TABLE server_pool, disk_allocations, refresh_tokens, access_tokens, device_authorizations, agent_enrollments, cert_revocations, server_vms, users, tenants RESTART IDENTITY CASCADE")
 		pool.Close()
 	})
 	return pool
@@ -501,6 +501,42 @@ func TestReleaseFreesForRebinding(t *testing.T) {
 	}
 	if sum != 5*GiB {
 		t.Fatalf("active sum: got %d want %d", sum, 5*GiB)
+	}
+}
+
+// TestReleaseMountLeaseRevokesCert covers issue #5: releasing a lease adds the
+// bound agent's leaf serial to the cert deny-list so it dies mid-TTL.
+func TestReleaseMountLeaseRevokesCert(t *testing.T) {
+	svc, pool := withSvc(t)
+	ctx := context.Background()
+	user := seedUser(t, pool, "alice@acme.example", 10*GiB)
+	agent := seedAgent(t, pool, user.ID)
+	q := sqlcdb.New(pool)
+
+	a, _ := svc.Allocate(ctx, user.ID, 5*GiB)
+	if _, err := svc.Bind(ctx, a.ID, user.ID, agent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL); err != nil {
+		t.Fatal(err)
+	}
+	enr, err := q.GetAgentEnrollment(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.ReleaseMountLease(ctx, a.ID, agent); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	var got string
+	if err := pool.QueryRow(ctx,
+		"SELECT cert_serial FROM cert_revocations WHERE cert_serial=$1", enr.CertSerial,
+	).Scan(&got); err != nil {
+		t.Fatalf("expected a revocation row for serial %s: %v", enr.CertSerial, err)
+	}
+	if got != enr.CertSerial {
+		t.Fatalf("revoked serial = %q, want %q", got, enr.CertSerial)
 	}
 }
 

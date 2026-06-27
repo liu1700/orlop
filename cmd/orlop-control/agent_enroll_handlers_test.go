@@ -64,7 +64,12 @@ func TestAgentEnrollHappyPath(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("cert verify: %v", err)
 	}
-	if len(leaf.URIs) != 1 || leaf.URIs[0].String() != "spiffe://test.example/tenant/acme" {
+	// Every enroll is agent-scoped: the leaf carries the tenant SAN plus the
+	// per-agent SAN (the single isolation policy, issue #9). seedEnrollTenant
+	// provisions agent "agent-<tenant>".
+	if len(leaf.URIs) != 2 ||
+		leaf.URIs[0].String() != "spiffe://test.example/tenant/acme" ||
+		leaf.URIs[1].String() != "spiffe://test.example/agent/agent-acme" {
 		t.Fatalf("leaf URI SANs = %v", leaf.URIs)
 	}
 	if got := leaf.NotAfter.UTC().Format(time.RFC3339); body.ExpiresAt != got {
@@ -84,13 +89,7 @@ func TestAgentEnrollReturnsAllocation(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	q := sqlcdb.New(pool)
 	_, userID := seedEnrollTenant(t, q, "acme", "active", false)
-	allocation, err := q.InsertAllocation(context.Background(), sqlcdb.InsertAllocationParams{
-		UserID:    userID,
-		SizeBytes: 5 * 1024 * 1024 * 1024,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	allocation := seedAgentAllocation(t, q, userID, "acme", "agent-acme-alloc")
 	token := "allocation-token"
 	if _, err := q.CreateAccessToken(context.Background(), sqlcdb.CreateAccessTokenParams{
 		TokenHash:    sha256Hex(token),
@@ -122,6 +121,135 @@ func TestAgentEnrollReturnsAllocation(t *testing.T) {
 	}
 	if body.SizeBytes != allocation.SizeBytes {
 		t.Fatalf("size_bytes = %d, want %d", body.SizeBytes, allocation.SizeBytes)
+	}
+}
+
+// TestAgentEnrollTokenSingleUse covers issue #6: a per-pod agent-enroll token
+// mints exactly one cert. The first /agent/enroll succeeds; replaying the same
+// token is rejected because it was consumed on first use.
+func TestAgentEnrollTokenSingleUse(t *testing.T) {
+	pool := httpOpenTestPool(t)
+	q := sqlcdb.New(pool)
+	ctx := context.Background()
+	_, userID := seedEnrollTenant(t, q, "acme", "active", false)
+
+	alloc := seedAgentAllocation(t, q, userID, "acme", "agent-acme-enroll")
+	const token = "single-use-enroll-token"
+	if _, err := q.CreateAccessToken(ctx, sqlcdb.CreateAccessTokenParams{
+		TokenHash:    sha256Hex(token),
+		Purpose:      devauth.PurposeAgentEnroll,
+		UserID:       userID,
+		TenantID:     "acme",
+		ExpiresAt:    pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+		AllocationID: alloc.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), nil)
+
+	first := postEnroll(t, srv.URL, token)
+	defer first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(first.Body)
+		t.Fatalf("first enroll status = %d, want 200; body = %s", first.StatusCode, b)
+	}
+
+	second := postEnroll(t, srv.URL, token)
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusUnauthorized {
+		b, _ := io.ReadAll(second.Body)
+		t.Fatalf("replayed enroll status = %d, want 401; body = %s", second.StatusCode, b)
+	}
+
+	row, err := q.GetAccessTokenByHash(ctx, sha256Hex(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.ConsumedAt.Valid {
+		t.Fatal("expected consumed_at to be set after first enroll")
+	}
+}
+
+// TestAgentEnrollDeviceTokenMultiUse guards the other side of issue #6: a
+// device-flow access token is a multi-use session, so enrolling with it must
+// NOT consume it. Only PurposeAgentEnroll tokens are single-use.
+func TestAgentEnrollDeviceTokenMultiUse(t *testing.T) {
+	pool := httpOpenTestPool(t)
+	q := sqlcdb.New(pool)
+	token, _ := seedEnrollTenant(t, q, "acme", "active", false) // PurposeDevice token
+	srv := startEnrollServer(t, pool, q, newEnrollCA(t, "acme"), nil)
+
+	for i := 1; i <= 2; i++ {
+		resp := postEnroll(t, srv.URL, token)
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			t.Fatalf("device-token enroll #%d status = %d, want 200; body = %s", i, resp.StatusCode, b)
+		}
+		resp.Body.Close()
+	}
+
+	row, err := q.GetAccessTokenByHash(context.Background(), sha256Hex(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ConsumedAt.Valid {
+		t.Fatal("device-flow token must not be consumed by /agent/enroll")
+	}
+}
+
+// TestAgentEnrollRejectsDisallowedTenant covers issue #8: an enroll whose tenant
+// is not permitted by the CA bootstrap policy is rejected with 403, not lazily
+// self-onboarded.
+func TestAgentEnrollRejectsDisallowedTenant(t *testing.T) {
+	pool := httpOpenTestPool(t)
+	q := sqlcdb.New(pool)
+	seedEnrollTenant(t, q, "evilcorp", "active", false) // exists in DB, not pre-bootstrapped
+
+	denyAll := newEnrollCAWithPolicy(t, func(string) bool { return false })
+	srv := startEnrollServer(t, pool, q, denyAll, nil)
+
+	resp := postEnroll(t, srv.URL, "test-token-evilcorp")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 403; body = %s", resp.StatusCode, b)
+	}
+	var body struct {
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error != "access_denied" || body.ErrorDescription != "tenant_not_allowed" {
+		t.Fatalf("body = %+v, want access_denied / tenant_not_allowed", body)
+	}
+	if denyAll.HasTenant("evilcorp") {
+		t.Fatal("disallowed tenant must not have been bootstrapped")
+	}
+}
+
+// TestAgentEnrollAllowsDynamicTenant confirms the #8 gate does NOT break the
+// legitimate server-derived dynamic (u_/a_) tenant flow under the default policy.
+func TestAgentEnrollAllowsDynamicTenant(t *testing.T) {
+	pool := httpOpenTestPool(t)
+	q := sqlcdb.New(pool)
+	seedEnrollTenant(t, q, "u_owner123", "active", false) // dynamic per-user tenant
+
+	policy := buildCATenantPolicy(config{CAAllowDynamicTenants: true})
+	caDyn := newEnrollCAWithPolicy(t, policy)
+	srv := startEnrollServer(t, pool, q, caDyn, nil)
+
+	resp := postEnroll(t, srv.URL, "test-token-u_owner123")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, b)
+	}
+	if !caDyn.HasTenant("u_owner123") {
+		t.Fatal("dynamic tenant should have been lazily bootstrapped")
 	}
 }
 
@@ -246,17 +374,39 @@ func seedEnrollTenant(t *testing.T, q *sqlcdb.Queries, tenantID, serverStatus st
 			t.Fatal(err)
 		}
 	}
+	// Every cert is bound to a specific agent via a SPIFFE /agent/<id> SAN, so an
+	// enroll without a provisioned agent disk gets no cert (the single isolation
+	// policy in agent_enroll_handlers.go). Seed an agent-scoped allocation and
+	// point the token at it so the happy paths actually mint.
+	alloc := seedAgentAllocation(t, q, user.ID, tenantID, "agent-"+tenantID)
 	token := "test-token-" + tenantID
 	if _, err := q.CreateAccessToken(ctx, sqlcdb.CreateAccessTokenParams{
-		TokenHash: sha256Hex(token),
-		Purpose:   devauth.PurposeDevice,
-		UserID:    user.ID,
-		TenantID:  tenantID,
-		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+		TokenHash:    sha256Hex(token),
+		Purpose:      devauth.PurposeDevice,
+		UserID:       user.ID,
+		TenantID:     tenantID,
+		ExpiresAt:    pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+		AllocationID: alloc.ID,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	return token, user.ID
+}
+
+// seedAgentAllocation provisions an agent-scoped disk allocation (agent_id set),
+// the shape the enroll handler requires before it will mint a per-agent cert.
+func seedAgentAllocation(t *testing.T, q *sqlcdb.Queries, userID pgtype.UUID, tenantID, agentID string) sqlcdb.DiskAllocation {
+	t.Helper()
+	alloc, err := q.UpsertAgentAllocation(context.Background(), sqlcdb.UpsertAgentAllocationParams{
+		UserID:    userID,
+		AgentID:   pgtype.Text{String: agentID, Valid: true},
+		TenantID:  pgtype.Text{String: tenantID, Valid: true},
+		SizeBytes: 5 * 1024 * 1024 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return alloc
 }
 
 func newEnrollCA(t *testing.T, tenants ...string) *ca.CA {
@@ -272,6 +422,22 @@ func newEnrollCA(t *testing.T, tenants ...string) *ca.CA {
 		if err := c.BootstrapTenant(context.Background(), tenant); err != nil {
 			t.Fatal(err)
 		}
+	}
+	return c
+}
+
+// newEnrollCAWithPolicy builds a CA whose lazy-bootstrap is gated by allow
+// (issue #8). No tenants are pre-bootstrapped, so the policy governs whether an
+// enroll's tenant gets an intermediate.
+func newEnrollCAWithPolicy(t *testing.T, allow func(string) bool) *ca.CA {
+	t.Helper()
+	c, err := ca.LoadOrInit(context.Background(), secrets.NewMemory(), ca.Env{
+		TrustDomain:    "test.example",
+		OrgName:        "Test",
+		AllowBootstrap: allow,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	return c
 }
@@ -388,10 +554,12 @@ func TestEnrollPlacesTenantWhenServerVMMissing(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Allocation for the user.
+	// Agent-scoped allocation for the user (agent_id set so the enroll mints).
 	const allocSize = int64(2 * (1 << 30))
-	alloc, err := q.InsertAllocation(ctx, sqlcdb.InsertAllocationParams{
+	alloc, err := q.UpsertAgentAllocation(ctx, sqlcdb.UpsertAgentAllocationParams{
 		UserID:    user.ID,
+		AgentID:   pgtype.Text{String: "agent-" + tenantID, Valid: true},
+		TenantID:  pgtype.Text{String: tenantID, Valid: true},
 		SizeBytes: allocSize,
 	})
 	if err != nil {

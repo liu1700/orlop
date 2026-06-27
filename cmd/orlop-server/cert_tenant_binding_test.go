@@ -34,24 +34,27 @@ func TestTenantBindingRejectsForgedCrossTenantSAN(t *testing.T) {
 	}
 }
 
-func TestTenantBindingFailsOpenOnUnexpectedChain(t *testing.T) {
-	// No intermediate (leaf only): the gate is skipped, not a hard reject, so an
-	// unusual-but-valid setup is never broken by this defense-in-depth check.
+func TestTenantBindingFailsClosedOnUnexpectedChain(t *testing.T) {
+	// No intermediate (leaf only): a legitimate agent leaf is always presented
+	// with its tenant intermediate (the server's ClientCAs is the org root
+	// alone, so the handshake cannot verify without it). A chain with no
+	// intermediate is therefore an attack or misconfiguration — reject it.
 	leafOnly := [][]*x509.Certificate{{&x509.Certificate{Subject: pkix.Name{CommonName: "x"}}}}
-	if !checkTenantBinding(discardLogger(), "a_demo", leafOnly) {
-		t.Fatal("a chain with no intermediate should fail open (allow)")
+	if checkTenantBinding(discardLogger(), "a_demo", leafOnly) {
+		t.Fatal("a chain with no intermediate must fail closed (reject)")
 	}
-	if !checkTenantBinding(discardLogger(), "a_demo", nil) {
-		t.Fatal("a nil chain should fail open (allow)")
+	if checkTenantBinding(discardLogger(), "a_demo", nil) {
+		t.Fatal("a nil chain must fail closed (reject)")
 	}
 
-	// Intermediate present but without a tenant OU: also fail open.
+	// Intermediate present but without a tenant OU: every real intermediate
+	// carries OU "tenant=<id>", so a missing OU is not a legitimate chain — reject.
 	noOU := [][]*x509.Certificate{{
 		&x509.Certificate{Subject: pkix.Name{CommonName: "leaf"}, Issuer: pkix.Name{CommonName: "int"}},
 		&x509.Certificate{Subject: pkix.Name{CommonName: "int"}},
 	}}
-	if !checkTenantBinding(discardLogger(), "a_demo", noOU) {
-		t.Fatal("an intermediate without a tenant OU should fail open (allow)")
+	if checkTenantBinding(discardLogger(), "a_demo", noOU) {
+		t.Fatal("an intermediate without a tenant OU must fail closed (reject)")
 	}
 }
 

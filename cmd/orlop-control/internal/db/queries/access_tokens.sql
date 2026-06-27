@@ -12,6 +12,7 @@ SELECT
     t.tenant_id,
     t.expires_at,
     t.revoked_at,
+    t.consumed_at,
     t.created_at,
     t.allocation_id,
     u.suspended_at AS user_suspended_at,
@@ -23,3 +24,17 @@ WHERE t.token_hash = $1;
 
 -- name: RevokeAccessToken :exec
 UPDATE access_tokens SET revoked_at = now() WHERE token_hash = $1;
+
+-- name: ConsumeAgentEnrollToken :one
+-- Atomically spend a single-use agent-enroll token (issue #6). Matches only an
+-- un-consumed 'agent_enroll' row; a replay or a lost concurrent race matches
+-- zero rows and returns pgx.ErrNoRows, which the caller treats as "already
+-- spent" and rejects. The purpose filter keeps device/admin/api multi-use
+-- sessions out — they are never consumed here even when presented on the
+-- enroll route. The literal mirrors devauth.PurposeAgentEnroll.
+UPDATE access_tokens
+SET consumed_at = now()
+WHERE token_hash = $1
+  AND purpose = 'agent_enroll'
+  AND consumed_at IS NULL
+RETURNING id;
