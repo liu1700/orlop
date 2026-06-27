@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "orlop"
-version = "1.0.0-rc.17"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 

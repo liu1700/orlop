@@ -61,7 +61,7 @@ orlop doctor            # confirms this host can mount
 ```
 
 Override the target dir with `ORLOP_BIN_DIR`, or pin a release with
-`ORLOP_VERSION=v1.0.0-rc.18`. If the install dir isn't on your `PATH`, the
+`ORLOP_VERSION=v0.2.0`. If the install dir isn't on your `PATH`, the
 script prints the line to add.
 
 <details>
