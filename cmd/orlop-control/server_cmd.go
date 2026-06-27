@@ -11,7 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 // defaultServerTotalBytes is the capacity a standalone `server register` claims
@@ -82,12 +83,12 @@ func runServerRegister(ctx context.Context, out io.Writer, args []string) error 
 		return fmt.Errorf("open pgxpool: %w", err)
 	}
 	defer pool.Close()
-	q := sqlcdb.New(pool)
+	store := postgres.New(pool)
 
 	// Fresh registration starts fully free; re-registering resets free_bytes to
 	// total, which is correct for a single-node demo (no concurrent reservations
 	// to preserve). A multi-node operator would manage capacity out of band.
-	row, err := q.UpsertServerPool(ctx, sqlcdb.UpsertServerPoolParams{
+	row, err := store.RegisterServerPool(ctx, storage.ServerPool{
 		DataAddr:   *dataAddr,
 		OpsAddr:    *opsAddr,
 		TotalBytes: *totalBytes,

@@ -10,11 +10,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
@@ -82,8 +82,8 @@ func runTokenIssue(ctx context.Context, out io.Writer, args []string) error {
 		*size = defaultGrantBytes
 	}
 
-	var ownerUUID pgtype.UUID
-	if err := ownerUUID.Scan(*ownerID); err != nil {
+	ownerUUID, err := uuid.Parse(*ownerID)
+	if err != nil {
 		return fmt.Errorf("--owner must be a uuid: %w", err)
 	}
 
@@ -92,17 +92,17 @@ func runTokenIssue(ctx context.Context, out io.Writer, args []string) error {
 		return fmt.Errorf("open pgxpool: %w", err)
 	}
 	defer pool.Close()
-	q := sqlcdb.New(pool)
+	store := postgres.New(pool)
 
 	// Provision the agent's disk the same way the service-to-service entity API
 	// does (handleProvision), so the enroll token references a real allocation:
 	// owner tenant -> owner user -> per-agent tenant -> agent allocation. Every
 	// step is idempotent, so re-issuing for the same agent just reuses the rows.
 	ownerTenant := tenantIDForOwner(*ownerID)
-	if err := q.EnsureTenant(ctx, sqlcdb.EnsureTenantParams{ID: ownerTenant, Name: ownerTenant}); err != nil {
+	if err := store.EnsureTenant(ctx, ownerTenant, ownerTenant); err != nil {
 		return fmt.Errorf("ensure owner tenant: %w", err)
 	}
-	if err := q.EnsureUserWithID(ctx, sqlcdb.EnsureUserWithIDParams{
+	if err := store.EnsureUserWithID(ctx, storage.NewUser{
 		ID:       ownerUUID,
 		TenantID: ownerTenant,
 		Email:    syntheticUserEmail(*ownerID),
@@ -110,13 +110,13 @@ func runTokenIssue(ctx context.Context, out io.Writer, args []string) error {
 		return fmt.Errorf("ensure owner user: %w", err)
 	}
 	agentTenant := tenantForAgent(*agentID)
-	if err := q.EnsureTenant(ctx, sqlcdb.EnsureTenantParams{ID: agentTenant, Name: agentTenant}); err != nil {
+	if err := store.EnsureTenant(ctx, agentTenant, agentTenant); err != nil {
 		return fmt.Errorf("ensure agent tenant: %w", err)
 	}
-	alloc, err := q.UpsertAgentAllocation(ctx, sqlcdb.UpsertAgentAllocationParams{
+	alloc, err := store.UpsertAgentAllocation(ctx, storage.NewAgentAllocation{
 		UserID:    ownerUUID,
-		AgentID:   pgtype.Text{String: *agentID, Valid: true},
-		TenantID:  pgtype.Text{String: agentTenant, Valid: true},
+		AgentID:   *agentID,
+		TenantID:  agentTenant,
 		SizeBytes: *size,
 	})
 	if err != nil {
@@ -125,8 +125,8 @@ func runTokenIssue(ctx context.Context, out io.Writer, args []string) error {
 
 	// Scope the token (and the cert it's traded for) to the agent's own tenant,
 	// matching handleEnrollToken so /agent/enroll mints the per-agent SAN.
-	svc := devauth.NewService(postgres.New(pool), nil)
-	token, expiresAt, err := svc.IssueAgentEnrollToken(ctx, ownerUUID, agentTenant, alloc.ID)
+	svc := devauth.NewService(store, nil)
+	token, expiresAt, err := svc.IssueAgentEnrollToken(ctx, fromUUID(ownerUUID), agentTenant, fromUUID(alloc.ID))
 	if err != nil {
 		return fmt.Errorf("mint enroll token: %w", err)
 	}
@@ -142,7 +142,7 @@ func runTokenIssue(ctx context.Context, out io.Writer, args []string) error {
 			Token:        token,
 			ExpiresAt:    expiresAt.UTC().Format(time.RFC3339),
 			AgentID:      *agentID,
-			AllocationID: uuidString(alloc.ID),
+			AllocationID: alloc.ID.String(),
 			ControlPlane: *controlPlane,
 		})
 	}
@@ -150,7 +150,7 @@ func runTokenIssue(ctx context.Context, out io.Writer, args []string) error {
 	fmt.Fprintf(out, "enroll token:  %s\n", token)
 	fmt.Fprintf(out, "expires at:    %s\n", expiresAt.Format("2006-01-02 15:04:05 MST"))
 	fmt.Fprintf(out, "agent id:      %s\n", *agentID)
-	fmt.Fprintf(out, "allocation:    %s\n", uuidString(alloc.ID))
+	fmt.Fprintf(out, "allocation:    %s\n", alloc.ID.String())
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "mount it with:")
 	fmt.Fprintf(out, "  export ORLOP_AGENT_ID=%s\n", *agentID)
