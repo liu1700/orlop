@@ -10,9 +10,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 type fakeRevPusher struct {
@@ -31,7 +32,9 @@ func (f *fakeRevPusher) PushCertRevocations(_ context.Context, opsAddr string, r
 }
 
 // TestCertRevocationReconcilePushesActiveSet covers issue #5's convergence loop:
-// the active deny-list is pushed to each server that hosts a placed tenant.
+// the active deny-list is pushed to each server that hosts a placed tenant. The
+// reconciler is driven through the Postgres storage adapter; rows are seeded
+// with raw sqlc (those subdomains aren't migrated to storage yet).
 func TestCertRevocationReconcilePushesActiveSet(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	q := sqlcdb.New(pool)
@@ -80,7 +83,7 @@ func TestCertRevocationReconcilePushesActiveSet(t *testing.T) {
 	}
 
 	fake := &fakeRevPusher{}
-	rc := newCertRevocationReconciler(q, fake, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rc := newCertRevocationReconciler(postgres.New(pool), fake, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	rc.reconcileOnce(ctx)
 
 	revs, ok := fake.byOps[opsAddr]
@@ -92,31 +95,28 @@ func TestCertRevocationReconcilePushesActiveSet(t *testing.T) {
 	}
 }
 
-// fakeReconcileStore implements just the two db.Store methods the reconciler
-// uses; the embedded interface satisfies the rest (and panics if anything else
-// is called). This is the payoff of depending on db.Store rather than the
-// concrete *sqlcdb.Queries (issue #4): the reconciler is testable with no DB.
-type fakeReconcileStore struct {
-	db.Store
-	revs  []sqlcdb.ListActiveCertRevocationsRow
+// fakeRevStore implements storage.RevocationStore with no database — three
+// methods, the whole surface the reconciler needs. (Contrast with the old
+// db.Store, whose 84 methods a fake had to embed.)
+type fakeRevStore struct {
+	revs  []storage.CertRevocation
 	addrs []string
 }
 
-func (f fakeReconcileStore) ListActiveCertRevocations(context.Context) ([]sqlcdb.ListActiveCertRevocationsRow, error) {
+func (f fakeRevStore) AddCertRevocation(context.Context, storage.CertRevocation) error { return nil }
+func (f fakeRevStore) ListActiveCertRevocations(context.Context) ([]storage.CertRevocation, error) {
 	return f.revs, nil
 }
-
-func (f fakeReconcileStore) ListActiveServerOpsAddrs(context.Context) ([]string, error) {
+func (f fakeRevStore) ListActiveServerOpsAddrs(context.Context) ([]string, error) {
 	return f.addrs, nil
 }
 
 // TestCertRevocationReconcileWithFakeStore exercises the reconciler against a
-// mock db.Store — no Postgres required — proving the interface decoupling.
+// mock storage.RevocationStore — no Postgres required — showing the payoff of
+// the narrow domain interface.
 func TestCertRevocationReconcileWithFakeStore(t *testing.T) {
-	store := fakeReconcileStore{
-		revs: []sqlcdb.ListActiveCertRevocationsRow{
-			{CertSerial: "AABBCC", ExpiresAt: pgtype.Timestamptz{Time: time.Unix(1_900_000_000, 0), Valid: true}},
-		},
+	store := fakeRevStore{
+		revs:  []storage.CertRevocation{{Serial: "AABBCC", ExpiresAt: time.Unix(1_900_000_000, 0)}},
 		addrs: []string{"ops-1.example.com", "ops-2.example.com"},
 	}
 	fake := &fakeRevPusher{}
