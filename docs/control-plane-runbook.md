@@ -215,10 +215,10 @@ knows which FQDN to return. There is not yet a public CLI for this row, so use
 SQL during the MVP:
 
 ```sql
-INSERT INTO server_vms (tenant_id, fqdn, status, provisioned_at)
+INSERT INTO server_vms (tenant_id, data_addr, status, provisioned_at)
 VALUES ('acme', 'tenant-acme.orlop.example', 'active', now())
 ON CONFLICT (tenant_id)
-DO UPDATE SET fqdn = EXCLUDED.fqdn,
+DO UPDATE SET data_addr = EXCLUDED.data_addr,
               status = 'active',
               provisioned_at = now();
 ```

@@ -32,8 +32,8 @@ Service environment:
 | `ORLOP_IDENTITY_ISSUER` | Optional; when set, required to equal the JWT `iss`. |
 | `ORLOP_IDENTITY_TENANT_CLAIM` | Claim mapped onto the tenant subject. Default `tenant`. |
 | `ORLOP_IDENTITY_TENANT_ALLOWLIST` | Comma-separated fail-closed allowlist of tenant ids that may be provisioned. Required when audience is set. |
-| `ORLOP_CA_TENANT_ALLOWLIST` | Comma-separated tenant ids that may have a CA intermediate lazily bootstrapped at first enroll, on top of the dynamic prefixes below. Anything else is refused with 403 `tenant_not_allowed`. |
-| `ORLOP_CA_ALLOW_DYNAMIC_TENANTS` | Allow lazy bootstrap of server-derived per-user (`u_`) / per-agent (`a_`) tenants. Default `true`; set `false` to restrict bootstrap to `ORLOP_CA_TENANT_ALLOWLIST` only. |
+| `ORLOP_CA_TENANT_ALLOWLIST` | Comma-separated tenant ids that may have a CA intermediate lazily bootstrapped at first enroll, on top of the dynamic prefixes below. An unrecognized tenant's enroll is refused with HTTP 403 `{"error":"access_denied","error_description":"tenant_not_allowed"}`. |
+| `ORLOP_CA_ALLOW_DYNAMIC_TENANTS` | Allow lazy bootstrap of server-derived per-user (`u_`) / per-agent (`a_`) tenants. Default `true`; set `false` to restrict bootstrap to `ORLOP_CA_TENANT_ALLOWLIST` only. Accepts `true/false/1/0/yes/no/on/off` (case-insensitive); unset uses the default, but a **set-but-unrecognized value fails boot** (a typo on a security toggle must not silently fall back). |
 
 ## Host identity (Mode B)
 
@@ -210,10 +210,10 @@ orlop-control user seed \
 For manual testing without enrollment, you can seed a server VM row ahead of time:
 
 ```sql
-INSERT INTO server_vms (tenant_id, fqdn, status, provisioned_at)
+INSERT INTO server_vms (tenant_id, data_addr, status, provisioned_at)
 VALUES ('acme', 'tenant-acme.localhost', 'active', now())
 ON CONFLICT (tenant_id)
-DO UPDATE SET fqdn = EXCLUDED.fqdn,
+DO UPDATE SET data_addr = EXCLUDED.data_addr,
               status = 'active',
               provisioned_at = now();
 ```
@@ -225,6 +225,7 @@ orlop login --control-plane http://127.0.0.1:8080
 ```
 
 For full-stack mTLS testing, you need an `orlop-server` certificate whose
-name matches a `server_vms.fqdn` value and whose `tls.client_ca_file` points
-to the tenant intermediate cert. (Server VM rows are created lazily on agent
+name matches a `server_vms.data_addr` value and whose `tls.client_ca_file`
+points to the org root (the shared client CA — the agent presents its tenant
+intermediate in the chain). (Server VM rows are created lazily on agent
 enrollment; use the SQL above if pre-seeding is preferred.)
