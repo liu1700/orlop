@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
 
 // certRevocationReconcileInterval bounds the cold-start / convergence window:
@@ -22,20 +22,20 @@ type certRevocationPusher interface {
 
 // certRevocationReconciler periodically fans the active serial deny-list out to
 // every data-plane server (issue #5). This is the convergence half of the kill
-// switch: lease release records a revocation in Postgres (durable), and this
+// switch: lease release records a revocation in storage (durable), and this
 // loop pushes the active set to the in-memory registries on the servers,
 // repopulating any that restarted. Best-effort per server — a push failure is
 // logged and retried on the next tick.
 type certRevocationReconciler struct {
-	q        db.Store
+	store    storage.RevocationStore
 	pusher   certRevocationPusher
 	logger   *slog.Logger
 	interval time.Duration
 }
 
-func newCertRevocationReconciler(q db.Store, pusher certRevocationPusher, logger *slog.Logger) *certRevocationReconciler {
+func newCertRevocationReconciler(store storage.RevocationStore, pusher certRevocationPusher, logger *slog.Logger) *certRevocationReconciler {
 	return &certRevocationReconciler{
-		q:        q,
+		store:    store,
 		pusher:   pusher,
 		logger:   logger,
 		interval: certRevocationReconcileInterval,
@@ -58,7 +58,7 @@ func (rc *certRevocationReconciler) Run(ctx context.Context) {
 }
 
 func (rc *certRevocationReconciler) reconcileOnce(ctx context.Context) {
-	revs, err := rc.q.ListActiveCertRevocations(ctx)
+	revs, err := rc.store.ListActiveCertRevocations(ctx)
 	if err != nil {
 		rc.logger.Warn("cert_revocation_reconcile_list_failed", "error", err)
 		return
@@ -69,11 +69,11 @@ func (rc *certRevocationReconciler) reconcileOnce(ctx context.Context) {
 	payload := make([]serverapi.CertRevocation, 0, len(revs))
 	for _, r := range revs {
 		payload = append(payload, serverapi.CertRevocation{
-			Serial:    r.CertSerial,
-			ExpiresAt: r.ExpiresAt.Time,
+			Serial:    r.Serial,
+			ExpiresAt: r.ExpiresAt,
 		})
 	}
-	addrs, err := rc.q.ListActiveServerOpsAddrs(ctx)
+	addrs, err := rc.store.ListActiveServerOpsAddrs(ctx)
 	if err != nil {
 		rc.logger.Warn("cert_revocation_reconcile_servers_failed", "error", err)
 		return

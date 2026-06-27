@@ -27,6 +27,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/identity"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/secrets"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -396,7 +397,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 				queries: deps.queries,
 			}
 			deps.agentPurger = serverapiAgentPurger{client: adminClient}
-			deps.certRevReconcile = newCertRevocationReconciler(deps.queries, adminClient, logger)
+			deps.certRevReconcile = newCertRevocationReconciler(postgres.New(pool), adminClient, logger)
 		}
 	}
 
