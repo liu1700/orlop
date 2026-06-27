@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/liu1700/orlop/internal/buildinfo"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -23,6 +25,7 @@ const shutdownTimeout = 10 * time.Second
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
+	showVersion := flag.Bool("version", false, "print version and exit")
 	configPath := flag.String("config", "", "path to YAML config")
 	migrateChunks := flag.Bool("migrate-to-chunks", false,
 		"migrate every tenant's flat-file storage to content-addressed chunks (issue #76)")
@@ -31,6 +34,10 @@ func main() {
 	seedTenant := flag.String("seed-tenant", "", "tenant id for --seed")
 	seedPath := flag.String("seed-virtual-path", "", "virtual path for --seed (e.g. /docs/profile.json)")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("orlop-server", buildinfo.Version())
+		return
+	}
 	if *configPath == "" {
 		logger.Error("missing -config flag")
 		os.Exit(1)

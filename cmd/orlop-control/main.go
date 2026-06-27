@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,6 +19,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/liu1700/orlop/internal/buildinfo"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
@@ -234,40 +237,101 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+// cliAction is the top-level decision derived from the process arguments.
+type cliAction int
+
+const (
+	actionRunServer  cliAction = iota // no args: start the control-plane server
+	actionVersion                     // print version and exit
+	actionHelp                        // print usage and exit
+	actionSubcommand                  // dispatch to a known subcommand
+	actionUnknown                     // unrecognized command/flag: error out
+)
+
+// knownSubcommands are the verbs dispatched by runSubcommand.
+var knownSubcommands = map[string]struct{}{
+	"ca": {}, "migrate": {}, "user": {}, "token": {}, "server": {},
+}
+
+// classifyArgs decides what the process should do from its arguments
+// (os.Args[1:]). With no arguments orlop-control starts the control-plane HTTP
+// server — the documented `PORT=8080 orlop-control` form. Any other first
+// argument must be a recognized subcommand or a version/help request; anything
+// else is rejected. This is the guard for the footgun where an unknown flag or
+// typo (e.g. `orlop-control --version`) used to fall through and silently boot
+// a control plane on :8080.
+func classifyArgs(args []string) (cliAction, string) {
+	if len(args) == 0 {
+		return actionRunServer, ""
+	}
+	switch args[0] {
+	case "version", "-version", "--version", "-v":
+		return actionVersion, ""
+	case "help", "-help", "--help", "-h":
+		return actionHelp, ""
+	}
+	if _, ok := knownSubcommands[args[0]]; ok {
+		return actionSubcommand, args[0]
+	}
+	return actionUnknown, args[0]
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprint(w, `orlop-control — Orlop control plane
+
+Usage:
+  orlop-control                start the control-plane server (configured via env: PORT, DATABASE_URL, ORLOP_*)
+  orlop-control server ...     manage the data-plane server pool (e.g. "server register")
+  orlop-control token ...      mint and manage enroll / API tokens
+  orlop-control user ...       manage users
+  orlop-control ca ...         certificate-authority operations
+  orlop-control migrate ...    run database migrations
+  orlop-control version        print the version and exit
+  orlop-control help           show this help
+
+Run any subcommand with -h for its own flags.
+`)
+}
+
+// runSubcommand dispatches a recognized verb, mirroring the original
+// per-subcommand error/exit handling.
+func runSubcommand(name string) {
+	var err error
+	switch name {
+	case "ca":
+		err = runCA(context.Background(), os.Stdout, os.Args[2:])
+	case "migrate":
+		err = runMigrate(context.Background(), os.Stdout, os.Args[2:])
+	case "user":
+		err = runUser(context.Background(), os.Stdout, os.Args[2:])
+	case "token":
+		err = runToken(context.Background(), os.Stdout, os.Args[2:])
+	case "server":
+		err = runServer(context.Background(), os.Stdout, os.Args[2:])
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "orlop-control %s: %v\n", name, err)
+		os.Exit(1)
+	}
+}
+
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "ca":
-			if err := runCA(context.Background(), os.Stdout, os.Args[2:]); err != nil {
-				fmt.Fprintln(os.Stderr, "orlop-control ca:", err)
-				os.Exit(1)
-			}
-			return
-		case "migrate":
-			if err := runMigrate(context.Background(), os.Stdout, os.Args[2:]); err != nil {
-				fmt.Fprintln(os.Stderr, "orlop-control migrate:", err)
-				os.Exit(1)
-			}
-			return
-		case "user":
-			if err := runUser(context.Background(), os.Stdout, os.Args[2:]); err != nil {
-				fmt.Fprintln(os.Stderr, "orlop-control user:", err)
-				os.Exit(1)
-			}
-			return
-		case "token":
-			if err := runToken(context.Background(), os.Stdout, os.Args[2:]); err != nil {
-				fmt.Fprintln(os.Stderr, "orlop-control token:", err)
-				os.Exit(1)
-			}
-			return
-		case "server":
-			if err := runServer(context.Background(), os.Stdout, os.Args[2:]); err != nil {
-				fmt.Fprintln(os.Stderr, "orlop-control server:", err)
-				os.Exit(1)
-			}
-			return
-		}
+	switch action, name := classifyArgs(os.Args[1:]); action {
+	case actionVersion:
+		fmt.Println("orlop-control", buildinfo.Version())
+		return
+	case actionHelp:
+		printUsage(os.Stdout)
+		return
+	case actionUnknown:
+		fmt.Fprintf(os.Stderr, "orlop-control: unknown command or flag %q\n\n", name)
+		printUsage(os.Stderr)
+		os.Exit(2)
+	case actionSubcommand:
+		runSubcommand(name)
+		return
+	case actionRunServer:
+		// no args — start the control plane below
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
