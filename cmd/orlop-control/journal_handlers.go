@@ -10,7 +10,6 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 )
 
@@ -87,12 +86,11 @@ type journalResponseJSON struct {
 type journalHandlers struct {
 	devAuth *devauth.Service
 	alloc   *allocations.Service
-	queries db.Store
 	querier journalQuerier
 }
 
-func newJournalHandlers(svc *devauth.Service, alloc *allocations.Service, queries db.Store, q journalQuerier) *journalHandlers {
-	return &journalHandlers{devAuth: svc, alloc: alloc, queries: queries, querier: q}
+func newJournalHandlers(svc *devauth.Service, alloc *allocations.Service, q journalQuerier) *journalHandlers {
+	return &journalHandlers{devAuth: svc, alloc: alloc, querier: q}
 }
 
 // mountJournal registers routes on both bare and /api-prefixed paths,

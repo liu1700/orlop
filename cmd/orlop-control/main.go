@@ -392,7 +392,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 			deps.serverResize = adminClient
 			deps.journalQuerier = &serverapiJournalAdapter{
 				client:  adminClient,
-				queries: deps.queries,
+				queries: deps.store,
 			}
 			deps.mountLeaseFencer = &serverapiMountLeaseFencer{
 				client:  adminClient,
@@ -493,7 +493,7 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 			newControlTenantUsageHandlers(logger, deps.store, deps.serverUsage))
 	}
 	if deps.devAuth != nil && deps.allocations != nil && deps.queries != nil && deps.journalQuerier != nil {
-		mountJournal(router, newJournalHandlers(deps.devAuth, deps.allocations, deps.queries, deps.journalQuerier))
+		mountJournal(router, newJournalHandlers(deps.devAuth, deps.allocations, deps.journalQuerier))
 	}
 	if deps.devAuth != nil && deps.queries != nil && deps.agentCA != nil {
 		mountAgentEnroll(router, RequireEnrollBearer(deps.devAuth, deps.store), newAgentEnrollHandlers(logger, deps.store, deps.devAuth, deps.agentCA, deps.enrollLimit, deps.allocations, deps.serverAdmin))
@@ -567,10 +567,7 @@ func healthz(w http.ResponseWriter, r *http.Request) {
 // handleAllocationUsage) so the adapter carries no per-tenant state.
 type serverapiJournalAdapter struct {
 	client  *serverapi.Client
-	queries interface {
-		GetServerVMByTenant(ctx context.Context, tenantID string) (sqlcdb.ServerVm, error)
-		GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (sqlcdb.ServerPool, error)
-	}
+	queries tenantPlacementQuerier
 }
 
 func (a *serverapiJournalAdapter) QueryJournal(
@@ -696,22 +693,12 @@ func (a *serverapiJournalAdapter) RevertPath(
 	return out, nil
 }
 
-// opsAddrFor resolves a tenant's orlop-server ops address. Returns ok=false
-// when the user has not yet provisioned an allocation (ErrNoRows on
-// server_vms) — the journal is empty by construction in that case.
+// opsAddrFor resolves a tenant's orlop-server ops address via the shared
+// placement walk (server_vms → server_pools). Returns ok=false when the user
+// has not yet provisioned an allocation (no server_vms row) — the journal is
+// empty by construction in that case.
 func (a *serverapiJournalAdapter) opsAddrFor(ctx context.Context, tenantID string) (string, bool, error) {
-	vm, err := a.queries.GetServerVMByTenant(ctx, tenantID)
-	if errors.Is(err, db.ErrNotFound) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("journal adapter: get server vm: %w", err)
-	}
-	pool, err := a.queries.GetServerPoolByDataAddr(ctx, vm.DataAddr)
-	if err != nil {
-		return "", false, fmt.Errorf("journal adapter: get server pool: %w", err)
-	}
-	return pool.OpsAddr, true, nil
+	return resolveTenantOpsAddr(ctx, a.queries, tenantID)
 }
 
 func fromServerJournalEntry(e serverapi.JournalEntry) journalEntryJSON {
