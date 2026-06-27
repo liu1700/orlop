@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 )
 
@@ -32,7 +32,7 @@ func agentVirtualPath(agentID string) string {
 	return "/mnt/orlop/agents/" + agentID
 }
 
-// entityQuerier is the slice of *sqlcdb.Queries that the entity handlers need.
+// entityQuerier is the slice of db.Store that the entity handlers need.
 // Declaring it as an interface lets the unit tests inject a stub without a live
 // database.
 type entityQuerier interface {
@@ -290,7 +290,7 @@ func (h *entityHandlers) handleResolve(w http.ResponseWriter, r *http.Request) {
 
 	row, err := h.queries.GetAllocationByAgent(r.Context(), pgtype.Text{String: agentID, Valid: true})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, db.ErrNotFound) {
 			writeOAuthError(w, http.StatusNotFound, "not_found", "")
 			return
 		}
@@ -339,7 +339,7 @@ func (h *entityHandlers) handleSetQuota(w http.ResponseWriter, r *http.Request) 
 	}
 	alloc, err := h.queries.GetAllocationByAgent(r.Context(), pgtype.Text{String: agentID, Valid: true})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, db.ErrNotFound) {
 			writeOAuthError(w, http.StatusNotFound, "not_found", "")
 			return
 		}
@@ -390,7 +390,7 @@ func (h *entityHandlers) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	alloc, err := h.queries.GetAllocationByAgent(r.Context(), pgtype.Text{String: agentID, Valid: true})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		w.WriteHeader(http.StatusNoContent) // idempotent: nothing to revoke
 		return
 	}
@@ -401,7 +401,7 @@ func (h *entityHandlers) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := h.queries.RevokeAllocation(r.Context(), sqlcdb.RevokeAllocationParams{
 		ID: alloc.ID, UserID: alloc.UserID,
-	}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	}); err != nil && !errors.Is(err, db.ErrNotFound) {
 		h.logger.Error("entity_delete_revoke_failed", "error", err, "agent_id", agentID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
@@ -442,7 +442,7 @@ func (h *entityHandlers) handleEnrollToken(w http.ResponseWriter, r *http.Reques
 
 	alloc, err := h.queries.GetAllocationByAgent(r.Context(), pgtype.Text{String: agentID, Valid: true})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, db.ErrNotFound) {
 			writeOAuthError(w, http.StatusNotFound, "not_found", "")
 			return
 		}
@@ -455,7 +455,7 @@ func (h *entityHandlers) handleEnrollToken(w http.ResponseWriter, r *http.Reques
 	// the cert it is traded for) must be scoped to.
 	user, err := h.queries.GetUser(r.Context(), alloc.UserID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, db.ErrNotFound) {
 			// An allocation always has a user; a missing one is an internal
 			// inconsistency, not a client error.
 			h.logger.Error("enroll_token_user_missing", "agent_id", agentID, "user_id", uuidString(alloc.UserID))
@@ -654,5 +654,5 @@ func RequireServiceToken(expected string) func(http.Handler) http.Handler {
 	}
 }
 
-// ensure *sqlcdb.Queries satisfies entityQuerier at compile time.
-var _ entityQuerier = (*sqlcdb.Queries)(nil)
+// ensure db.Store satisfies entityQuerier at compile time.
+var _ entityQuerier = (db.Store)(nil)

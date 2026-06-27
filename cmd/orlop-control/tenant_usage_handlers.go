@@ -8,20 +8,20 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 )
 
 // tenantPlacementQuerier resolves where a tenant's data plane lives (server_vms →
-// server_pools). *sqlcdb.Queries satisfies it; see [resolveTenantOpsAddr].
+// server_pools). db.Store satisfies it; see [resolveTenantOpsAddr].
 type tenantPlacementQuerier interface {
 	GetServerVMByTenant(ctx context.Context, tenantID string) (sqlcdb.ServerVm, error)
 	GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (sqlcdb.ServerPool, error)
 }
 
-// controlTenantUsageQuerier is the slice of *sqlcdb.Queries the per-user usage
+// controlTenantUsageQuerier is the slice of db.Store the per-user usage
 // route needs. An interface so the unit tests inject a stub without a live DB.
 type controlTenantUsageQuerier interface {
 	GetUser(ctx context.Context, id pgtype.UUID) (sqlcdb.User, error)
@@ -36,7 +36,7 @@ type controlTenantUsageQuerier interface {
 // adapters walk; a future cleanup could converge those onto this helper.
 func resolveTenantOpsAddr(ctx context.Context, q tenantPlacementQuerier, tenantID string) (opsAddr string, placed bool, err error) {
 	vm, err := q.GetServerVMByTenant(ctx, tenantID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		return "", false, nil
 	}
 	if err != nil {
@@ -102,7 +102,7 @@ func (h *controlTenantUsageHandlers) handleTenantUsage(w http.ResponseWriter, r 
 
 	user, err := h.queries.GetUser(r.Context(), ownerID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, db.ErrNotFound) {
 			// Owner has never provisioned a disk → no dg user → zero usage.
 			writeJSON(w, http.StatusOK, zero)
 			return
@@ -153,5 +153,5 @@ func (h *controlTenantUsageHandlers) handleTenantUsage(w http.ResponseWriter, r 
 	writeJSON(w, http.StatusOK, tenantUsageDTO{OwnerID: uuidString(ownerID), UsedBytes: total})
 }
 
-// ensure *sqlcdb.Queries satisfies controlTenantUsageQuerier at compile time.
-var _ controlTenantUsageQuerier = (*sqlcdb.Queries)(nil)
+// ensure db.Store satisfies controlTenantUsageQuerier at compile time.
+var _ controlTenantUsageQuerier = (db.Store)(nil)

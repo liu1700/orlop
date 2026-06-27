@@ -8,11 +8,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
 )
@@ -38,13 +37,13 @@ type mountLeaseFencer interface {
 type dashboardHandlers struct {
 	logger  *slog.Logger
 	devAuth *devauth.Service
-	queries *sqlcdb.Queries
+	queries db.Store
 	alloc   *allocations.Service
 	usage   tenantUsageClient // nil when the server admin client is not configured (no SecretsDir)
 	fencer  mountLeaseFencer  // nil when no serverapi client; revoke skips the fence call
 }
 
-func newDashboardHandlers(logger *slog.Logger, svc *devauth.Service, q *sqlcdb.Queries, alloc *allocations.Service, usage tenantUsageClient, fencer mountLeaseFencer) *dashboardHandlers {
+func newDashboardHandlers(logger *slog.Logger, svc *devauth.Service, q db.Store, alloc *allocations.Service, usage tenantUsageClient, fencer mountLeaseFencer) *dashboardHandlers {
 	return &dashboardHandlers{logger: logger, devAuth: svc, queries: q, alloc: alloc, usage: usage, fencer: fencer}
 }
 
@@ -266,7 +265,7 @@ func (h *dashboardHandlers) handleAllocationUsage(w http.ResponseWriter, r *http
 
 	vm, err := h.queries.GetServerVMByTenant(r.Context(), user.TenantID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, db.ErrNotFound) {
 			// Allocation exists but tenant has never been placed on a server
 			// (i.e. no `orlop mount` since allocation was created). Surface
 			// zero usage so the dashboard / CLI can render something sensible.

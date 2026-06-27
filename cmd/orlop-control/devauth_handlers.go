@@ -15,7 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/tokens"
 )
@@ -72,7 +72,7 @@ const apiTokenTouchInterval = 60 * time.Second
 //     revoked, or belongs to a suspended user or suspended tenant.
 //   - everything else: short-lived device-flow access token, validated
 //     by devauth.Service (existing OAuth path, unchanged).
-func RequireBearer(svc *devauth.Service, q *sqlcdb.Queries) func(http.Handler) http.Handler {
+func RequireBearer(svc *devauth.Service, q db.Store) func(http.Handler) http.Handler {
 	return requireBearer(q, svc.AuthenticateBearer)
 }
 
@@ -81,14 +81,14 @@ func RequireBearer(svc *devauth.Service, q *sqlcdb.Queries) func(http.Handler) h
 // agent-scoped enroll token (devauth.PurposeAgentEnroll, minted by
 // IssueAgentEnrollToken). The widened purpose set is confined to this
 // middleware so /agent/run and other RequireBearer surfaces stay device-only.
-func RequireEnrollBearer(svc *devauth.Service, q *sqlcdb.Queries) func(http.Handler) http.Handler {
+func RequireEnrollBearer(svc *devauth.Service, q db.Store) func(http.Handler) http.Handler {
 	return requireBearer(q, svc.AuthenticateEnrollBearer)
 }
 
 // requireBearer is the shared body for RequireBearer / RequireEnrollBearer.
 // authenticate validates the OAuth-style (non-"orlop_") token and resolves an
 // Identity; the API-token ("orlop_") shape is handled identically for both.
-func requireBearer(q *sqlcdb.Queries, authenticate func(context.Context, string) (devauth.Identity, error)) func(http.Handler) http.Handler {
+func requireBearer(q db.Store, authenticate func(context.Context, string) (devauth.Identity, error)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			raw := bearerToken(r.Header.Get("Authorization"))

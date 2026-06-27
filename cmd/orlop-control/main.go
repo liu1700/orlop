@@ -17,11 +17,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/identity"
@@ -278,7 +278,7 @@ func main() {
 type runtimeDeps struct {
 	devAuth          *devauth.Service
 	allocations      *allocations.Service
-	queries          *sqlcdb.Queries
+	queries          db.Store
 	agentCA          *ca.CA
 	enrollLimit      *agentEnrollLimiter
 	serverAdmin      allocations.ServerAdmin
@@ -687,7 +687,7 @@ func (a *serverapiJournalAdapter) RevertPath(
 // server_vms) — the journal is empty by construction in that case.
 func (a *serverapiJournalAdapter) opsAddrFor(ctx context.Context, tenantID string) (string, bool, error) {
 	vm, err := a.queries.GetServerVMByTenant(ctx, tenantID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		return "", false, nil
 	}
 	if err != nil {
@@ -730,7 +730,7 @@ type serverapiMountLeaseFencer struct {
 
 func (a *serverapiMountLeaseFencer) FenceAllocation(ctx context.Context, tenantID, allocationID string) error {
 	vm, err := a.queries.GetServerVMByTenant(ctx, tenantID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		// No server-pool placement for this tenant (single-node / no populated server_pool):
 		// there is no remote data-plane registry to clear, so fencing is a clean no-op rather
 		// than an error. The local dg-server's stale active-lease slot is instead taken over

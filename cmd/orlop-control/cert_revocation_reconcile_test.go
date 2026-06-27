@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
 )
@@ -88,6 +89,48 @@ func TestCertRevocationReconcilePushesActiveSet(t *testing.T) {
 	}
 	if len(revs) != 1 || revs[0].Serial != "AABBCC" {
 		t.Fatalf("pushed revocations = %+v, want only the active serial AABBCC", revs)
+	}
+}
+
+// fakeReconcileStore implements just the two db.Store methods the reconciler
+// uses; the embedded interface satisfies the rest (and panics if anything else
+// is called). This is the payoff of depending on db.Store rather than the
+// concrete *sqlcdb.Queries (issue #4): the reconciler is testable with no DB.
+type fakeReconcileStore struct {
+	db.Store
+	revs  []sqlcdb.ListActiveCertRevocationsRow
+	addrs []string
+}
+
+func (f fakeReconcileStore) ListActiveCertRevocations(context.Context) ([]sqlcdb.ListActiveCertRevocationsRow, error) {
+	return f.revs, nil
+}
+
+func (f fakeReconcileStore) ListActiveServerOpsAddrs(context.Context) ([]string, error) {
+	return f.addrs, nil
+}
+
+// TestCertRevocationReconcileWithFakeStore exercises the reconciler against a
+// mock db.Store — no Postgres required — proving the interface decoupling.
+func TestCertRevocationReconcileWithFakeStore(t *testing.T) {
+	store := fakeReconcileStore{
+		revs: []sqlcdb.ListActiveCertRevocationsRow{
+			{CertSerial: "AABBCC", ExpiresAt: pgtype.Timestamptz{Time: time.Unix(1_900_000_000, 0), Valid: true}},
+		},
+		addrs: []string{"ops-1.example.com", "ops-2.example.com"},
+	}
+	fake := &fakeRevPusher{}
+	rc := newCertRevocationReconciler(store, fake, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rc.reconcileOnce(context.Background())
+
+	if len(fake.byOps) != 2 {
+		t.Fatalf("pushed to %d servers, want 2 (%v)", len(fake.byOps), keysOf(fake.byOps))
+	}
+	for _, ops := range store.addrs {
+		revs := fake.byOps[ops]
+		if len(revs) != 1 || revs[0].Serial != "AABBCC" {
+			t.Fatalf("push to %s = %+v, want [AABBCC]", ops, revs)
+		}
 	}
 }
 
