@@ -16,6 +16,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 func testDatabaseURL() string { return os.Getenv("TEST_DATABASE_URL") }
@@ -91,7 +92,7 @@ func hashForTest(s string) string {
 
 func TestEndToEndDeviceFlowHappyPath(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -209,7 +210,7 @@ func TestEndToEndDeviceFlowHappyPath(t *testing.T) {
 
 func TestRefreshRotatesTokens(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	res := issueApprovedSession(t, pool, svc)
 	ctx := context.Background()
 
@@ -230,7 +231,7 @@ func TestRefreshRotatesTokens(t *testing.T) {
 
 func TestRefreshReuseRevokesFamily(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	res := issueApprovedSession(t, pool, svc)
 	ctx := context.Background()
 
@@ -248,7 +249,7 @@ func TestRefreshReuseRevokesFamily(t *testing.T) {
 
 func TestRefreshRejectsSuspendedUserAndTenant(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	res := issueApprovedSession(t, pool, svc)
 	ctx := context.Background()
 	q := sqlcdb.New(pool)
@@ -276,7 +277,7 @@ func TestRefreshRejectsSuspendedUserAndTenant(t *testing.T) {
 
 func TestSlowDownReturnedWhenPollingTooFast(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	_ = seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -298,7 +299,7 @@ func TestSlowDownReturnedWhenPollingTooFast(t *testing.T) {
 
 func TestExpiredCodeReturnsExpiredToken(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	_ = seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -321,7 +322,7 @@ func TestExpiredCodeReturnsExpiredToken(t *testing.T) {
 
 func TestUnknownDeviceCodeReturnsExpiredToken(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ctx := context.Background()
 	res, err := svc.Poll(ctx, "this-device-code-does-not-exist")
 	if err != nil {
@@ -334,7 +335,7 @@ func TestUnknownDeviceCodeReturnsExpiredToken(t *testing.T) {
 
 func TestDeniedCodeReturnsAccessDenied(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -356,7 +357,7 @@ func TestDeniedCodeReturnsAccessDenied(t *testing.T) {
 
 func TestApproveTwiceFails(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -374,7 +375,7 @@ func TestApproveTwiceFails(t *testing.T) {
 
 func TestApproveExpiredCodeFails(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -392,7 +393,7 @@ func TestApproveExpiredCodeFails(t *testing.T) {
 
 func TestApproveUnknownUserCode(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 	if err := svc.ApproveByUserCode(ctx, "ORL-XXXX", ident); !errors.Is(err, devauth.ErrUserCodeUnknown) {
@@ -402,7 +403,7 @@ func TestApproveUnknownUserCode(t *testing.T) {
 
 func TestAuthenticateRejectsRevokedToken(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -428,7 +429,7 @@ func TestAuthenticateRejectsRevokedToken(t *testing.T) {
 
 func TestAuthenticateRejectsSuspendedUser(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -455,7 +456,7 @@ func TestAuthenticateRejectsSuspendedUser(t *testing.T) {
 
 func TestAuthenticateRejectsSuspendedTenant(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -482,7 +483,7 @@ func TestAuthenticateRejectsSuspendedTenant(t *testing.T) {
 
 func TestAuthenticateRejectsAdminPurposeOnBearer(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 
@@ -506,7 +507,7 @@ func TestAuthenticateRejectsAdminPurposeOnBearer(t *testing.T) {
 // /agent/run), confirming the widened purpose set is scoped to enroll.
 func TestAgentEnrollTokenAuthenticatesOnEnroll(t *testing.T) {
 	pool := openTestPool(t)
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	ident := seedTenantUser(t, pool, "acme", "alice@acme.example")
 	ctx := context.Background()
 

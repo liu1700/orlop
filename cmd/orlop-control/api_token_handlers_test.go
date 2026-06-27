@@ -15,6 +15,7 @@ import (
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/tokens"
 )
 
@@ -363,7 +364,7 @@ func deleteToken(t *testing.T, srvURL string, cookie *http.Cookie, id string) *h
 // being wired up.
 func requireBearerProbe(t *testing.T, pool *pgxpool.Pool) *httptest.Server {
 	t.Helper()
-	svc := devauth.NewService(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	q := sqlcdb.New(pool)
 	h := RequireBearer(svc, q)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ident, ok := IdentityFromRequest(r)

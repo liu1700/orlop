@@ -22,6 +22,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 func httpTestDatabaseURL() string { return os.Getenv("TEST_DATABASE_URL") }
@@ -66,7 +67,7 @@ func httpStartServer(t *testing.T, pool *pgxpool.Pool) (*httptest.Server, *devau
 
 func httpStartServerWithFencer(t *testing.T, pool *pgxpool.Pool, fencer mountLeaseFencer) (*httptest.Server, *devauth.Service) {
 	t.Helper()
-	svc := devauth.NewService(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
 		devAuth:          svc,
 		queries:          sqlcdb.New(pool),

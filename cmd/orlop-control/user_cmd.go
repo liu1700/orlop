@@ -14,6 +14,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 const userUsage = `usage:
@@ -101,7 +102,7 @@ func runUserSeed(ctx context.Context, out io.Writer, args []string) error {
 	}
 
 	// Mint admin session token.
-	svc := devauth.NewService(pool, nil)
+	svc := devauth.NewService(postgres.New(pool), nil)
 	tok, expires, err := svc.IssueAdminSession(ctx, user.ID, *tenantID)
 	if err != nil {
 		return fmt.Errorf("issue admin session: %w", err)
