@@ -33,7 +33,11 @@ jobs:
         include:
           - { runner: ubuntu-24.04,     os: linux,  arch: amd64, rust_target: x86_64-unknown-linux-gnu }
           - { runner: ubuntu-24.04-arm, os: linux,  arch: arm64, rust_target: aarch64-unknown-linux-gnu }
-          - { runner: macos-13,         os: darwin, arch: amd64, rust_target: x86_64-apple-darwin }
+          # Both darwin targets build on the Apple-Silicon runner: x86_64 is
+          # cross-compiled there (Go via GOARCH; Rust via the x86_64-apple-darwin
+          # target). GitHub's Intel macos-13 runners are scarce and can sit
+          # unassigned for hours, which would block the whole release.
+          - { runner: macos-14,         os: darwin, arch: amd64, rust_target: x86_64-apple-darwin }
           - { runner: macos-14,         os: darwin, arch: arm64, rust_target: aarch64-apple-darwin }
     steps:
       - uses: actions/checkout@v4
