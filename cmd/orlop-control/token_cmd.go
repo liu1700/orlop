@@ -11,11 +11,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 // defaultOwnerID is the demo account a standalone `token issue` provisions
@@ -87,12 +85,11 @@ func runTokenIssue(ctx context.Context, out io.Writer, args []string) error {
 		return fmt.Errorf("--owner must be a uuid: %w", err)
 	}
 
-	pool, err := pgxpool.New(ctx, *databaseURL)
+	store, _, closeStore, err := openStore(ctx, *databaseURL)
 	if err != nil {
-		return fmt.Errorf("open pgxpool: %w", err)
+		return err
 	}
-	defer pool.Close()
-	store := postgres.New(pool)
+	defer closeStore()
 
 	// Provision the agent's disk the same way the service-to-service entity API
 	// does (handleProvision), so the enroll token references a real allocation:

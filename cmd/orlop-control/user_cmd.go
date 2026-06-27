@@ -9,11 +9,8 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
 const userUsage = `usage:
@@ -67,12 +64,11 @@ func runUserSeed(ctx context.Context, out io.Writer, args []string) error {
 		*tenantName = *tenantID
 	}
 
-	pool, err := pgxpool.New(ctx, *databaseURL)
+	store, _, closeStore, err := openStore(ctx, *databaseURL)
 	if err != nil {
-		return fmt.Errorf("open pgxpool: %w", err)
+		return err
 	}
-	defer pool.Close()
-	store := postgres.New(pool)
+	defer closeStore()
 
 	// Tenant: idempotent create.
 	if _, err := store.GetTenant(ctx, *tenantID); err != nil {
@@ -138,12 +134,11 @@ func runUserSuspend(ctx context.Context, out io.Writer, args []string) error {
 		return errors.New("--database-url or DATABASE_URL is required")
 	}
 
-	pool, err := pgxpool.New(ctx, *databaseURL)
+	store, _, closeStore, err := openStore(ctx, *databaseURL)
 	if err != nil {
-		return fmt.Errorf("open pgxpool: %w", err)
+		return err
 	}
-	defer pool.Close()
-	store := postgres.New(pool)
+	defer closeStore()
 
 	user, err := store.GetUserByEmail(ctx, *email)
 	if err != nil {

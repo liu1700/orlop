@@ -43,6 +43,17 @@ func runMigrateUp(ctx context.Context, out io.Writer, args []string) error {
 	if *databaseURL == "" {
 		return errors.New("--database-url or DATABASE_URL is required")
 	}
+	// The SQLite backend applies its schema on open (no goose). Open it once so
+	// `migrate up` still initialises a fresh database file, then close.
+	if _, ok := sqlitePath(*databaseURL); ok {
+		_, _, closeStore, err := openStore(ctx, *databaseURL)
+		if err != nil {
+			return err
+		}
+		_ = closeStore()
+		fmt.Fprintln(out, "sqlite schema applied")
+		return nil
+	}
 	if err := db.MigrateUp(ctx, *databaseURL); err != nil {
 		return err
 	}

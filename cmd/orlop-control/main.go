@@ -25,7 +25,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/identity"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/secrets"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -288,7 +288,7 @@ func main() {
 type runtimeDeps struct {
 	devAuth          *devauth.Service
 	allocations      *allocations.Service
-	store            *postgres.Store
+	store            storage.Store
 	agentCA          *ca.CA
 	enrollLimit      *agentEnrollLimiter
 	serverAdmin      allocations.ServerAdmin
@@ -318,22 +318,26 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	}
 	var pool *pgxpool.Pool
 	if cfg.DatabaseURL != "" {
-		var err error
-		pool, err = pgxpool.New(ctx, cfg.DatabaseURL)
+		st, p, closeStore, err := openStore(ctx, cfg.DatabaseURL)
 		if err != nil {
-			return fmt.Errorf("open pgxpool: %w", err)
+			return err
 		}
-		defer pool.Close()
-		deps.store = postgres.New(pool)
-		deps.devAuth = devauth.NewService(deps.store, logger)
-		deps.allocations = allocations.NewService(deps.store, logger)
+		defer closeStore()
+		pool = p // non-nil only for Postgres; used by the "postgres" CA backend
+		deps.store = st
+		deps.devAuth = devauth.NewService(st, logger)
+		deps.allocations = allocations.NewService(st, logger)
 		deps.cookieDomain = cfg.CookieDomain
 		// CA storage backend: "postgres" keeps the root key + tenant intermediates
 		// in this shared DB (no block-storage PVC); otherwise the filesystem backend
-		// at SecretsDir. pool is non-nil here (we are inside the DatabaseURL branch).
+		// at SecretsDir. The SQLite backend has no pool, so it always uses the
+		// filesystem CA backend.
 		var caBackend secrets.Backend
 		switch cfg.SecretsBackend {
 		case "postgres":
+			if pool == nil {
+				return fmt.Errorf("ORLOP_SECRETS_BACKEND=postgres requires a Postgres DATABASE_URL; with sqlite, use the filesystem CA backend via ORLOP_SECRETS_DIR")
+			}
 			caBackend = secrets.NewPostgres(pool)
 		default:
 			if cfg.SecretsDir != "" {
