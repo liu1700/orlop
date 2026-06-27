@@ -80,6 +80,45 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Single-host developer stack: bring up the control plane, data-plane
+    /// server, and a mounted disk in one command.
+    Dev {
+        #[command(subcommand)]
+        command: DevCommand,
+    },
+    /// Report a running `orlop dev` stack and any mount daemon. `--json` prints
+    /// a machine-readable report.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevCommand {
+    /// Bring up a single-node stack (control plane + data plane + mounted disk)
+    /// and supervise it until Ctrl-C, which tears it all down. Automates the
+    /// standalone quickstart for local development.
+    Up {
+        /// Work directory for all stack state (db, secrets, data, logs).
+        #[arg(long, default_value = "./orlop-dev")]
+        dir: PathBuf,
+        /// Where to mount the agent disk (default: <dir>/mnt).
+        #[arg(long)]
+        mountpoint: Option<PathBuf>,
+        /// Agent id to provision and mount.
+        #[arg(long, default_value = "demo")]
+        agent: String,
+        #[arg(long, default_value_t = 8080)]
+        control_port: u16,
+        #[arg(long, default_value_t = 7878)]
+        ops_port: u16,
+        #[arg(long, default_value_t = 8443)]
+        data_port: u16,
+        /// Pool capacity to register for the data-plane server, in bytes.
+        #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
+        total_bytes: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -396,6 +435,31 @@ fn main() -> anyhow::Result<()> {
             if !report.ready {
                 std::process::exit(1);
             }
+        }
+        Command::Dev { command } => match command {
+            DevCommand::Up {
+                dir,
+                mountpoint,
+                agent,
+                control_port,
+                ops_port,
+                data_port,
+                total_bytes,
+            } => {
+                let mountpoint = mountpoint.clone().or_else(|| cli.mountpoint.clone());
+                orlop::dev::run_dev_up(orlop::dev::DevUpOpts {
+                    dir: dir.clone(),
+                    mountpoint,
+                    agent: agent.clone(),
+                    control_port: *control_port,
+                    ops_port: *ops_port,
+                    data_port: *data_port,
+                    total_bytes: *total_bytes,
+                })?;
+            }
+        },
+        Command::Status { json } => {
+            orlop::dev::run_status(*json)?;
         }
     }
 

@@ -153,6 +153,12 @@ pub fn log_file_path() -> anyhow::Result<PathBuf> {
     Ok(cache_dir()?.join("mount.log"))
 }
 
+/// `<cache_dir>/dev.json` — the state file written by `orlop dev up` and read
+/// by `orlop status`, so `status` can find a running dev stack with no args.
+pub fn dev_state_path() -> anyhow::Result<PathBuf> {
+    Ok(cache_dir()?.join("dev.json"))
+}
+
 /// Is anything mounted at `path`? Cross-platform via `/sbin/mount`, which
 /// exists on both Linux and macOS and prints one line per active mount.
 ///

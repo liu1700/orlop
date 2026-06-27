@@ -62,9 +62,14 @@ jobs:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
         run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_NAME" = "$version" ]; then
+            version="$(git rev-parse --short HEAD)"   # workflow_dispatch: no tag
+          fi
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o dist/orlop-control ./cmd/orlop-control
-          go build -trimpath -ldflags "-s -w" -o dist/orlop-server  ./cmd/orlop-server
+          ldflags="-s -w -X github.com/liu1700/orlop/internal/buildinfo.version=${version}"
+          go build -trimpath -ldflags "$ldflags" -o dist/orlop-control ./cmd/orlop-control
+          go build -trimpath -ldflags "$ldflags" -o dist/orlop-server  ./cmd/orlop-server
 
       - name: Build Rust binary
         run: |
