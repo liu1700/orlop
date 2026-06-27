@@ -3,6 +3,7 @@ pub mod audit;
 pub mod backend;
 pub mod config;
 pub mod daemon;
+pub mod dev;
 pub mod doctor;
 pub mod enroll;
 // FUSE-only — the macOS mount path goes through `nfs.rs` instead, so darwin
