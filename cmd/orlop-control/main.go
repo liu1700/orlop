@@ -94,8 +94,12 @@ type config struct {
 	CAAllowDynamicTenants bool
 }
 
-func loadConfig() config {
+func loadConfig() (config, error) {
 	port := getenv("PORT", "8080")
+	allowDynamicTenants, err := parseBoolEnv("ORLOP_CA_ALLOW_DYNAMIC_TENANTS", true)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
 		Addr:                  ":" + port,
 		DatabaseURL:           os.Getenv("DATABASE_URL"),
@@ -119,23 +123,25 @@ func loadConfig() config {
 		IdentityTenantAllowlist: os.Getenv("ORLOP_IDENTITY_TENANT_ALLOWLIST"),
 
 		CATenantAllowlist:     os.Getenv("ORLOP_CA_TENANT_ALLOWLIST"),
-		CAAllowDynamicTenants: envBoolDefault("ORLOP_CA_ALLOW_DYNAMIC_TENANTS", true),
-	}
+		CAAllowDynamicTenants: allowDynamicTenants,
+	}, nil
 }
 
-// envBoolDefault parses a boolean env var, returning fallback when unset/blank.
-// Accepts "1"/"true"/"yes"/"on" (case-insensitive) as true and the obvious
-// negatives as false; an unrecognized value falls back.
-func envBoolDefault(key string, fallback bool) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+// parseBoolEnv parses a boolean env var. An unset/blank value yields fallback;
+// "1"/"true"/"yes"/"on" and "0"/"false"/"no"/"off" (case-insensitive) parse as
+// expected. A set-but-unrecognized value is an ERROR rather than a silent
+// fallback — a typo on a security toggle (e.g. ORLOP_CA_ALLOW_DYNAMIC_TENANTS)
+// must fail boot, not quietly leave the permissive default in force.
+func parseBoolEnv(key string, fallback bool) (bool, error) {
+	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(key))); v {
 	case "":
-		return fallback
+		return fallback, nil
 	case "1", "true", "yes", "on":
-		return true
+		return true, nil
 	case "0", "false", "no", "off":
-		return false
+		return false, nil
 	default:
-		return fallback
+		return false, fmt.Errorf("%s: unrecognized boolean %q (use true/false)", key, v)
 	}
 }
 
@@ -266,7 +272,12 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	if err := run(context.Background(), logger, loadConfig()); err != nil {
+	cfg, err := loadConfig()
+	if err != nil {
+		logger.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+	if err := run(context.Background(), logger, cfg); err != nil {
 		logger.Error("orlop-control stopped", "error", err)
 		os.Exit(1)
 	}

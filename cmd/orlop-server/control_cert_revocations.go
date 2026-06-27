@@ -34,5 +34,7 @@ func (s *serverState) pushCertRevocations(w http.ResponseWriter, r *http.Request
 	for _, rev := range req.Revocations {
 		s.certRevocations.Add(rev.Serial, rev.ExpiresAt)
 	}
+	// One sweep per batch reclaims aged-out serials (keeps Add O(1) — see Add).
+	s.certRevocations.Prune()
 	writeJSON(w, http.StatusOK, map[string]any{"count": s.certRevocations.Count()})
 }
