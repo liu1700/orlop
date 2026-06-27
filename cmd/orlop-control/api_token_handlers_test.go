@@ -365,8 +365,7 @@ func deleteToken(t *testing.T, srvURL string, cookie *http.Cookie, id string) *h
 func requireBearerProbe(t *testing.T, pool *pgxpool.Pool) *httptest.Server {
 	t.Helper()
 	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	q := sqlcdb.New(pool)
-	h := RequireBearer(svc, q)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := RequireBearer(svc, postgres.New(pool))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ident, ok := IdentityFromRequest(r)
 		if !ok {
 			w.WriteHeader(http.StatusInternalServerError)

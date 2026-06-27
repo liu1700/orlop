@@ -343,6 +343,7 @@ func startEnrollServerWithAdmin(t *testing.T, pool *pgxpool.Pool, q *sqlcdb.Quer
 	router := newRouter(logger, runtimeDeps{
 		devAuth:     svc,
 		queries:     q,
+		store:       postgres.New(pool),
 		agentCA:     agentCA,
 		enrollLimit: limit,
 		allocations: allocSvc,

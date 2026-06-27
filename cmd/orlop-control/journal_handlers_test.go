@@ -139,6 +139,7 @@ func startJournalServer(t *testing.T, pool *pgxpool.Pool, jq journalQuerier) (*h
 	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
 		devAuth:        svc,
 		queries:        sqlcdb.New(pool),
+		store:          postgres.New(pool),
 		allocations:    allocations.NewService(postgres.New(pool), nil),
 		journalQuerier: jq,
 	}, config{})
