@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/db/sqlcdb"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/identity"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/secrets"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
 )
@@ -69,6 +71,16 @@ type config struct {
 	// APITokenTTL, when > 0, sets an expiry on newly minted orlop_ API tokens.
 	// 0 (default) means tokens never expire. ORLOP_API_TOKEN_TTL (e.g. "2160h").
 	APITokenTTL time.Duration
+
+	// Mode B host-identity verifier (docs/design-identity.md §3). When
+	// IdentityAudience is set, orlop-control verifies a host-issued signed JWT
+	// and maps an allowlisted claim onto the tenant subject. All
+	// ORLOP_IDENTITY_* knobs.
+	IdentityIssuer          string // ORLOP_IDENTITY_ISSUER (optional; pins iss)
+	IdentityAudience        string // ORLOP_IDENTITY_AUDIENCE (enables Mode B; pins aud)
+	IdentityPublicKeyFile   string // ORLOP_IDENTITY_PUBLIC_KEY_FILE (PKIX PEM)
+	IdentityTenantClaim     string // ORLOP_IDENTITY_TENANT_CLAIM (default "tenant")
+	IdentityTenantAllowlist string // ORLOP_IDENTITY_TENANT_ALLOWLIST (comma-separated, fail-closed)
 }
 
 func loadConfig() config {
@@ -88,6 +100,12 @@ func loadConfig() config {
 		ServerCertFQDN:        getenv("ORLOP_DATAGW_SERVER_FQDN", defaultServerCertFQDN),
 		ServerCertTTL:         parseDurationOr(os.Getenv("ORLOP_DATAGW_SERVER_CERT_TTL"), defaultServerCertTTL),
 		APITokenTTL:           parseDurationOr(os.Getenv("ORLOP_API_TOKEN_TTL"), 0),
+
+		IdentityIssuer:          os.Getenv("ORLOP_IDENTITY_ISSUER"),
+		IdentityAudience:        os.Getenv("ORLOP_IDENTITY_AUDIENCE"),
+		IdentityPublicKeyFile:   os.Getenv("ORLOP_IDENTITY_PUBLIC_KEY_FILE"),
+		IdentityTenantClaim:     os.Getenv("ORLOP_IDENTITY_TENANT_CLAIM"),
+		IdentityTenantAllowlist: os.Getenv("ORLOP_IDENTITY_TENANT_ALLOWLIST"),
 	}
 }
 
@@ -214,11 +232,24 @@ type runtimeDeps struct {
 	journalQuerier   journalQuerier
 	mountLeaseFencer mountLeaseFencer
 	agentPurger      allocations.AgentDataPurger
+	hostIdentity     identity.Verifier
 	cookieDomain     string
 }
 
 func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	deps := runtimeDeps{}
+	// Mode B host-identity verifier. Independent of the DB: it verifies a
+	// host-issued JWT and maps an allowlisted claim onto the tenant subject. A
+	// misconfiguration fails startup (fail closed) rather than silently leaving
+	// the seam unguarded.
+	if cfg.IdentityAudience != "" {
+		v, err := buildHostIdentityVerifier(cfg)
+		if err != nil {
+			return fmt.Errorf("host identity verifier: %w", err)
+		}
+		deps.hostIdentity = v
+		logger.Info("host_identity_enabled", "audience", cfg.IdentityAudience, "issuer", cfg.IdentityIssuer)
+	}
 	var pool *pgxpool.Pool
 	if cfg.DatabaseURL != "" {
 		var err error
@@ -396,8 +427,38 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 		mountServerCert(router, RequireServiceToken(cfg.ControlPlaneToken),
 			newServerCertHandlers(logger, deps.agentCA, cfg.ServerCertFQDN, cfg.ServerCertTTL))
 	}
+	// Mode B: GET /v1/whoami behind the host-identity verifier (mounted only
+	// when ORLOP_IDENTITY_AUDIENCE is configured).
+	if deps.hostIdentity != nil {
+		mountHostIdentity(router, RequireHostIdentity(deps.hostIdentity, logger))
+	}
 
 	return router
+}
+
+// buildHostIdentityVerifier constructs the Mode B JWT verifier from config.
+// Reads the PKIX public key from ORLOP_IDENTITY_PUBLIC_KEY_FILE.
+func buildHostIdentityVerifier(cfg config) (identity.Verifier, error) {
+	if cfg.IdentityPublicKeyFile == "" {
+		return nil, fmt.Errorf("ORLOP_IDENTITY_PUBLIC_KEY_FILE is required when ORLOP_IDENTITY_AUDIENCE is set")
+	}
+	pubPEM, err := os.ReadFile(cfg.IdentityPublicKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("read public key file: %w", err)
+	}
+	var allow []string
+	for _, t := range strings.Split(cfg.IdentityTenantAllowlist, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			allow = append(allow, t)
+		}
+	}
+	return identity.NewJWTVerifier(identity.JWTConfig{
+		Issuer:          cfg.IdentityIssuer,
+		Audience:        cfg.IdentityAudience,
+		PublicKeyPEM:    pubPEM,
+		TenantClaim:     cfg.IdentityTenantClaim,
+		TenantAllowlist: allow,
+	})
 }
 
 func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {

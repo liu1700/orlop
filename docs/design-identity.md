@@ -206,15 +206,20 @@ JWT-SVID is the natural fit.
 
 ### ADD — the pluggable identity seam (Temporal/Envoy shaped)
 
-1. A `ClaimMapper` / `Authorizer` interface in orlop-control. `AuthInfo` carries
-   a JWT *and* mTLS subject so both paths share one mapping seam.
-2. A built-in JWT verifier (Mode B default): config `{issuer, jwks_uri |
-   static_pubkey, audience, tenant_claim, tenant_allowlist, sender_constraint}`;
-   networkless verify after JWKS cache. Replaces `createHostedUser` with "map
-   verified + allowlisted claim → existing tenant subject."
+1. A `Verifier` interface in orlop-control (`internal/identity`). `AuthInfo`
+   carries a JWT *and* mTLS subject so both paths share one mapping seam.
+   **Implemented.**
+2. A built-in JWT verifier (Mode B default): config `{issuer, public key,
+   audience, tenant_claim, tenant_allowlist}`; offline verify. Maps a verified +
+   allowlisted claim → tenant subject, replacing `createHostedUser`.
+   **Implemented** (`internal/identity/jwt.go`, RS256/ES256/EdDSA against a
+   static PKIX public key; wired via `ORLOP_IDENTITY_*` and exercised by
+   `GET /v1/whoami`). *Follow-ups:* `jwks_uri` with rotation; sender-constraint
+   (DPoP/mTLS) on the enroll seam; re-sourcing `/agent/enroll` authorization
+   from the verifier with allowlisted tenant bootstrap (issue #8).
 3. A built-in platform-token verifier (Mode A fallback): per-tenant scoped,
    expirable token via `api_tokens`, with default-deny stripping of
-   caller-supplied tenant.
+   caller-supplied tenant. *Not yet implemented.*
 
 ### KEEP — the isolation core
 
