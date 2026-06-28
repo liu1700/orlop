@@ -15,7 +15,7 @@ allowlisted claim onto the tenant subject. It is implemented today in
 
 Most deployments do not need an IdP. The shipped, working agent path mints a
 single-use enroll token (`orlop-control token issue`) and hands it to the mount
-client. See [`control-plane.md`](./control-plane.md). Reach for host identity
+client. See [`control-plane.md`](control-plane.md). Reach for host identity
 when you **already run an IdP** and want it, rather than an operator-issued
 token, to be the source of truth for tenant assignment.
 
@@ -36,12 +36,12 @@ different threat models, and "just pass a tenant id" is valid for only one.
 | **host → orlop-control** (control plane) | the host platform | host is *trusted*; orlop is a subsystem behind it | A signed token verified against a pinned key. A plain id is acceptable only if the host authenticated with a real credential first **and** orlop strips any caller-supplied tenant (default-deny). |
 | **agent → orlop-server** (data plane) | the AI agent | **agent is hostile**, orlop's whole premise | **Never** a plain id. Only the mTLS certificate: proof-of-possession, CA-rooted, tenant scope baked into the SAN, serial revocable. |
 
-The cardinal rule, stated bluntly by AWS's multi-tenant guidance: **never accept
-a tenant id from request parameters; derive it only from a validated token's
-claims.** That is exactly what the verifier below does: the tenant comes from a
-signed, allowlisted claim, never from the request body.
+The rule that follows: **never accept a tenant id from request parameters; derive
+it only from a validated token's claims.** That is exactly what the verifier below
+does — the tenant comes from a signed, allowlisted claim, never from the request
+body.
 
-The data-plane certificate model is covered in [`design-auth.md`](./design-auth.md);
+The data-plane certificate model is covered in [`design-auth.md`](design-auth.md);
 this document is only about the host → control-plane integration point.
 
 ## Trust flow
@@ -62,10 +62,7 @@ this document is only about the host → control-plane integration point.
                       │  2. iss / aud exact match, exp + skew
                       │  3. tenant claim must be on the allowlist
                       ▼
-              tenant subject  (u_acme)
-                      │
-                      ▼  authorizes allocation + agent enrollment
-              agent leaf certificate minted, scoped to the tenant
+              tenant subject  (u_acme)   ── echoed by GET /v1/whoami
 ```
 
 1. The host platform authenticates the human. orlop never sees this step.
@@ -76,9 +73,11 @@ this document is only about the host → control-plane integration point.
 4. orlop-control checks the signature against the configured public key, checks
    `iss`/`aud`/`exp`, and maps the tenant claim onto the tenant subject, but only
    if that claim value is on the operator allowlist.
-5. The tenant subject is the durable authorization unit. The agent leaf
-   certificate is minted bound to it (two SPIFFE URI SANs:
-   `spiffe://<trust-domain>/tenant/<id>` and `.../agent/<agentID>`).
+5. `/v1/whoami` echoes the verified tenant subject — the durable authorization
+   unit the rest of orlop hangs off (a disk allocation, an agent leaf cert whose
+   SANs are `spiffe://<trust-domain>/tenant/<id>` and `.../agent/<agentID>`).
+   Today the verifier gates only `/v1/whoami`; agent enrollment still rides the
+   enroll-token path above.
 
 ## Configure the trusted issuer
 
@@ -92,10 +91,11 @@ knobs, and mounts `GET /v1/whoami`.
 | `ORLOP_IDENTITY_PUBLIC_KEY_FILE` | yes when audience set | Path to a PKIX/SPKI PEM public key. The token signature is checked against this key. |
 | `ORLOP_IDENTITY_ISSUER` | optional | When set, the token `iss` must equal it exactly. |
 | `ORLOP_IDENTITY_TENANT_CLAIM` | optional | The claim whose string value becomes the tenant subject. Default `tenant`. |
-| `ORLOP_IDENTITY_TENANT_ALLOWLIST` | yes when audience set | Comma-separated, fail-closed list of tenant ids that may be provisioned. |
+| `ORLOP_IDENTITY_TENANT_ALLOWLIST` | yes when audience set | Comma-separated, fail-closed list of tenant ids that may be accepted. |
 
-The verifier uses a static PKIX public key. Rotating the signing key means
-swapping the file and restarting (or running both keys briefly on the IdP side).
+The verifier trusts exactly one static PKIX public key — there is no JWKS
+endpoint or multi-key trust. Rotating the signing key means swapping the file and
+restarting.
 
 ## JWT verification rules
 
@@ -173,8 +173,8 @@ The verifier is built to fail closed; the load-bearing properties are:
 
 - **Pin the audience.** `aud` is required and must match exactly, so a token
   minted for another service cannot be replayed against orlop.
-- **Keep the allowlist tight.** It is default-deny; only listed tenant ids can
-  be provisioned. An empty list refuses to start.
+- **Keep the allowlist tight.** It is default-deny; only listed tenant ids are
+  accepted. An empty list refuses to start.
 - **Tenant comes from the claim, never the request.** The handler derives the
   tenant from the verified token; nothing in the request body can influence it.
 - **Algorithm is bound to the key.** The accepted `alg` is fixed by the
@@ -182,10 +182,6 @@ The verifier is built to fail closed; the load-bearing properties are:
 - **Short expiries.** `exp` is mandatory; issue host JWTs with a short lifetime
   so a leaked token ages out quickly (60-second skew allowance).
 
-This is the same pattern infra components converge on. For example, MinIO's
-`AssumeRoleWithWebIdentity` verifies an OIDC JWT and maps a claim to a policy
-rather than running its own user database.
-
 For the data-plane certificate model (the agent leaf, tenant binding, and
 revocation that protect agent → orlop-server), see
-[`design-auth.md`](./design-auth.md).
+[`design-auth.md`](design-auth.md).

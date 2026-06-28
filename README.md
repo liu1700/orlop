@@ -12,10 +12,10 @@
 [Quickstart](#quickstart) · [How it works](#how-it-works) · [Architecture](#architecture) · [Docs](#documentation) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 orlop is a multi-tenant, **zero-trust file plane** for agent sandboxes. Each agent
-gets one auto-expanding POSIX directory that it mounts over FUSE and uses like an
-ordinary disk. The bytes live remotely in a content-addressed chunk store, so when
-the sandbox dies the data persists and the next run re-mounts the same disk with
-zero idle compute.
+gets one auto-expanding POSIX directory that it mounts and uses like an ordinary
+disk. The bytes live remotely in a content-addressed chunk store, so when the
+sandbox dies the data persists and the next run re-mounts the same disk with zero
+idle compute.
 
 > **The credential never reaches the agent.** Each agent is issued its own
 > short-lived mTLS client certificate whose identity (a SPIFFE SAN) is the only

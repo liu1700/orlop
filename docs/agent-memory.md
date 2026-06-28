@@ -73,12 +73,13 @@ At launch, mint a short-lived, agent-scoped enroll token:
 token, _ := cp.MintEnrollToken(ctx, agentID)   // single-use; spent on first mount
 ```
 
-Then inject it into the sandbox environment with the mount coordinates:
+Then inject it into the sandbox environment with the mount coordinates — all four
+are required by `--from-env`:
 
 ```bash
 ORLOP_AGENT_ID=<agentID>
 ORLOP_CONTROL_PLANE=https://control.example.com
-ORLOP_MOUNT_POINT=/mnt/agent-memory     # where the agent sees its disk (required for --from-env)
+ORLOP_MOUNT_POINT=/mnt/agent-memory     # where the agent sees its disk
 ORLOP_ENROLL_TOKEN=<token from above>
 ```
 
@@ -118,10 +119,10 @@ Orlop imposes no layout — it stores raw bytes verbatim, dedupes them by conten
 hash, and on a write ships only the chunks that changed, so keeping the full raw
 trace is cheap. Each path is versioned and overwritten in place by
 compare-and-swap, so the agent can *replace* a stale fact rather than append a
-correction and hope retrieval picks the latest. On mount, orlop also drops a
-short stanza into the working directory's `AGENTS.md` so a file-reading agent
-(Claude Code, Cursor) discovers its memory directory on its own — disable with
-`--no-inject`.
+correction and hope retrieval picks the latest. When the working directory
+already has an `AGENTS.md` (or looks like a project root), orlop also drops a
+short stanza into it so an `AGENTS.md`-reading agent (Cursor, Aider, Codex CLI)
+discovers its memory directory on its own — disable with `--no-inject`.
 
 ### 5. Reattach the same disk next session
 
@@ -142,10 +143,11 @@ orlop mount --from-env
 cat "$ORLOP_MOUNT_POINT/MEMORY.md"      # → the build uses Go 1.24
 ```
 
-A persistent local chunk cache serves already-seen chunks from local disk, so
-the second mount skips re-fetching unchanged data. The whole per-agent loop is:
-allocate once, then enroll → mount → use → unmount each session, with the agent
-seeing nothing but a directory whose contents persist across runs.
+When the remount lands on a host whose chunk cache is already warm (a reused
+sandbox image, or the same machine), already-seen chunks are served from local
+disk; a cold host fetches them once and warms its cache. The whole per-agent loop
+is: allocate once, then enroll → mount → use → unmount each session, with the
+agent seeing nothing but a directory whose contents persist across runs.
 
 ## Where orlop stops
 

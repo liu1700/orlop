@@ -116,7 +116,9 @@ orlop by calling this SDK and running the `orlop` binary in the sandbox.
 
 ## Mount-client CLI surface
 
-The mount client exposes exactly these commands:
+These are the mount client's commands for working with a disk (it also has
+`orlop dev` and `orlop status` for the single-node dev stack — see
+[`standalone-quickstart.md`](standalone-quickstart.md)):
 
 | Command | What it does |
 |---|---|

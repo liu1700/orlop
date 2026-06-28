@@ -61,10 +61,16 @@ Identity richness depends on the emitter:
   orlop stamps each backend with a `mount:<hex>` id (derived from the
   exclusive-mount lease), and every write for the lifetime of that mount carries
   it. It is omitted on non-write events.
-- **`size`** (optional) appears only on events that move or measure bytes:
-  `read`, `flush`, `head_file`, `manifest_get`, `manifest_put`, `chunk_get`,
-  `chunk_put`. It is absent on `manifest_delete`, `manifest_rename`, `chunk_has`
-  (which carries `count` instead), and open/create-style events.
+- **`size`, `offset`, and `command` are always-present keys** — emitted on every
+  line as `null` when not applicable, not omitted (a SIEM can rely on the key
+  existing). `size` holds a byte count on byte-measuring events (`read`, `flush`,
+  read-only `open`, `lookup` on hit, `readdir_entry`/`readdirplus_entry`,
+  `head_file`, `manifest_get`/`manifest_put`, `chunk_get`/`chunk_put`,
+  `cache_corrupt`, `cache_evicted`) and is `null` elsewhere; `chunk_has` carries
+  `count` instead. `offset` is set only by the client `read` (and the macOS write
+  path). By contrast, the richer identity fields below (`agent_pid`, `uid`,
+  `gid`, `agent_id`, `tenant_id`, `cert_*`, `session_id`) are *omitted* when
+  absent, not null.
 - **Lease-lifecycle and GC events carry a deliberately reduced envelope.** See
   those sections.
 
@@ -75,7 +81,9 @@ Identity richness depends on the emitter:
 - **Policy and authorization denials reuse the op's own event name.** When an
   agent cert's per-agent scope rejects a path, the server writes the normal op
   line (e.g. `manifest_put`) with `allowed: false`, rather than a distinct
-  "denied" event.
+  "denied" event. One wrinkle: the per-agent path-moat denial logs the lowercased
+  wire op, so a denied directory listing or stat is recorded as `list`/`stat`
+  (not `list_entries`/`head_file`).
 - **`lease_denied` and `lease_violation` are not `allowed: false`.** Both
   hard-code `allowed: true`: `lease_denied` records that the client fell back
   to an uncached path, and `lease_violation` records a server-side lease
@@ -96,9 +104,9 @@ calling process (`command`, `agent_pid`, `uid`, `gid`).
 |---|---|---|
 | `lookup` | path resolution | `size` (on hit) |
 | `opendir` | directory open | none |
-| `readdir_entry` | one per child returned to `readdir` | none |
-| `readdirplus_entry` | one per child returned to `readdirplus` | none |
-| `open` | file open | none |
+| `readdir_entry` | one per child returned to `readdir` | `size` |
+| `readdirplus_entry` | one per child returned to `readdirplus` | `size` |
+| `open` | file open | `size` (read-only opens; absent on write opens) |
 | `read` | `read(2)` served from the chunk cache | `size`, `offset` |
 | `create` | file create | `mode` |
 | `mkdir` | directory create | `mode` |
@@ -137,17 +145,44 @@ Sample of a `flush` that wrote two new chunks and reused one:
  "command":"python3","agent_pid":48211,"uid":1000,"gid":1000,"allowed":true}
 ```
 
+On a write conflict, the `flush` line also carries a flattened recovery hint:
+
+| Field | Meaning |
+|---|---|
+| `recovery_kind` | conflict kind, e.g. `cas_conflict` |
+| `recovery_suggested_action` | human-readable remediation |
+| `recovery_your_version` | version the client wrote against |
+| `recovery_current_version` | server's current version |
+| `recovery_last_writer_agent_id` | agent that last won the path (if known) |
+| `recovery_last_writer_session_id` | that writer's session (if known) |
+| `recovery_last_writer_at_unix_ms` | when that write landed (unix ms) |
+
+> The columns above describe the Linux **FUSE** surface (the production path). The
+> macOS **NFS** surface emits the same event *names* but a leaner envelope: no
+> `agent_pid`/`uid`/`gid` (`command` is `null`), `create` carries `size: 0`
+> instead of `mode`, `setattr` omits `setattr_fields`, `read` and `readdir_entry`
+> omit `size`, writes log as `flush` with `size`+`offset` (no chunk stats), and
+> `symlink`/`readlink` are not emitted.
+
 ### Mount client: cache integrity (Rust)
 
 | `event` | When | Extra fields |
 |---|---|---|
 | `cache_corrupt` | a cached chunk's bytes failed BLAKE3 re-verification; the entry is dropped and refetched | `path` = hex hash, `size`, `allowed: false` |
+| `cache_evicted` | the local read-cache LRU-prunes chunks to reclaim space | `size` = bytes freed, `chunks_reused` = chunks evicted, `reason` (`low_water` \| `high_water`), `path` empty, `allowed: true` |
+
+These cache events carry the default, empty identity — no `command`, `agent_pid`,
+`uid`, or `gid`:
 
 ```json
 {"ts":"2026-06-27T18:22:01.004Z","event":"cache_corrupt",
  "path":"7d865e959b2466918c9863afca942d0fb89d7c9ac0c99bafc3749504ded97730",
- "size":1048576,"command":"orlop","agent_pid":48000,"uid":1000,"gid":1000,
- "allowed":false}
+ "size":1048576,"offset":null,"command":null,"allowed":false}
+```
+
+```json
+{"ts":"2026-06-27T18:25:40.512Z","event":"cache_evicted","path":"","size":104857600,
+ "offset":null,"chunks_reused":128,"reason":"low_water","command":null,"allowed":true}
 ```
 
 ### Mount client: enrollment (Rust)
