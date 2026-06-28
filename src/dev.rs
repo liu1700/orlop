@@ -33,14 +33,23 @@ pub struct DevUpOpts {
     pub ops_port: u16,
     pub data_port: u16,
     pub total_bytes: u64,
+    /// Run the supervisor in the background and return 0 once the disk is
+    /// mounted, instead of blocking until Ctrl-C. See [`run_dev_up`].
+    pub detach: bool,
 }
 
 /// Persisted description of a running `dev up` stack. Written to
-/// [`crate::daemon::dev_state_path`] so `orlop status` finds it with no args.
+/// [`crate::daemon::dev_state_path`] so `orlop status` and `orlop dev down`
+/// find it with no args.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DevState {
     pub work_dir: PathBuf,
     pub control_plane_url: String,
+    /// PID of the `orlop dev up` supervisor itself — the process `orlop dev
+    /// down` signals for a graceful teardown. Present whether the stack was
+    /// started in the foreground or with `--detach`.
+    #[serde(default)]
+    pub supervisor_pid: u32,
     pub control_pid: u32,
     pub server_pid: u32,
     pub mount_pid: u32,
@@ -52,6 +61,14 @@ pub struct DevState {
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// `dev up --detach` blocks at most this long for the backgrounded supervisor
+/// to mount the disk. Bring-up is normally a few seconds; this covers the
+/// worst case where each of the five steps approaches its own timeout.
+const DETACH_TIMEOUT: Duration = Duration::from_secs(120);
+/// `dev down` waits at most this long for the supervisor to tear the stack
+/// down and exit. The supervisor's teardown is three sequential stops, each
+/// bounded by [`STOP_TIMEOUT`], so this must exceed `3 × STOP_TIMEOUT`.
+const DOWN_TIMEOUT: Duration = Duration::from_secs(40);
 const TRUST_DOMAIN: &str = "demo.example";
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -121,22 +138,23 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Bring up the full single-node stack and block until Ctrl-C.
+/// Bring up the full single-node stack.
+///
+/// In the default (foreground) mode this blocks until Ctrl-C / SIGTERM and
+/// then tears the stack down. With `opts.detach` it instead re-execs itself as
+/// a backgrounded supervisor, blocks only until the disk is mounted, and
+/// returns 0 — so CI, an IDE, or an agent can bring the stack up without
+/// holding a terminal. Either way `orlop dev down` stops it.
 pub fn run_dev_up(opts: DevUpOpts) -> Result<()> {
+    if opts.detach {
+        return run_dev_up_detached(&opts);
+    }
+
     let control_bin = find_binary("orlop-control")?;
     let server_bin = find_binary("orlop-server")?;
     let self_bin = std::env::current_exe().context("locate the running orlop binary")?;
 
-    // Fail fast on busy ports — the same preflight the quickstart asks for.
-    for (label, port) in [
-        ("control plane", opts.control_port),
-        ("server ops", opts.ops_port),
-        ("server data", opts.data_port),
-    ] {
-        if port_in_use(port) {
-            bail!("port {port} ({label}) is already in use; free it or pass a different --*-port");
-        }
-    }
+    preflight(&opts)?;
 
     // Work dir + layout.
     fs::create_dir_all(&opts.dir).with_context(|| format!("create work dir {}", opts.dir.display()))?;
@@ -250,10 +268,12 @@ pub fn run_dev_up(opts: DevUpOpts) -> Result<()> {
     })
     .context("mount did not come up (see mount.log)")?;
 
-    // Persist state for `orlop status`.
+    // Persist state for `orlop status` and `orlop dev down`. This process is
+    // the supervisor `dev down` will signal, so record our own PID.
     let state = DevState {
         work_dir: work_dir.clone(),
         control_plane_url: control_url.clone(),
+        supervisor_pid: std::process::id(),
         control_pid: control.id(),
         server_pid: server.id(),
         mount_pid: mount.id(),
@@ -280,6 +300,256 @@ pub fn run_dev_up(opts: DevUpOpts) -> Result<()> {
     let _ = fs::remove_file(&state_path);
     eprintln!("stack down. data kept in {} (rm -rf to discard)", work_dir.display());
     Ok(())
+}
+
+/// Fail-fast checks shared by the foreground and detached bring-up paths:
+/// refuse to stack a second instance on top of a live one, then surface a busy
+/// port with an actionable hint before we spawn anything.
+fn preflight(opts: &DevUpOpts) -> Result<()> {
+    if let Some(state) = load_dev_state() {
+        if state.supervisor_pid != 0 && crate::daemon::pid_alive(state.supervisor_pid) {
+            bail!(
+                "a dev stack is already up (supervisor pid {}, work dir {}); \
+                 inspect it with `orlop status` or stop it with `orlop dev down`",
+                state.supervisor_pid,
+                state.work_dir.display(),
+            );
+        }
+    }
+    for (label, port, flag) in [
+        ("control plane", opts.control_port, "--control-port"),
+        ("server ops", opts.ops_port, "--ops-port"),
+        ("server data", opts.data_port, "--data-port"),
+    ] {
+        if port_in_use(port) {
+            bail!("port {port} ({label}) is already in use; free it or pass {flag} <port>");
+        }
+    }
+    Ok(())
+}
+
+/// `orlop dev up --detach`: re-exec ourselves as a backgrounded supervisor,
+/// block only until the disk is mounted, then return 0. The child runs the
+/// ordinary foreground bring-up (so it writes `dev.json` and tears down on
+/// SIGTERM just like an interactive run) — `orlop dev down` stops it.
+fn run_dev_up_detached(opts: &DevUpOpts) -> Result<()> {
+    // Resolve binaries up front so a misinstall fails synchronously here,
+    // rather than inside a backgrounded child the caller can't watch.
+    find_binary("orlop-control")?;
+    find_binary("orlop-server")?;
+    let self_bin = std::env::current_exe().context("locate the running orlop binary")?;
+
+    preflight(opts)?;
+
+    fs::create_dir_all(&opts.dir).with_context(|| format!("create work dir {}", opts.dir.display()))?;
+    let work_dir = fs::canonicalize(&opts.dir).with_context(|| format!("resolve {}", opts.dir.display()))?;
+    let log = work_dir.join("dev.log");
+
+    eprintln!("orlop dev up --detach — starting supervisor in the background");
+    let mut child = spawn_detached_supervisor(opts, &self_bin, &log)?;
+    let supervisor_pid = child.id();
+
+    // Block until the backgrounded supervisor records itself in dev.json with
+    // the disk mounted, or it dies first.
+    let deadline = Instant::now() + DETACH_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().context("waiting on detached supervisor")? {
+            bail!(
+                "dev stack failed to come up (supervisor exited with {status}); see {}",
+                log.display()
+            );
+        }
+        if let Some(state) = load_dev_state() {
+            if state.supervisor_pid == supervisor_pid
+                && crate::daemon::is_mountpoint_active(&state.mountpoint)
+            {
+                print_detached_banner(&state, &log);
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            // Don't leave a half-started stack running behind us.
+            crate::daemon::send_signal(supervisor_pid, libc::SIGTERM);
+            bail!(
+                "dev stack did not come up within {DETACH_TIMEOUT:?}; \
+                 signaled the supervisor to stop — see {}",
+                log.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Reconstruct the `orlop dev up` argv for the backgrounded supervisor —
+/// every option the caller passed, minus `--detach` (the child runs in the
+/// foreground; it just happens to be detached from our terminal). Pure so it
+/// can be unit-tested without spawning anything.
+fn detached_args(opts: &DevUpOpts) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "dev".into(),
+        "up".into(),
+        "--dir".into(),
+        opts.dir.to_string_lossy().into_owned(),
+        "--agent".into(),
+        opts.agent.clone(),
+        "--control-port".into(),
+        opts.control_port.to_string(),
+        "--ops-port".into(),
+        opts.ops_port.to_string(),
+        "--data-port".into(),
+        opts.data_port.to_string(),
+        "--total-bytes".into(),
+        opts.total_bytes.to_string(),
+    ];
+    if let Some(mp) = &opts.mountpoint {
+        args.push("--mountpoint".into());
+        args.push(mp.to_string_lossy().into_owned());
+    }
+    args
+}
+
+/// Spawn `orlop dev up` (foreground, same options minus `--detach`) detached
+/// from the controlling terminal so a shell hangup or the launcher exiting
+/// doesn't take the supervisor with it.
+fn spawn_detached_supervisor(opts: &DevUpOpts, self_bin: &Path, log: &Path) -> Result<Child> {
+    let args = detached_args(opts);
+
+    let out = fs::File::create(log).with_context(|| format!("open {}", log.display()))?;
+    let err = out.try_clone()?;
+    let mut cmd = Command::new(self_bin);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .process_group(0);
+    // SAFETY: setsid() is async-signal-safe and the only call between fork and
+    // exec; it puts the child in its own session so SIGHUP/SIGINT on the
+    // launching terminal can't reach it.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .with_context(|| format!("spawn detached supervisor {}", self_bin.display()))
+}
+
+fn print_detached_banner(state: &DevState, log: &Path) {
+    eprintln!();
+    eprintln!("orlop dev stack is up (detached):");
+    eprintln!("  work dir       {}", state.work_dir.display());
+    eprintln!("  control plane  {}", state.control_plane_url);
+    eprintln!(
+        "  disk mounted   {}  (agent {})",
+        state.mountpoint.display(),
+        state.agent_id
+    );
+    eprintln!("  supervisor     pid {}  (log {})", state.supervisor_pid, log.display());
+    eprintln!();
+    eprintln!("  status:   orlop status");
+    eprintln!("  stop:     orlop dev down");
+}
+
+/// `orlop dev down` — stop a running stack (foreground or detached) without
+/// PID-hunting. Reads `dev.json`, sends the graceful-shutdown signal to the
+/// supervisor, and waits for it to tear the stack down and exit. Idempotent:
+/// a missing or already-dead stack is reconciled and reported, not an error.
+pub fn run_dev_down(dir: Option<PathBuf>) -> Result<()> {
+    let state_path = crate::daemon::dev_state_path()?;
+    let state = match load_dev_state() {
+        Some(s) => s,
+        None => {
+            println!("no dev stack is running");
+            return Ok(());
+        }
+    };
+
+    // If the caller named a --dir, only act on a stack that matches it, so a
+    // scripted `dev down --dir X` can never tear down an unrelated stack.
+    if let Some(dir) = dir {
+        let want = fs::canonicalize(&dir).unwrap_or(dir);
+        if state.work_dir != want {
+            bail!(
+                "the running dev stack is at {}, not {}; \
+                 re-run `orlop dev down` without --dir to stop it",
+                state.work_dir.display(),
+                want.display(),
+            );
+        }
+    }
+
+    let pid = state.supervisor_pid;
+    if pid == 0 || !crate::daemon::pid_alive(pid) {
+        // Supervisor already gone (crash, kill -9, OOM). Its children are
+        // orphaned and still holding the ports — reap them so the next
+        // `dev up` isn't blocked, then clear the stale state file.
+        eprintln!("supervisor not running; cleaning up orphaned dev stack");
+        reap_orphans(&state);
+        let _ = fs::remove_file(&state_path);
+        println!(
+            "dev stack already down. data kept in {} (rm -rf to discard)",
+            state.work_dir.display()
+        );
+        return Ok(());
+    }
+
+    eprintln!("stopping dev stack (supervisor pid {pid})…");
+    crate::daemon::send_signal(pid, libc::SIGTERM);
+
+    // The supervisor tears down mount→server→control and removes dev.json on
+    // its way out; wait for it to exit.
+    let deadline = Instant::now() + DOWN_TIMEOUT;
+    while crate::daemon::pid_alive(pid) {
+        if Instant::now() >= deadline {
+            eprintln!("supervisor pid {pid} did not exit within {DOWN_TIMEOUT:?}; sending SIGKILL");
+            crate::daemon::send_signal(pid, libc::SIGKILL);
+            // The supervisor never ran its teardown — reap its orphaned
+            // children and clear state ourselves.
+            reap_orphans(&state);
+            let _ = fs::remove_file(&state_path);
+            bail!("dev stack force-stopped (supervisor was unresponsive)");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The supervisor removes dev.json itself; clear any remnant just in case.
+    let _ = fs::remove_file(&state_path);
+    println!(
+        "dev stack stopped. data kept in {} (rm -rf to discard)",
+        state.work_dir.display()
+    );
+    Ok(())
+}
+
+/// Stop the recorded children of a supervisor that is no longer driving them,
+/// in dependency order: mount first (so it releases its lease while the control
+/// plane is still up and unmounts the disk), then data plane, then control.
+fn reap_orphans(state: &DevState) {
+    reap_pid(state.mount_pid, "mount", STOP_TIMEOUT);
+    if crate::daemon::is_mountpoint_active(&state.mountpoint) {
+        crate::util::warn_err("unmount leftover disk", crate::mount::unmount(&state.mountpoint));
+    }
+    reap_pid(state.server_pid, "data plane", STOP_TIMEOUT);
+    reap_pid(state.control_pid, "control plane", STOP_TIMEOUT);
+}
+
+/// SIGTERM a still-living pid, wait up to `timeout` for it to exit, then
+/// SIGKILL. No-op if the pid is unset or already gone.
+fn reap_pid(pid: u32, name: &str, timeout: Duration) {
+    if pid == 0 || !crate::daemon::pid_alive(pid) {
+        return;
+    }
+    eprintln!("  stopping orphaned {name} (pid {pid})");
+    crate::daemon::send_signal(pid, libc::SIGTERM);
+    let deadline = Instant::now() + timeout;
+    while crate::daemon::pid_alive(pid) {
+        if Instant::now() >= deadline {
+            crate::daemon::send_signal(pid, libc::SIGKILL);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn supervise(control: &mut ChildGuard, server: &mut ChildGuard, mount: &mut ChildGuard) {
@@ -319,7 +589,7 @@ fn print_ready_banner(state: &DevState) {
     eprintln!();
     eprintln!("  try it:   echo hi > {}/hello.txt", mp);
     eprintln!("  status:   orlop status");
-    eprintln!("  stop:     Ctrl-C (tears the stack down and releases the lease)");
+    eprintln!("  stop:     Ctrl-C, or `orlop dev down` from another shell");
 }
 
 // ---- process helpers -------------------------------------------------------
@@ -622,6 +892,66 @@ mod tests {
         assert_eq!(port_of("localhost:8443"), "8443");
         assert_eq!(port_of("8443"), "8443");
         assert_eq!(port_of("[::1]:7878"), "7878");
+    }
+
+    fn sample_opts() -> DevUpOpts {
+        DevUpOpts {
+            dir: PathBuf::from("./orlop-dev"),
+            mountpoint: None,
+            agent: "demo".into(),
+            control_port: 8080,
+            ops_port: 7878,
+            data_port: 8443,
+            total_bytes: 10 * 1024 * 1024 * 1024,
+            detach: true,
+        }
+    }
+
+    #[test]
+    fn detached_args_round_trip_options() {
+        let args = detached_args(&sample_opts());
+        assert_eq!(&args[0..2], &["dev", "up"]);
+        // --detach must NOT be forwarded — the child runs foreground.
+        assert!(!args.iter().any(|a| a == "--detach" || a == "-d"));
+        // Every option the caller can set is carried through.
+        for (flag, val) in [
+            ("--dir", "./orlop-dev"),
+            ("--agent", "demo"),
+            ("--control-port", "8080"),
+            ("--ops-port", "7878"),
+            ("--data-port", "8443"),
+            ("--total-bytes", "10737418240"),
+        ] {
+            let i = args.iter().position(|a| a == flag).expect(flag);
+            assert_eq!(args[i + 1], val, "value for {flag}");
+        }
+        // No mountpoint set → flag omitted (child defaults to <dir>/mnt).
+        assert!(!args.iter().any(|a| a == "--mountpoint"));
+    }
+
+    #[test]
+    fn detached_args_includes_mountpoint_when_set() {
+        let mut opts = sample_opts();
+        opts.mountpoint = Some(PathBuf::from("/tmp/mp"));
+        let args = detached_args(&opts);
+        let i = args.iter().position(|a| a == "--mountpoint").expect("--mountpoint");
+        assert_eq!(args[i + 1], "/tmp/mp");
+    }
+
+    #[test]
+    fn dev_state_tolerates_missing_supervisor_pid() {
+        // dev.json written by an older orlop has no supervisor_pid; it must
+        // still deserialize (defaulting to 0) so status/down don't choke.
+        let json = r#"{
+            "work_dir":"/tmp/orlop-dev",
+            "control_plane_url":"http://localhost:8080",
+            "control_pid":1,"server_pid":2,"mount_pid":3,
+            "mountpoint":"/tmp/orlop-dev/mnt",
+            "ops_addr":"localhost:7878","data_addr":"localhost:8443",
+            "agent_id":"demo"
+        }"#;
+        let state: DevState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.supervisor_pid, 0);
     }
 
     #[test]

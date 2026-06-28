@@ -60,6 +60,7 @@ backend (`DATABASE_URL=sqlite:./orlop.db`), so not even Postgres is required:
 ```bash
 orlop dev up        # control plane + server + a mounted disk, supervised; Ctrl-C tears it down
 orlop status        # what's running
+orlop dev down      # graceful teardown (use `dev up --detach` to run it non-interactively)
 ```
 
 Follow [`docs/standalone-quickstart.md`](docs/standalone-quickstart.md) to write
