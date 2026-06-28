@@ -35,7 +35,7 @@ curl -fsSL https://orlop.dev/install.sh | sh
 ```
 
 Override the target dir with `ORLOP_BIN_DIR`, or pin a release with
-`ORLOP_VERSION=v0.2.1`. If the install dir isn't on your `PATH`, the script
+`ORLOP_VERSION=v0.3.1`. If the install dir isn't on your `PATH`, the script
 prints the line to add. `orlop dev up` finds `orlop-control` and `orlop-server`
 next to the `orlop` binary or on your `PATH`.
 
