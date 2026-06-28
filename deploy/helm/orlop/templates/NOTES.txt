@@ -1,0 +1,22 @@
+orlop is installed.
+
+Control plane : {{ include "orlop.control.name" . }}:{{ .Values.control.port }} (HTTP API)
+Data server   : {{ include "orlop.server.name" . }}:{{ .Values.server.opsPort }} (ops), :{{ .Values.server.dataPort }} (data, mTLS)
+
+The cross-component invariants are wired for you:
+  - server cert FQDN / Service name : {{ include "orlop.server.name" . }}
+  - trust domain (both sides)       : {{ .Values.trustDomain }}
+  - shared control<->server token   : Secret/{{ include "orlop.secretName" . }} (key control-plane-token)
+
+Next steps:
+  1. Register the server with the control plane and seed an admin (operator CLI):
+       kubectl exec deploy/{{ include "orlop.control.name" . }} -- \
+         orlop-control server register --data-addr {{ include "orlop.server.name" . }}:{{ .Values.server.dataPort }} --ops-addr {{ include "orlop.server.name" . }}:{{ .Values.server.opsPort }}
+     (see docs/control-plane-runbook.md for the full bring-up: CA, user seed, tokens)
+
+  2. Port-forward the control API to try it:
+       kubectl port-forward svc/{{ include "orlop.control.name" . }} {{ .Values.control.port }}:{{ .Values.control.port }}
+
+  3. Mount a disk with the mount image (ghcr.io/liu1700/orlop-mount) — see docs/container-images.md.
+
+Full reference: docs/kubernetes.md
