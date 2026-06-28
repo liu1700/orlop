@@ -1,16 +1,26 @@
 # Control-plane runbook
 
 Operator workflows for the orlop control plane. The CA design and rationale live
-in [`design-auth.md`](./design-auth.md). For a single-node bring-up that exercises
-the whole stack end to end, see [`standalone-quickstart.md`](./standalone-quickstart.md).
+in [`design-auth.md`](design-auth.md); the full control-plane config reference
+(every env var) is in [`control-plane.md`](control-plane.md), and the production
+security obligations are canonical in [`SECURITY.md`](../SECURITY.md). For a
+single-node bring-up that exercises the whole stack end to end, see
+[`standalone-quickstart.md`](standalone-quickstart.md).
 
 ## Trust hierarchy
 
 ```
-org root CA           (10y, ed25519, offline operator machine)
-  └── tenant CA       (1y,  ed25519, online: control-plane secret store)
+org root CA           (10y, ed25519; generated offline, then loaded into the
+  │                          control-plane secret store — never onto an orlop-server VM)
+  └── tenant CA       (1y,  ed25519, control-plane secret store)
         └── agent     (1h,  ed25519, minted on every /agent/enroll)
 ```
+
+Both the root and tenant keys live in the **control-plane** secret store at
+runtime: the control plane is the CA, and signs with the root key at boot (its
+own client cert) and on demand (tenant intermediates, server CSRs). What never
+reaches a **data-plane** (`orlop-server`) VM is any signing key — those hold only
+the public root cert as a trust anchor.
 
 Each agent leaf carries **two** SPIFFE URI SANs:
 
@@ -28,11 +38,15 @@ never from the request body.
 
 ## Bootstrapping the CA
 
-### 1. Org root (offline operator machine)
+### 1. Org root
 
-The org root signing key must never be present on a server VM. It lives on an
-operator workstation; the only output that leaves that machine is the public root
-cert, which ships with every server deploy bundle as a trust anchor.
+Generate the org root on an operator workstation. The control plane needs the
+root **key** to mint its own client cert at boot and to sign tenant intermediates
+and server CSRs, so it must be provisioned into the control-plane secret store —
+the filesystem backend (`ORLOP_SECRETS_DIR`) below, or generated directly into
+encrypted Postgres (`ORLOP_SECRETS_BACKEND=postgres`). The key that must **never**
+reach a data-plane (`orlop-server`) VM is the root key; those VMs hold only the
+public root cert.
 
 ```sh
 # on the operator workstation; pick a vault directory you control.
@@ -48,14 +62,17 @@ The command is idempotent: if a root already exists in
 `$ORLOP_SECRETS_DIR/ca/root/`, it is loaded as-is and the command is a no-op.
 Re-running never rotates the root.
 
-Distribute `ca/root/cert.pem`, and only the cert, to every server deploy bundle.
+Distribute `ca/root/cert.pem`, and only the cert, to every orlop-server deploy
+bundle as its trust anchor.
 
 ### 2. Tenant intermediate (online, signed against the root)
 
-Run on the operator machine while the root is reachable, then upload the
-resulting cert and key into the deploy target's secret manager. On the running
-control plane the materials are decrypted into process memory at boot, never
-written to disk on the VM.
+Run on the operator machine while the root is reachable, then provision the
+resulting cert and key into the control-plane secret store. How they live there
+depends on the backend: the filesystem backend (`ORLOP_SECRETS_DIR`) keeps them as
+`0600` files; the encrypted-Postgres backend (`ORLOP_SECRETS_BACKEND=postgres` +
+`ORLOP_SECRETS_ENC_KEY`) stores them encrypted and decrypts into process memory at
+boot.
 
 ```sh
 orlop-control ca init --tenant acme
@@ -63,16 +80,41 @@ orlop-control ca init --tenant acme
 ```
 
 Idempotent. Repeat per tenant. Upload `ca/tenant/<id>/cert.pem` to the matching
-tenant's orlop-server VM (used as the server's client-CA trust), and upload both
-files to the control-plane secret store. `orlop-control ca list` prints the tenant
-intermediates currently loaded from the vault.
+tenant's orlop-server VM (used as the server's client-CA trust), and provision
+both files into the control-plane secret store. `orlop-control ca list` prints the
+tenant intermediates currently loaded from the vault.
+
+## Running the control plane
+
+With the CA provisioned, apply the schema and start the service. `orlop-control`
+with no subcommand starts the HTTP server.
+
+```sh
+orlop-control migrate up        # applies the embedded schema (Postgres or SQLite)
+orlop-control                   # start the service (PORT=8080 by default)
+```
+
+The boot-critical secrets and gates — full reference in
+[`control-plane.md`](control-plane.md), obligations in [`SECURITY.md`](../SECURITY.md):
+
+- **A CA backend** (`ORLOP_SECRETS_DIR`, or `ORLOP_SECRETS_BACKEND=postgres` with
+  `ORLOP_SECRETS_ENC_KEY`). Without one, `/agent/enroll` and server-cert signing
+  are not served; a postgres CA backend without an encryption key fails closed
+  unless you set `ORLOP_SECRETS_ALLOW_PLAINTEXT=1`.
+- **`ORLOP_CONTROL_PLANE_TOKEN`** — the service token gating provisioning,
+  enroll-token minting, and server-cert signing. Those routes reject until it is
+  set.
+- **`ORLOP_CA_TENANT_ALLOWLIST` / `ORLOP_CA_ALLOW_DYNAMIC_TENANTS`** — gate which
+  tenants may have a CA intermediate lazily bootstrapped on first enroll (dynamic
+  on by default; a typo'd boolean fails boot rather than falling back to the
+  permissive default).
 
 ## Provisioning a tenant server cert
 
 orlop-server presents a TLS server cert that must chain through the same tenant
 intermediate the agent receives via `/agent/enroll`. The agent uses that chain as
 its only server trust anchor (it does not consult the system trust store; see
-[`design-auth.md`](./design-auth.md)). Mint that cert with:
+[`design-auth.md`](design-auth.md)). Mint that cert with:
 
 ```sh
 orlop-control ca mint-server-cert \
@@ -116,7 +158,7 @@ These commands operate on the control-plane database. They all read `DATABASE_UR
 from the environment (or take `--database-url`), and possession of `DATABASE_URL`
 is the operator credential, the same trust model as `ca init`. `DATABASE_URL`
 accepts either `postgres://...` or `sqlite:...`; see
-[`database-backends.md`](./database-backends.md).
+[`database-backends.md`](database-backends.md).
 
 | Task                                   | Command                        |
 | -------------------------------------- | ------------------------------ |
@@ -207,7 +249,7 @@ The mount client trades `ORLOP_ENROLL_TOKEN` at `/agent/enroll` for a 1h agent
 leaf. Optional flags: `--owner UUID` (the owning account), `--size BYTES` (initial
 disk grant, default 1 GiB), and `--mount-point PATH`. For the full end-to-end
 flow (database, control plane, `server register`, the data-plane server, mount,
-and a durability check), follow [`standalone-quickstart.md`](./standalone-quickstart.md).
+and a durability check), follow [`standalone-quickstart.md`](standalone-quickstart.md).
 
 ### Suspend a user
 
@@ -290,4 +332,4 @@ To cut a single user off, use `orlop-control user suspend` (see above).
 | Agent leaf                   | One user, up to 1h.                                                                                            | None needed; the cert expires. Cut it short via the deny-list.                                           |
 | Tenant intermediate          | All agents in that tenant for as long as the intermediate is trusted by the server.                           | Rotate the intermediate. Up to 1h until all outstanding leaves expire.                                   |
 | Org root                     | All tenants and all environments using that root. The attacker can mint intermediates that pass verification. | Emergency root rotation. Re-bootstrap every server VM and every tenant intermediate against the new root.|
-| Control-plane process memory | Equivalent to a tenant intermediate compromise per tenant whose intermediate was loaded at the time.          | Rotate every loaded intermediate.                                                                        |
+| Control-plane process memory | Holds the org root key, so worst case equals an org-root compromise: arbitrary tenant certs can be minted.     | Emergency root rotation (above).                                                                         |

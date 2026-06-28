@@ -44,7 +44,7 @@ Three properties have to hold on every connection:
 | Agent cert leaked | 1h leaf TTL bounds the window. Releasing the mount lease puts the leaf's serial on a data-plane deny-list; the server drops it mid-TTL within the reconcile window (~60s). Rotating the tenant intermediate is the backstop. |
 | Tenant A forges a leaf bearing tenant B's SAN | The TLS handshake completes (the forged leaf chains to the shared org root), but the data-plane tenant-binding check fails closed and the connection is dropped before any frame is served. |
 | Stolen/forged bearer token at `/agent/enroll` | Opaque tokens carry ≥128 bits of entropy; only hashes are stored; unknown, expired, revoked, consumed, suspended-user and suspended-tenant tokens are rejected. Enroll tokens are single-use, spent the moment a cert is minted. |
-| Replay of an old cert | Leaf TTL is 1h; the server tolerates ±5 min of clock skew. |
+| Replay of an old cert | Bounded by the 1h leaf TTL (and, for a released cert, the deny-list above). The only clock-skew allowance is the leaf's `NotBefore`, back-dated 5 min at issue; there is no extra leeway on expiry. |
 | Server impersonation | The client trusts **only** the org root delivered in `ca.pem` at enroll. The server's leaf is signed by that org root, so a public-PKI or self-signed cert is rejected; the client never falls back to a system trust store. |
 | MITM on the wire | TLS 1.3 only, mutual cert auth on every connection. |
 | Compromised control plane | Worst case: the attacker can mint arbitrary tenant certs. Mitigations: the CA signing key is encrypted at rest in the secret store and decrypted into memory only on boot; every signing event is audited; enroll is rate-limited per token. |
@@ -108,7 +108,7 @@ re-signed in place before expiry). The private key never leaves the server pod.
 | **Tenant intermediate** | org root | CN `<ORG> Tenant <id> Intermediate`, OU `tenant=<id>` | none | none | CertSign, CRLSign (IsCA); `PermittedURIDomains=[td]` | 1y |
 | **Agent leaf** | tenant intermediate | CN `<userID>`, OU `tenant=<id>` | `tenant/<id>`, `agent/<agentID>` | none | DigitalSignature, ExtKeyUsage ClientAuth | 1h |
 | **Server leaf** | org root | CN `<fqdn>` | none | `<fqdn>` | DigitalSignature, KeyEncipherment, ExtKeyUsage ServerAuth | ~90d |
-| **Control-plane** | org root | CN `orlop-control` | `control` | none | DigitalSignature, ExtKeyUsage ClientAuth | (short) |
+| **Control-plane** | org root | CN `orlop-control` | `control` | none | DigitalSignature, ExtKeyUsage ClientAuth | 30d |
 
 The agent's user id rides in the leaf Subject CN (for the audit trail); the
 tenant id is duplicated into the OU as `tenant=<id>`; that OU is what the
@@ -202,6 +202,30 @@ What happens on connect:
 The attacker can only ever mint leaves that bind to tenant A, because that is the
 tenant their intermediate's OU says. A leaked signing key is contained to its own
 tenant.
+
+## Path confinement within a tenant
+
+Tenant binding keeps tenants apart; a second gate keeps agents *within* a tenant
+apart. An agent's disk is a single top-level directory named by its id
+(`/<agentID>`), and for any cert carrying an `agent/<id>` SAN, `checkAgentPath`
+(`cmd/orlop-server/dataplane_server.go`) gates **every** path-bearing op
+(`manifest_get/put/delete/rename`, `list`, `dir_create/remove`, `setattr`,
+`symlink`, `chunk_*`):
+
+1. **Canonical-path check.** The requested path must already be canonical —
+   `path.Clean("/"+p)` must equal its raw leading-slash form — so `..`, `.`,
+   `//`, and trailing-slash variants are rejected up front. This guarantees the
+   path the server *authorizes* is byte-for-byte the path it later *stores*, so a
+   request can't authorize one subtree (`/A/x`) while storage resolves another
+   (`/A/../B/x`).
+2. **Subtree check.** The canonical path must be `/<agentID>` or sit under
+   `/<agentID>/`.
+
+Anything else returns `EACCES` ("path outside agent subtree") and is audited.
+Because the `agentID` comes from the verified SAN, not the request, a compromised
+agent can't rename, symlink, or `..`-escape into a sibling agent's tree. (A
+tenant-scoped cert with no agent SAN is rejected at the door, so there is no
+tenant-wide path that skips this gate.)
 
 ## Rotation and revocation
 

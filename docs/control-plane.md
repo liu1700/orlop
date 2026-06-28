@@ -7,14 +7,14 @@ the per-tenant `orlop-server`; once an agent is enrolled it reads and writes its
 files directly against that server over mTLS, keeping the control plane out of
 the data path.
 
-See [`design-auth.md`](./design-auth.md) for the certificate model,
-[`design-identity.md`](./design-identity.md) for host-issued JWT identity,
-[`database-backends.md`](./database-backends.md) for Postgres vs. SQLite, and
-[`control-plane-runbook.md`](./control-plane-runbook.md) for operator tasks.
+See [`design-auth.md`](design-auth.md) for the certificate model,
+[`design-identity.md`](design-identity.md) for host-issued JWT identity,
+[`database-backends.md`](database-backends.md) for Postgres vs. SQLite, and
+[`control-plane-runbook.md`](control-plane-runbook.md) for operator tasks.
 
 A machine-readable **OpenAPI spec** for the provisioning surface the Go SDK
 (`orlop/client`) exercises lives at
-[`openapi/orlop-control.yaml`](./openapi/orlop-control.yaml) — implement a client
+[`openapi/orlop-control.yaml`](https://github.com/liu1700/orlop/blob/main/docs/openapi/orlop-control.yaml) — implement a client
 in any language from it. The versioning and SDK↔server compatibility policy is
 in [Versioning and compatibility](#versioning-and-compatibility) below.
 
@@ -40,7 +40,7 @@ table names the one it requires.
 | Enroll token | `Authorization: Bearer <token>` | `orlop-control token issue` / `POST /v1/agents/{id}/enroll-token` (single-use) |
 | Admin session cookie | `HttpOnly` cookie set at `/admin/session?token=…` | `orlop-control user seed` |
 | Service token | `Authorization: Bearer $ORLOP_CONTROL_PLANE_TOKEN` | shared static token, set by the operator |
-| Host JWT | `Authorization: Bearer <jwt>` | a host-issued, signed JWT (see [`design-identity.md`](./design-identity.md)) |
+| Host JWT | `Authorization: Bearer <jwt>` | a host-issued, signed JWT (see [`design-identity.md`](design-identity.md)) |
 | Agent identity | client mTLS cert, or an `agent_fingerprint` body field | the leaf minted at enrollment |
 
 Bearer parsing is case-insensitive on the `Bearer` keyword and tolerates
@@ -56,14 +56,14 @@ Successful responses are JSON with `Content-Type: application/json`.
 | Code | Meaning |
 | --- | --- |
 | `200 OK` | success, JSON body |
-| `204 No Content` | success, no body (`POST /auth/logout`) |
+| `201 Created` | success, resource created (`POST /v1/tokens`) |
+| `204 No Content` | success, no body (`POST /auth/logout`, `DELETE /v1/entities/...`) |
 | `400 Bad Request` | malformed request |
 | `401 Unauthorized` | missing/invalid/expired credential (`invalid_token`, `invalid_client`) |
 | `403 Forbidden` | authenticated but not allowed (`access_denied`: suspended tenant/user, tenant not allowed, missing agent scope) |
 | `404 Not Found` | unknown resource |
 | `409 Conflict` | mount or capacity conflict (`wrong_agent`, `already_mounted`, `insufficient_capacity`) |
 | `410 Gone` | revoked allocation or lost lease (`revoked`, `lease_lost`) |
-| `422 Unprocessable Entity` | `quota_exceeded` |
 | `429 Too Many Requests` | rate limited (`rate_limited`) |
 | `503 Service Unavailable` | transient; retry. `POST /agent/enroll` adds `Retry-After: 60` when CA material or server placement is not yet ready |
 | `500 Internal Server Error` | `server_error` |
@@ -101,7 +101,7 @@ back-compat.
 Concretely today: every released orlop SDK and server (v0.1.0 through v0.2.x)
 speaks API major `1`, so any combination of them is supported. A future breaking
 change ships under `/v2` with `Orlop-API-Version: 2` and is called out as a
-breaking change in the release notes (see [`upgrade-safety.md`](./upgrade-safety.md)).
+breaking change in the release notes (see [`upgrade-safety.md`](upgrade-safety.md)).
 
 Other-language clients should: send `Authorization: Bearer <service token>`,
 optionally send `Orlop-API-Version: 1`, and check the response header to detect
@@ -112,11 +112,13 @@ skew the same way the Go SDK does.
 The set of mounted routes depends on configuration:
 
 - `GET /healthz` is always mounted.
-- The dashboard, API-token, `/v1/entities`, journal, and `/agent/enroll` routes
-  are mounted only when `DATABASE_URL` is set.
-- `/agent/enroll`, `POST /control/sign-server-cert`, and the `/v1/tenants` and
-  `/v1/admin` service routes additionally need an agent CA configured (a
-  filesystem CA at `ORLOP_SECRETS_DIR`, or the in-DB CA via
+- The dashboard, API-token, `/v1/entities`, `/v1/admin`, `/v1/tenants`, journal,
+  and `/agent/enroll` routes are mounted only when `DATABASE_URL` is set.
+  (`/v1/tenants/{owner}/usage` and `/v1/admin/purge-sweep` mount on the database
+  alone but return `503` until an agent CA is configured, since they call the
+  data plane.)
+- `/agent/enroll` and `POST /control/sign-server-cert` additionally need an agent
+  CA configured (a filesystem CA at `ORLOP_SECRETS_DIR`, or the in-DB CA via
   `ORLOP_SECRETS_BACKEND=postgres`).
 - `GET /v1/whoami` is mounted only when `ORLOP_IDENTITY_AUDIENCE` is set, and is
   independent of `DATABASE_URL`.
@@ -131,17 +133,17 @@ The set of mounted routes depends on configuration:
 | GET | `/me` | admin session cookie | dashboard: current user |
 | GET | `/allocations` | admin session cookie | dashboard: list the user's disk allocations |
 | GET | `/allocations/{id}/usage` | admin session cookie | dashboard: per-allocation usage |
-| POST | `/allocations/{id}/revoke` | admin session cookie or bearer | revoke an allocation |
+| POST | `/allocations/{id}/revoke` | admin session cookie | revoke an allocation |
 | POST | `/allocations/{id}/mount` | agent identity | acquire the exclusive mount lease |
 | POST | `/allocations/{id}/mount/refresh` | agent identity | extend the mount lease |
 | DELETE | `/allocations/{id}/mount` | agent identity | release the mount lease |
 | POST | `/allocations/{id}/unmount` | admin session cookie | owner-forced unmount |
-| POST | `/v1/tokens` | bearer or admin session cookie | mint a long-lived `orlop_…` API token (shown once) |
-| GET | `/v1/tokens` | bearer or admin session cookie | list API tokens |
-| DELETE | `/v1/tokens/{id}` | bearer or admin session cookie | revoke an API token |
-| GET | `/v1/journal` | admin session cookie or bearer | tenant write journal (paged) |
-| POST | `/v1/journal/revert` | admin session cookie or bearer | revert a `(path, seq)` |
-| GET | `/v1/journal/stream` | admin session cookie or bearer | journal SSE stream |
+| POST | `/v1/tokens` | admin session cookie | mint a long-lived `orlop_…` API token (shown once; `201`) |
+| GET | `/v1/tokens` | admin session cookie | list API tokens |
+| DELETE | `/v1/tokens/{id}` | admin session cookie | revoke an API token (`204`) |
+| GET | `/v1/journal` | admin session cookie | tenant write journal (paged) |
+| POST | `/v1/journal/revert` | admin session cookie | revert a `(path, seq)` |
+| GET | `/v1/journal/stream` | admin session cookie | journal SSE stream |
 | POST | `/v1/entities` | service token | provision an owner/agent + disk allocation |
 | GET | `/v1/entities/{type}/{id}` | service token | resolve an entity |
 | PATCH | `/v1/entities/{type}/{id}` | service token | set an agent's quota |
@@ -243,7 +245,7 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 | Variable | Meaning |
 | --- | --- |
 | `PORT` | HTTP listen port. Default `8080`. |
-| `DATABASE_URL` | Storage backend. Accepts a `postgres://…` DSN or a `sqlite:…` URL; the scheme selects the backend. Without it, the dashboard, `/v1/entities`, journal, and enroll routes are not mounted. See [`database-backends.md`](./database-backends.md). |
+| `DATABASE_URL` | Storage backend. Accepts a `postgres://…` DSN or a `sqlite:…` URL; the scheme selects the backend. Without it, the dashboard, `/v1/entities`, journal, and enroll routes are not mounted. See [`database-backends.md`](database-backends.md). |
 | `ORLOP_SECRETS_DIR` | Filesystem secrets root holding CA material (the default CA backend). |
 | `ORLOP_SECRETS_BACKEND` | `postgres` keeps the CA (root key + tenant intermediates) in the shared DB instead of on disk; any other value uses the filesystem backend at `ORLOP_SECRETS_DIR`. `/agent/enroll` mounts whenever a CA is configured by *either* backend, so `ORLOP_SECRETS_DIR` is not strictly required. `postgres` requires a Postgres `DATABASE_URL`. |
 | `ORLOP_SECRETS_ENC_KEY` | Hex-encoded 32-byte AES key; encrypts CA values at rest. Recommended with `ORLOP_SECRETS_BACKEND=postgres`. |
@@ -253,7 +255,7 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 | `ORLOP_COOKIE_DOMAIN` | Domain for the admin session cookie. |
 | `ORLOP_CONTROL_PLANE_TOKEN` | Shared service token gating the `/v1/entities`, `/v1/admin`, `/v1/tenants`, and `/control/sign-server-cert` routes. Empty ⇒ those routes reject every request (fail closed). |
 | `ORLOP_API_TOKEN_TTL` | Expiry for newly minted `orlop_…` API tokens (e.g. `2160h`). `0` (default) ⇒ never expire. |
-| `ORLOP_INITIAL_GRANT_BYTES` | Disk granted at provision when no `quota_bytes` is supplied. Default 1 GiB. |
+| `ORLOP_INITIAL_GRANT_BYTES` | Disk granted at provision when the request specifies no explicit size. Default 1 GiB. |
 | `ORLOP_DATAGW_SERVER_FQDN` | The only name `POST /control/sign-server-cert` will issue a server cert for. Default `orlop-server`. |
 | `ORLOP_DATAGW_SERVER_CERT_TTL` | Validity of a self-provisioned server cert (e.g. `2160h`). Default 90 days. |
 | `ORLOP_IDENTITY_AUDIENCE` | Enables the host-issued JWT identity verifier and mounts `GET /v1/whoami`; pins the JWT `aud`. The other `ORLOP_IDENTITY_*` knobs apply only when this is set. |
@@ -297,7 +299,7 @@ for `token issue`, `server register`, `user seed`, and `ca init`.
 
 Bring up storage, migrate, bootstrap the CA, and start the service. The example
 uses Postgres; substitute a `sqlite:…` `DATABASE_URL` to run with no external
-database (see [`database-backends.md`](./database-backends.md)).
+database (see [`database-backends.md`](database-backends.md)).
 
 ```bash
 export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/orlop_control

@@ -232,6 +232,12 @@ Two ops expose it on the wire:
 This is what lets an operator roll back an agent's writes to a known-good
 state after a bad run.
 
+Each committed entry is also broadcast over an in-process pub/sub
+(`cmd/orlop-server/journal_pubsub.go`) to per-allocation subscribers — a live
+feed of what an agent is changing, without polling. Delivery is non-blocking: a
+subscriber whose buffer fills is dropped and is expected to reconnect and
+backfill, so a slow consumer can never stall a writer's commit.
+
 ## 11. Garbage collection and leases
 
 **GC is reference-counted, not mark-and-sweep.** Because every manifest write
@@ -336,8 +342,8 @@ pushes to the client. (Codes from `cmd/orlop-server/dataplane/protocol.go`.)
 | `MKNOD` | 0x19 | client → server |
 
 A benchmark harness (`orlop-bench`, in `bench/`) drives synthetic filesystem
-workloads under emulated WAN; the TCP-vs-QUIC comparison that set the default
-is summarized in one line above (QUIC was ~4× slower on 100 MiB cold reads).
+workloads under emulated WAN to compare TCP and QUIC; TCP stays the default
+pending QUIC throughput parity on large cold reads.
 
 ## 13. Threat model
 
