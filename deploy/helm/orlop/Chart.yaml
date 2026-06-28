@@ -9,7 +9,7 @@ description: >-
 type: application
 version: 0.1.0
 # Tracks the orlop release whose images this chart targets by default.
-appVersion: "0.2.1"
+appVersion: "0.3.0"
 home: https://orlop.dev
 sources:
   - https://github.com/liu1700/orlop

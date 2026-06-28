@@ -20,7 +20,7 @@ Every release publishes `:vX.Y.Z` and moves `:latest`. Each push also prints an
 immutable manifest digest; pin it for reproducible deploys:
 
 ```bash
-docker pull ghcr.io/liu1700/orlop-control:v0.2.1
+docker pull ghcr.io/liu1700/orlop-control:v0.3.0
 # or, pinned by digest:
 docker pull ghcr.io/liu1700/orlop-control@sha256:<digest>
 ```
@@ -45,7 +45,7 @@ The control-plane HTTP API and the operator CLI — **the same binary**, so
 docker run --rm -p 8080:8080 \
   -e DATABASE_URL="postgres://user:pw@db:5432/orlop?sslmode=disable" \
   -e ORLOP_SECRETS_BACKEND=postgres \
-  ghcr.io/liu1700/orlop-control:v0.2.1 migrate up
+  ghcr.io/liu1700/orlop-control:v0.3.0 migrate up
 ```
 
 ## `orlop-server`

@@ -2,7 +2,7 @@ name: release
 
 # Cuts cross-platform binaries for all three orlop programs on tag push.
 #
-#   git tag v0.2.1 && git push origin v0.2.1
+#   git tag v0.3.0 && git push origin v0.3.0
 #
 # Each runner builds the two Go binaries (orlop-control, orlop-server) and the
 # Rust client (orlop) for its own OS/arch, tars them up, and a final job
