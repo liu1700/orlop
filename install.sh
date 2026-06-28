@@ -107,4 +107,4 @@ case ":$PATH:" in
 	;;
 esac
 
-info "next: run 'orlop doctor' to confirm this host can mount"
+info "next: run 'orlop dev up' to bring up a local stack (it self-preflights)"
