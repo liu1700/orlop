@@ -107,24 +107,29 @@ impl ChildGuard {
     }
 
     /// Graceful stop: SIGTERM, wait up to `timeout`, then SIGKILL. Claims the
-    /// child so Drop won't touch it.
-    fn stop(&mut self, timeout: Duration) {
+    /// child so Drop won't touch it. Returns `true` if the child stopped on its
+    /// own within `timeout` (or was already gone), `false` if it ignored
+    /// SIGTERM and had to be SIGKILL'd — a teardown problem worth surfacing.
+    fn stop(&mut self, timeout: Duration) -> bool {
         if let Some(mut c) = self.child.take() {
             eprintln!("  stopping {} (pid {})", self.name, c.id());
             crate::daemon::send_signal(c.id(), libc::SIGTERM);
             let deadline = Instant::now() + timeout;
             loop {
                 match c.try_wait() {
-                    Ok(Some(_)) => return,
+                    Ok(Some(_)) => return true,
                     Ok(None) if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(100));
                     }
                     _ => break,
                 }
             }
+            eprintln!("  {} did not stop within {timeout:?}; sending SIGKILL", self.name);
             let _ = c.kill();
             let _ = c.wait();
+            return false;
         }
+        true
     }
 }
 
@@ -290,16 +295,47 @@ pub fn run_dev_up(opts: DevUpOpts) -> Result<()> {
 
     // Supervise until Ctrl-C / SIGTERM, or until a child dies on its own.
     install_signal_handlers();
-    supervise(&mut control, &mut server, &mut mount);
+    let reason = supervise(&mut control, &mut server, &mut mount);
+    match &reason {
+        ExitReason::Signaled => eprintln!("\nshutting down orlop dev stack…"),
+        ExitReason::ChildDied(name) => {
+            eprintln!("\n{name} exited unexpectedly; tearing down the rest of the stack")
+        }
+    }
 
     // Teardown in dependency order: mount (releases lease) → server → control.
-    eprintln!("\nshutting down orlop dev stack…");
-    mount.stop(STOP_TIMEOUT);
-    server.stop(STOP_TIMEOUT);
-    control.stop(STOP_TIMEOUT);
+    let mut teardown_ok = mount.stop(STOP_TIMEOUT);
+    teardown_ok &= server.stop(STOP_TIMEOUT);
+    teardown_ok &= control.stop(STOP_TIMEOUT);
     let _ = fs::remove_file(&state_path);
     eprintln!("stack down. data kept in {} (rm -rf to discard)", work_dir.display());
-    Ok(())
+
+    shutdown_result(reason, teardown_ok)
+}
+
+/// Why [`supervise`] returned.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitReason {
+    /// SIGINT/SIGTERM asked us to stop — the documented, intended way to bring
+    /// the stack down, and therefore a success.
+    Signaled,
+    /// A supervised child exited on its own (crash); names the component.
+    ChildDied(&'static str),
+}
+
+/// Decide `orlop dev up`'s exit status from why supervision ended and whether
+/// teardown was clean (issue #52). A signal-initiated shutdown is success;
+/// non-zero is reserved for a child that crashed or teardown that errored.
+fn shutdown_result(reason: ExitReason, teardown_ok: bool) -> Result<()> {
+    match reason {
+        ExitReason::Signaled if teardown_ok => Ok(()),
+        ExitReason::Signaled => {
+            bail!("dev stack stopped on signal, but teardown reported errors (see log above)")
+        }
+        ExitReason::ChildDied(name) => {
+            bail!("dev stack went down because the {name} exited unexpectedly (see its log)")
+        }
+    }
 }
 
 /// Fail-fast checks shared by the foreground and detached bring-up paths:
@@ -552,22 +588,26 @@ fn reap_pid(pid: u32, name: &str, timeout: Duration) {
     }
 }
 
-fn supervise(control: &mut ChildGuard, server: &mut ChildGuard, mount: &mut ChildGuard) {
+/// Block until a shutdown signal arrives or a supervised child exits on its
+/// own, reporting which happened so the caller can pick the right exit status.
+fn supervise(
+    control: &mut ChildGuard,
+    server: &mut ChildGuard,
+    mount: &mut ChildGuard,
+) -> ExitReason {
     while !SHUTDOWN.load(Ordering::SeqCst) {
         if !mount.is_running() {
-            eprintln!("\nmount process exited; tearing down the rest of the stack");
-            break;
+            return ExitReason::ChildDied("mount");
         }
         if !server.is_running() {
-            eprintln!("\ndata-plane server exited; tearing down the rest of the stack");
-            break;
+            return ExitReason::ChildDied("data plane");
         }
         if !control.is_running() {
-            eprintln!("\ncontrol plane exited; tearing down the rest of the stack");
-            break;
+            return ExitReason::ChildDied("control plane");
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    ExitReason::Signaled
 }
 
 fn install_signal_handlers() {
@@ -936,6 +976,24 @@ mod tests {
         let args = detached_args(&opts);
         let i = args.iter().position(|a| a == "--mountpoint").expect("--mountpoint");
         assert_eq!(args[i + 1], "/tmp/mp");
+    }
+
+    #[test]
+    fn signal_shutdown_with_clean_teardown_is_success() {
+        // issue #52: Ctrl-C / SIGTERM is the intended way to stop → exit 0.
+        assert!(shutdown_result(ExitReason::Signaled, true).is_ok());
+    }
+
+    #[test]
+    fn signal_shutdown_with_failed_teardown_is_error() {
+        // A child that ignored SIGTERM (had to be SIGKILL'd) is a real fault.
+        assert!(shutdown_result(ExitReason::Signaled, false).is_err());
+    }
+
+    #[test]
+    fn child_crash_is_error_even_if_rest_torn_down_cleanly() {
+        let err = shutdown_result(ExitReason::ChildDied("control plane"), true).unwrap_err();
+        assert!(err.to_string().contains("control plane"), "got: {err}");
     }
 
     #[test]

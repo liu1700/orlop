@@ -104,6 +104,11 @@ orlop dev down            # graceful teardown; waits for unmount + exit, returns
 whose supervisor died uncleanly, so it's safe to call from a CI cleanup step.
 The detached supervisor logs to `./orlop-dev/dev.log`.
 
+A foreground `dev up` stopped by **Ctrl-C / SIGTERM exits 0** — the intended,
+graceful stop — so a process supervisor or CI step won't mistake a normal stop
+for a crash. It exits non-zero only on a real failure (the stack couldn't come
+up, a component crashed while running, or teardown errored).
+
 ## 3. Prove durability
 
 In a second shell, write a file to the disk:
