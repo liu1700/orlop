@@ -6,7 +6,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 )
+
+// APIVersion is the control-plane API major version this SDK is written against.
+// It is sent on every request as the Orlop-API-Version header and compared
+// against the server's advertised version so skew surfaces as an explicit
+// APIVersionError rather than an opaque 4xx. See the compatibility policy in
+// docs/control-plane.md.
+const APIVersion = "1"
+
+const apiVersionHeader = "Orlop-API-Version"
+
+// APIVersionError reports that the control plane advertised a control API major
+// version this SDK was not built against. When you see it, the SDK and server
+// are incompatible — upgrade one to a matching major (see the compatibility
+// policy). It is returned in preference to the underlying HTTP status so the
+// skew is unambiguous.
+type APIVersionError struct {
+	Client string // the SDK's APIVersion
+	Server string // the server's advertised Orlop-API-Version
+}
+
+func (e *APIVersionError) Error() string {
+	return fmt.Sprintf("orlop: control API version skew: SDK speaks v%s, server speaks v%s", e.Client, e.Server)
+}
 
 // HTTPClient talks to a running orlop control plane (orlop-control) over its
 // REST API. Construct it with New. The zero value is not usable; set HTTP to
@@ -48,11 +72,17 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body, out any)
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(apiVersionHeader, APIVersion)
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	// Detect SDK<->server skew explicitly. A server that predates the header
+	// (empty) is left alone for back-compat; a differing MAJOR is incompatible.
+	if sv := resp.Header.Get(apiVersionHeader); sv != "" && apiMajor(sv) != apiMajor(APIVersion) {
+		return &APIVersionError{Client: APIVersion, Server: sv}
+	}
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("orlop %s %s: status %d", method, path, resp.StatusCode)
 	}
@@ -175,4 +205,13 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// apiMajor returns the major component of a version string ("1" from "1",
+// "1.2" from "1.2"). Compatibility is decided on the major alone.
+func apiMajor(v string) string {
+	if i := strings.IndexByte(v, '.'); i >= 0 {
+		return v[:i]
+	}
+	return v
 }
