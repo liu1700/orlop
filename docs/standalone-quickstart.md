@@ -88,6 +88,11 @@ All state lives under `./orlop-dev` (override with `--dir`); the disk mounts at
 orlop status        # control plane / data plane / mount + liveness; --json for machine output
 ```
 
+`status` probes the actual PIDs and mount (it doesn't just trust its cached
+state), so a stack that died uncleanly reports `DEAD` — never a false `UP`. The
+header is `UP` / `DEGRADED` / `DEAD`; `--json` exposes it as `dev_stack.state`
+(`up` / `degraded` / `dead`) for scripts to poll.
+
 ### Run it without holding a terminal (CI, agents, IDEs)
 
 `orlop dev up` blocks in the foreground until Ctrl-C. To drive the stack from a

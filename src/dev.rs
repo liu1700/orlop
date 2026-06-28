@@ -780,11 +780,60 @@ struct StatusReport {
 
 #[derive(Serialize)]
 struct DevStackStatus {
+    /// Overall health, probed live — not trusted from the cached state file.
+    state: StackState,
     work_dir: PathBuf,
     control_plane_url: String,
+    /// The `dev up` supervisor. `None` only for a pre-#51 state file that
+    /// predates recording it, in which case health falls back to the children.
+    supervisor: Option<ProcStatus>,
     control: ProcStatus,
     server: ServerStatus,
     mount: MountStatus,
+}
+
+/// Live health of a dev stack, derived by probing PIDs and the mount rather
+/// than trusting `dev.json` (issue #53).
+#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum StackState {
+    /// Supervisor alive and all three components running + mounted.
+    Up,
+    /// Supervisor alive but a component is down or the disk is unmounted.
+    Degraded,
+    /// Supervisor gone (or every component gone) — the cached state is stale.
+    Dead,
+}
+
+impl StackState {
+    fn label(self) -> &'static str {
+        match self {
+            StackState::Up => "UP",
+            StackState::Degraded => "DEGRADED",
+            StackState::Dead => "DEAD",
+        }
+    }
+}
+
+/// Pure health decision from the probed liveness signals. `supervisor_running`
+/// is `None` when the state file predates recording the supervisor PID.
+fn compute_stack_state(
+    control_running: bool,
+    server_running: bool,
+    mount_running: bool,
+    mounted: bool,
+    supervisor_running: Option<bool>,
+) -> StackState {
+    let supervisor_dead = supervisor_running == Some(false);
+    let nothing_alive = !control_running && !server_running && !mount_running && !mounted;
+    if supervisor_dead || nothing_alive {
+        return StackState::Dead;
+    }
+    if control_running && server_running && mount_running && mounted {
+        StackState::Up
+    } else {
+        StackState::Degraded
+    }
 }
 
 #[derive(Serialize)]
@@ -810,26 +859,47 @@ struct MountStatus {
     agent_id: String,
 }
 
-/// `orlop status` — report a running dev stack and/or mount daemon.
+/// `orlop status` — report a running dev stack and/or mount daemon. Liveness is
+/// probed (PIDs + mountpoint), never trusted from the cached state file, so a
+/// stack that died uncleanly is reported as DEAD rather than a false UP (#53).
 pub fn run_status(json: bool) -> Result<()> {
     let dev = load_dev_state();
-    let dev_status = dev.map(|d| DevStackStatus {
-        control: ProcStatus { pid: d.control_pid, running: crate::daemon::pid_alive(d.control_pid) },
-        server: ServerStatus {
+    let dev_status = dev.map(|d| {
+        let control = ProcStatus { pid: d.control_pid, running: crate::daemon::pid_alive(d.control_pid) };
+        let server = ServerStatus {
             pid: d.server_pid,
             running: crate::daemon::pid_alive(d.server_pid),
             ops_addr: d.ops_addr,
             data_addr: d.data_addr,
-        },
-        mount: MountStatus {
+        };
+        let mount = MountStatus {
             pid: d.mount_pid,
             running: crate::daemon::pid_alive(d.mount_pid),
             mounted: crate::daemon::is_mountpoint_active(&d.mountpoint),
             mountpoint: d.mountpoint,
             agent_id: d.agent_id,
-        },
-        work_dir: d.work_dir,
-        control_plane_url: d.control_plane_url,
+        };
+        // supervisor_pid == 0 means a pre-#51 state file that never recorded it.
+        let supervisor = (d.supervisor_pid != 0).then(|| ProcStatus {
+            pid: d.supervisor_pid,
+            running: crate::daemon::pid_alive(d.supervisor_pid),
+        });
+        let state = compute_stack_state(
+            control.running,
+            server.running,
+            mount.running,
+            mount.mounted,
+            supervisor.as_ref().map(|s| s.running),
+        );
+        DevStackStatus {
+            state,
+            work_dir: d.work_dir,
+            control_plane_url: d.control_plane_url,
+            supervisor,
+            control,
+            server,
+            mount,
+        }
     });
 
     let mount_daemon = crate::daemon::pid_file_path()
@@ -862,7 +932,18 @@ fn render_status(r: &StatusReport) -> String {
     let mut s = String::from("orlop status\n\n");
     match &r.dev_stack {
         Some(d) => {
-            s.push_str(&format!("dev stack: UP   (work dir {})\n", d.work_dir.display()));
+            s.push_str(&format!(
+                "dev stack: {}   (work dir {})\n",
+                d.state.label(),
+                d.work_dir.display(),
+            ));
+            if let Some(sup) = &d.supervisor {
+                s.push_str(&format!(
+                    "  supervisor     pid {}  {}\n",
+                    sup.pid,
+                    yesno(sup.running, "running", "DOWN"),
+                ));
+            }
             s.push_str(&format!(
                 "  control plane  {}  pid {}  {}\n",
                 d.control_plane_url,
@@ -883,6 +964,15 @@ fn render_status(r: &StatusReport) -> String {
                 d.mount.pid,
                 yesno(d.mount.mounted, "mounted", "NOT MOUNTED"),
             ));
+            match d.state {
+                StackState::Up => {}
+                StackState::Dead => s.push_str(
+                    "  → stack is not running; run `orlop dev down` to clear the stale state\n",
+                ),
+                StackState::Degraded => s.push_str(
+                    "  → some components are down; run `orlop dev down` then `orlop dev up`\n",
+                ),
+            }
         }
         None => s.push_str("dev stack: not running\n"),
     }
@@ -1020,16 +1110,22 @@ mod tests {
         assert!(out.contains("mount daemon: none"));
     }
 
+    fn stack_status(state: StackState, supervisor: Option<bool>, mounted: bool) -> DevStackStatus {
+        DevStackStatus {
+            state,
+            work_dir: PathBuf::from("/tmp/orlop-dev"),
+            control_plane_url: "http://localhost:8080".into(),
+            supervisor: supervisor.map(|running| ProcStatus { pid: 9, running }),
+            control: ProcStatus { pid: 10, running: true },
+            server: ServerStatus { pid: 11, running: true, ops_addr: "localhost:7878".into(), data_addr: "localhost:8443".into() },
+            mount: MountStatus { pid: 12, running: true, mountpoint: PathBuf::from("/tmp/orlop-dev/mnt"), mounted, agent_id: "demo".into() },
+        }
+    }
+
     #[test]
     fn render_status_shows_running_stack() {
         let r = StatusReport {
-            dev_stack: Some(DevStackStatus {
-                work_dir: PathBuf::from("/tmp/orlop-dev"),
-                control_plane_url: "http://localhost:8080".into(),
-                control: ProcStatus { pid: 10, running: true },
-                server: ServerStatus { pid: 11, running: true, ops_addr: "localhost:7878".into(), data_addr: "localhost:8443".into() },
-                mount: MountStatus { pid: 12, running: true, mountpoint: PathBuf::from("/tmp/orlop-dev/mnt"), mounted: true, agent_id: "demo".into() },
-            }),
+            dev_stack: Some(stack_status(StackState::Up, Some(true), true)),
             mount_daemon: None,
         };
         let out = render_status(&r);
@@ -1037,5 +1133,32 @@ mod tests {
         assert!(out.contains("http://localhost:8080"));
         assert!(out.contains("agent demo"));
         assert!(out.contains("mounted"));
+        // A healthy stack offers no cleanup hint.
+        assert!(!out.contains("dev down"));
+    }
+
+    #[test]
+    fn render_status_dead_stack_reports_dead_with_hint() {
+        let r = StatusReport {
+            dev_stack: Some(stack_status(StackState::Dead, Some(false), false)),
+            mount_daemon: None,
+        };
+        let out = render_status(&r);
+        assert!(out.contains("dev stack: DEAD"), "got: {out}");
+        assert!(out.contains("orlop dev down"), "expected cleanup hint, got: {out}");
+    }
+
+    #[test]
+    fn compute_stack_state_classifies_health() {
+        // Supervisor alive, everything up → UP.
+        assert_eq!(compute_stack_state(true, true, true, true, Some(true)), StackState::Up);
+        // Supervisor dead trumps live orphaned children → DEAD.
+        assert_eq!(compute_stack_state(true, true, true, true, Some(false)), StackState::Dead);
+        // Supervisor alive but the disk fell off → DEGRADED.
+        assert_eq!(compute_stack_state(true, true, true, false, Some(true)), StackState::Degraded);
+        // Nothing alive at all → DEAD even without supervisor info.
+        assert_eq!(compute_stack_state(false, false, false, false, None), StackState::Dead);
+        // Old state file (no supervisor pid), all healthy → UP.
+        assert_eq!(compute_stack_state(true, true, true, true, None), StackState::Up);
     }
 }
