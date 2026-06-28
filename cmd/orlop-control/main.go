@@ -380,6 +380,12 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 			return err
 		}
 		defer closeStore()
+		// Fail fast if migrations were never applied or an in-place upgrade left
+		// a schema gap, with an actionable error rather than a later opaque
+		// runtime failure (#39).
+		if err := verifyStoreSchema(ctx, st); err != nil {
+			return err
+		}
 		pool = p // non-nil only for Postgres; used by the "postgres" CA backend
 		deps.store = st
 		deps.devAuth = devauth.NewService(st, logger)
