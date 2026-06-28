@@ -40,6 +40,9 @@ pub struct OrlopNfs {
     policy: Policy,
     audit: Arc<AuditLog>,
     inodes: Inodes,
+    /// Wall-clock at mount, used as the stable fallback timestamp for
+    /// directories — which carry no manifest, so no stored mtime (issue #55).
+    started_ns: u64,
 }
 
 impl OrlopNfs {
@@ -49,7 +52,17 @@ impl OrlopNfs {
             policy,
             audit,
             inodes: Inodes::new(),
+            started_ns: Self::now_ns(),
         }
+    }
+
+    /// A sane, stable mtime/ctime/atime for a directory. Directories have no
+    /// manifest (so no stored mtime); without this they'd report the Unix epoch
+    /// (Dec 31 1969) over NFS. The mount time is non-zero and stable across
+    /// repeated stats, so tools that sort or filter by mtime aren't confused
+    /// (issue #55).
+    fn dir_time_ns(&self) -> u64 {
+        self.started_ns
     }
 
     /// Build the macOS-flavoured audit identity. `agent_pid` is intentionally
@@ -173,8 +186,8 @@ impl NFSFileSystem for OrlopNfs {
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let path = self.inodes.path_of(id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         if path.is_empty() {
-            // Root directory — no manifest, synthesise.
-            return Ok(self.fattr_for(id, EntryKind::Dir, 0, 0));
+            // Root directory — no manifest, synthesise a stable timestamp.
+            return Ok(self.fattr_for(id, EntryKind::Dir, 0, self.dir_time_ns()));
         }
         let entry = self
             .store
@@ -187,12 +200,14 @@ impl NFSFileSystem for OrlopNfs {
                 .manifest_get(&path)
                 .map(|m| m.mtime_ns)
                 .unwrap_or(0),
+            // Directories (and other manifest-less kinds) carry no stored
+            // mtime; report a stable non-epoch timestamp instead of 0.
             EntryKind::Dir
             | EntryKind::Symlink
             | EntryKind::Fifo
             | EntryKind::Socket
             | EntryKind::CharDev
-            | EntryKind::BlockDev => 0,
+            | EntryKind::BlockDev => self.dir_time_ns(),
         };
         Ok(self.fattr_for(id, entry.kind, entry.size, mtime_ns))
     }
@@ -280,12 +295,14 @@ impl NFSFileSystem for OrlopNfs {
                     .manifest_get(&rel)
                     .map(|m| m.mtime_ns)
                     .unwrap_or(0),
+                // Directories (and other manifest-less kinds) carry no stored
+                // mtime; report a stable non-epoch timestamp instead of 0.
                 EntryKind::Dir
                 | EntryKind::Symlink
                 | EntryKind::Fifo
                 | EntryKind::Socket
                 | EntryKind::CharDev
-                | EntryKind::BlockDev => 0,
+                | EntryKind::BlockDev => self.dir_time_ns(),
             };
             let attr = self.fattr_for(id, entry.kind, entry.size, mtime_ns);
             out.push(DirEntry {
@@ -489,7 +506,7 @@ impl NFSFileSystem for OrlopNfs {
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         let id = self.inodes.intern(&rel);
         self.record(event::MKDIR, &rel, true);
-        Ok((id, self.fattr_for(id, EntryKind::Dir, 0, Self::now_ns())))
+        Ok((id, self.fattr_for(id, EntryKind::Dir, 0, self.dir_time_ns())))
     }
 
     async fn rename(
@@ -939,6 +956,40 @@ mod tests {
     async fn capabilities_advertise_readwrite() {
         let (_s, _a, _p, nfs) = nfs_with(&[]);
         assert!(matches!(nfs.capabilities(), VFSCapabilities::ReadWrite));
+    }
+
+    #[tokio::test]
+    async fn directory_getattr_and_readdir_report_nonzero_mtime() {
+        // issue #55: directories carry no manifest, so without a synthesised
+        // timestamp they reported epoch 0 (Dec 31 1969) over NFS.
+        let (store, _audit, _path, nfs) = nfs_with(&[]);
+        let (dir_id, mkdir_attr) = nfs
+            .mkdir(nfs.root_dir(), &b"sub".to_vec().into())
+            .await
+            .expect("mkdir");
+        assert!(matches!(mkdir_attr.ftype, ftype3::NF3DIR));
+        // mkdir's returned attr is non-epoch...
+        assert_ne!(mkdir_attr.mtime.seconds, 0, "mkdir mtime should not be epoch 0");
+
+        // ...and a later getattr is consistent (same stable value), never epoch 0.
+        let got = nfs.getattr(dir_id).await.expect("getattr dir");
+        assert_ne!(got.mtime.seconds, 0, "dir getattr mtime should not be epoch 0");
+        assert_eq!(got.mtime.seconds, mkdir_attr.mtime.seconds, "dir mtime must be stable");
+        assert_eq!(got.ctime.seconds, got.mtime.seconds);
+
+        // The root directory must also report a non-epoch mtime.
+        let root = nfs.getattr(nfs.root_dir()).await.expect("getattr root");
+        assert_ne!(root.mtime.seconds, 0, "root mtime should not be epoch 0");
+
+        // And a directory entry surfaced via readdir carries it too.
+        let _ = store;
+        let listing = nfs.readdir(nfs.root_dir(), 0, 64).await.expect("readdir");
+        let sub = listing
+            .entries
+            .iter()
+            .find(|e| e.name.as_ref() == b"sub")
+            .expect("sub in listing");
+        assert_ne!(sub.attr.mtime.seconds, 0, "readdir dir entry mtime should not be epoch 0");
     }
 
     #[tokio::test]
