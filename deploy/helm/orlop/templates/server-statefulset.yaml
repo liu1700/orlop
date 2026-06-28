@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "orlop.server.name" . }}
+  labels:
+    {{- include "orlop.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  serviceName: {{ include "orlop.server.name" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        {{- include "orlop.labels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+      annotations:
+        # Roll the pod when the config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/server-configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: orlop-server
+          image: {{ include "orlop.server.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-config", "/etc/orlop/server.yaml"]
+          ports:
+            - name: ops
+              containerPort: {{ .Values.server.opsPort }}
+            - name: data
+              containerPort: {{ .Values.server.dataPort }}
+          env:
+            # Must equal control's ORLOP_CONTROL_PLANE_TOKEN — same Secret key.
+            - name: ORLOP_DATAGW_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orlop.secretName" . }}
+                  key: control-plane-token
+          volumeMounts:
+            - name: config
+              mountPath: /etc/orlop
+              readOnly: true
+            - name: data
+              mountPath: {{ .Values.server.persistence.dataDir }}
+          # The ops/data listeners are mTLS and require a client cert, so an
+          # HTTPS probe can't complete the handshake — a TCP connect is the right
+          # signal (the listeners bind only after self-provisioning succeeds).
+          # The probe opening/closing the socket logs a benign "TLS handshake
+          # error ... EOF" each interval; that's the probe, not a real error.
+          readinessProbe:
+            tcpSocket:
+              port: ops
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: ops
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- with .Values.server.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "orlop.server.name" . }}-config
+        {{- if not .Values.server.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.server.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.server.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.server.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.server.persistence.size | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "orlop.server.name" . }}
+  labels:
+    {{- include "orlop.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  # Headless: clients reach the server by this name (== the cert SAN), so name
+  # resolution and TLS verification agree.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: server
+  ports:
+    - name: ops
+      port: {{ .Values.server.opsPort }}
+      targetPort: ops
+    - name: data
+      port: {{ .Values.server.dataPort }}
+      targetPort: data

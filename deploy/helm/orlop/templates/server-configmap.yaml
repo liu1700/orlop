@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "orlop.server.name" . }}-config
+  labels:
+    {{- include "orlop.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+data:
+  server.yaml: |
+    tenant:
+      id: {{ .Values.server.tenant.id | quote }}
+      name: {{ .Values.server.tenant.name | quote }}
+    store:
+      type: local
+      root: {{ .Values.server.persistence.dataDir }}/objects
+    routes:
+      type: sqlite
+      path: {{ .Values.server.persistence.dataDir }}/routes.db
+    server:
+      ops_bind: ":{{ .Values.server.opsPort }}"
+      data_bind: ":{{ .Values.server.dataPort }}"
+    tls:
+      # Self-provision: the server generates a keypair in memory, sends a CSR to
+      # the control plane (authenticated by ORLOP_DATAGW_SERVICE_TOKEN), and
+      # serves the returned cert. No out-of-band `ca mint-server-cert`, no TLS
+      # secret to manage.
+      self_provision: true
+      control_url: {{ include "orlop.controlURL" . | quote }}
+      # Must equal control's ORLOP_DATAGW_SERVER_FQDN and the server Service name.
+      fqdn: {{ include "orlop.server.name" . | quote }}
+      trust_domain: {{ .Values.trustDomain | quote }}
+    tenants_root: {{ .Values.server.persistence.dataDir }}/tenants
+    quota:
+      enforce: {{ .Values.server.quota.enforce }}

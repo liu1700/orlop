@@ -1,0 +1,91 @@
+# Default values for the orlop reference chart.
+#
+# The three things you MUST set (or supply via auth.existingSecret + database):
+#   - auth.controlPlaneToken : the shared control<->server token
+#   - auth.secretsEncKey     : hex 32-byte AES key for the in-Postgres CA root key
+#   - database.url           : the external Postgres connection string
+#
+# Generate the secrets:
+#   openssl rand -hex 32   # secretsEncKey (exactly 32 bytes / 64 hex chars)
+#   openssl rand -hex 24   # controlPlaneToken (any high-entropy string)
+
+image:
+  registry: ghcr.io/liu1700
+  pullPolicy: IfNotPresent
+  # Tags default to the chart's appVersion when left empty.
+  control:
+    repository: orlop-control
+    tag: ""
+  server:
+    repository: orlop-server
+    tag: ""
+  pullSecrets: []
+
+# --- shared identity, wired into BOTH components from one place ---------------
+# These three values are the cross-component constraints that are easy to get
+# subtly wrong by hand. The chart derives both sides from a single source, so
+# they cannot drift:
+#   - the server Service is NAMED serverFQDN, and both control's
+#     ORLOP_DATAGW_SERVER_FQDN and the server's tls.fqdn use serverFQDN — so the
+#     cert SAN always matches the name clients connect to (no fqdn_not_allowed).
+#   - trustDomain is set on both sides.
+#   - the shared token lives in one Secret, read by control as
+#     ORLOP_CONTROL_PLANE_TOKEN and by the server as ORLOP_DATAGW_SERVICE_TOKEN.
+serverFQDN: orlop-server
+trustDomain: orlop.example
+orgName: ORL
+
+auth:
+  # Required unless existingSecret is set.
+  controlPlaneToken: ""
+  secretsEncKey: ""
+  # Optionally bring your own Secret (recommended for production). It must
+  # contain keys: control-plane-token, secrets-enc-key, database-url.
+  existingSecret: ""
+
+database:
+  # Required unless auth.existingSecret is set. The chart does NOT run Postgres;
+  # point this at your managed/long-lived database.
+  url: "" # e.g. postgres://orlop:pw@postgres:5432/orlop?sslmode=disable
+
+# --- control plane -----------------------------------------------------------
+control:
+  replicas: 1
+  port: 8080
+  # `orlop-control migrate up` runs as an initContainer before each pod serves.
+  # Idempotent and schema-self-checking (see docs/upgrade-safety.md).
+  runMigrations: true
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# --- data-plane server -------------------------------------------------------
+server:
+  opsPort: 7878
+  dataPort: 8443
+  # The server image runs as distroless nonroot (uid/gid 65532). fsGroup makes
+  # the PVC group-owned by that gid so the nonroot process can write to /data;
+  # without it, many CSI drivers leave the volume root-owned and the pod
+  # crashes. Override/empty if your storage handles ownership differently.
+  podSecurityContext:
+    fsGroup: 65532
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+  # Bootstrap tenant; more register on enroll.
+  tenant:
+    id: a_demo
+    name: demo agent disk
+  quota:
+    enforce: false
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+    # mountPath for object store + routes DB + tenants.
+    dataDir: /data
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "orlop.control.name" . }}
+  labels:
+    {{- include "orlop.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+spec:
+  replicas: {{ .Values.control.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: control
+  template:
+    metadata:
+      labels:
+        {{- include "orlop.labels" . | nindent 8 }}
+        app.kubernetes.io/component: control
+    spec:
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.control.runMigrations }}
+      initContainers:
+        # Apply pending migrations before serving. Idempotent; fails fast on a
+        # schema gap (docs/upgrade-safety.md). `migrate` is a subcommand of the
+        # same control binary.
+        - name: migrate
+          image: {{ include "orlop.control.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate", "up"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orlop.secretName" . }}
+                  key: database-url
+      {{- end }}
+      containers:
+        - name: orlop-control
+          image: {{ include "orlop.control.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.control.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.control.port | quote }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orlop.secretName" . }}
+                  key: database-url
+            # CA lives in Postgres, encrypted at rest — no CA PVC needed, and the
+            # key material survives pod restarts because the DB does.
+            - name: ORLOP_SECRETS_BACKEND
+              value: postgres
+            - name: ORLOP_SECRETS_ENC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orlop.secretName" . }}
+                  key: secrets-enc-key
+            - name: ORLOP_CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "orlop.secretName" . }}
+                  key: control-plane-token
+            # The only FQDN control will sign a server cert for. Equal to the
+            # server Service name by construction (see _helpers.tpl).
+            - name: ORLOP_DATAGW_SERVER_FQDN
+              value: {{ include "orlop.server.name" . | quote }}
+            - name: ORLOP_TRUST_DOMAIN
+              value: {{ .Values.trustDomain | quote }}
+            - name: ORLOP_ORG_NAME
+              value: {{ .Values.orgName | quote }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          {{- with .Values.control.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.control.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.control.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.control.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "orlop.control.name" . }}
+  labels:
+    {{- include "orlop.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: control
+  ports:
+    - name: http
+      port: {{ .Values.control.port }}
+      targetPort: http

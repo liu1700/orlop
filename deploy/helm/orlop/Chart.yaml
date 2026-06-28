@@ -1,0 +1,22 @@
+apiVersion: v2
+name: orlop
+description: >-
+  Reference chart for the orlop control plane (orlop-control) and data-plane
+  server (orlop-server). Stands up a working control + server — including the
+  migrate step, the in-Postgres CA, and the mTLS self-provisioning topology —
+  from the published GHCR images, parameterized by image, database URL, and the
+  shared token.
+type: application
+version: 0.1.0
+# Tracks the orlop release whose images this chart targets by default.
+appVersion: "0.2.1"
+home: https://orlop.dev
+sources:
+  - https://github.com/liu1700/orlop
+keywords:
+  - orlop
+  - agent-disk
+  - storage
+maintainers:
+  - name: orlop
+    url: https://github.com/liu1700/orlop
