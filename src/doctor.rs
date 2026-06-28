@@ -83,6 +83,10 @@ pub struct DoctorInputs {
     pub credentials_path: Option<PathBuf>,
     /// Control-plane URL read from credentials, if any.
     pub control_plane_url: Option<String>,
+    /// When set (`orlop doctor --dev`), check exactly what `orlop dev up` needs:
+    /// these `(label, port)` pairs are free. In this mode the config/credentials
+    /// checks are skipped — `dev up` supplies them out of band (issue #54).
+    pub dev_ports: Option<Vec<(String, u16)>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +95,8 @@ pub struct DoctorReport {
     pub arch: String,
     /// True when every *required* check passed.
     pub ready: bool,
+    /// Whether this report was gathered for the `dev up` path (`--dev`).
+    pub dev: bool,
     pub checks: Vec<Check>,
 }
 
@@ -98,11 +104,42 @@ pub struct DoctorReport {
 pub fn gather(inputs: DoctorInputs) -> DoctorReport {
     let mut checks = Vec::new();
 
-    // Required: host mount support.
+    // Required everywhere: host mount support + a writable chunk-cache dir.
     checks.push(mount_support_check());
+    checks.push(chunk_cache_check(inputs.cache_root.as_deref()));
 
-    // Required: a writable chunk-cache dir.
-    checks.push(match &inputs.cache_root {
+    let dev = inputs.dev_ports.is_some();
+    if let Some(ports) = &inputs.dev_ports {
+        // `dev up` preflight: the ports it binds must be free. Config and
+        // credentials are minted out of band, so they're intentionally absent
+        // from this report.
+        for (label, port) in ports {
+            checks.push(port_free_check(label, *port));
+        }
+    } else {
+        // Config-based `orlop mount` advisories. These are *not* needed for
+        // `orlop dev up` (which supplies config + credentials itself), so the
+        // wording says so — their absence on a clean host is normal, not a fault.
+        checks.push(config_check(&inputs.config_path, inputs.config_has_hosted));
+        checks.push(credentials_check(inputs.credentials_path.as_deref()));
+        if let Some(url) = &inputs.control_plane_url {
+            checks.push(Check::warn_ok("control-plane", url.clone()));
+        }
+    }
+
+    let ready = checks.iter().all(|c| c.ok || !c.required);
+    DoctorReport {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        ready,
+        dev,
+        checks,
+    }
+}
+
+/// Required: a writable chunk-cache directory.
+fn chunk_cache_check(cache_root: Option<&Path>) -> Check {
+    match cache_root {
         Some(root) => match check_writable_dir(root) {
             Ok(()) => Check::req_ok("chunk-cache", format!("writable at {}", root.display())),
             Err(e) => Check::req_fail(
@@ -116,10 +153,12 @@ pub fn gather(inputs: DoctorInputs) -> DoctorReport {
             "cache directory could not be determined",
             "set XDG_CACHE_HOME or HOME",
         ),
-    });
+    }
+}
 
-    // Advisory: config presence + a `hosted:` block.
-    checks.push(match (&inputs.config_path, inputs.config_has_hosted) {
+/// Advisory: config presence + a `hosted:` block (config-based mount only).
+fn config_check(config_path: &Option<PathBuf>, has_hosted: Option<bool>) -> Check {
+    match (config_path, has_hosted) {
         (Some(p), Some(true)) => Check::warn_ok("config", format!("{} (hosted)", p.display())),
         (Some(p), Some(false)) => Check::warn_fail(
             "config",
@@ -133,39 +172,55 @@ pub fn gather(inputs: DoctorInputs) -> DoctorReport {
         ),
         (None, _) => Check::warn_fail(
             "config",
-            "no config found",
-            "pass --config, or mount with `orlop mount --from-env`",
+            "no config found (not needed for `orlop dev up`)",
+            "only for a config-based `orlop mount`: pass --config, or mount with `orlop mount --from-env`",
         ),
-    });
+    }
+}
 
-    // Advisory: credentials.
-    checks.push(match &inputs.credentials_path {
+/// Advisory: credentials file (config-based mount only).
+fn credentials_check(credentials_path: Option<&Path>) -> Check {
+    match credentials_path {
         Some(p) => Check::warn_ok("credentials", p.display().to_string()),
         None => Check::warn_fail(
             "credentials",
-            "no credentials.json",
-            "re-enroll the agent, or mount with `orlop mount --from-env` (it supplies credentials out of band)",
+            "no credentials.json (not needed for `orlop dev up`)",
+            "only for a config-based `orlop mount`: re-enroll the agent, or mount with `orlop mount --from-env`",
         ),
-    });
-
-    // Informational: control-plane URL, when known.
-    if let Some(url) = &inputs.control_plane_url {
-        checks.push(Check::warn_ok("control-plane", url.clone()));
     }
+}
 
-    let ready = checks.iter().all(|c| c.ok || !c.required);
-    DoctorReport {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        ready,
-        checks,
+/// Required (dev mode): a TCP connect to 127.0.0.1:port fails iff nothing is
+/// listening, i.e. `dev up` can bind it.
+fn port_free_check(label: &str, port: u16) -> Check {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let in_use = TcpStream::connect_timeout(
+        &([127, 0, 0, 1], port).into(),
+        Duration::from_millis(200),
+    )
+    .is_ok();
+    let name = format!("port-{port}");
+    if in_use {
+        Check::req_fail(
+            &name,
+            format!("{port} ({label}) is already in use"),
+            format!("free port {port}, or pass a different --*-port to `orlop dev up`"),
+        )
+    } else {
+        Check::req_ok(&name, format!("{port} ({label}) is free"))
     }
 }
 
 impl DoctorReport {
     /// Human-readable rendering for the default (non-`--json`) output.
     pub fn render_human(&self) -> String {
-        let mut out = format!("orlop doctor — {}/{}\n", self.os, self.arch);
+        let mut out = format!(
+            "orlop doctor{} — {}/{}\n",
+            if self.dev { " --dev" } else { "" },
+            self.os,
+            self.arch,
+        );
         for c in &self.checks {
             let tag = if c.ok {
                 "ok  "
@@ -181,10 +236,10 @@ impl DoctorReport {
                 }
             }
         }
-        out.push_str(if self.ready {
-            "\nready: this host can mount a Orlop disk.\n"
-        } else {
-            "\nNOT ready: resolve the FAIL items above before mounting.\n"
+        out.push_str(match (self.ready, self.dev) {
+            (true, true) => "\nready: this host can run `orlop dev up`.\n",
+            (true, false) => "\nready: this host can mount a Orlop disk.\n",
+            (false, _) => "\nNOT ready: resolve the FAIL items above first.\n",
         });
         out
     }
@@ -286,6 +341,7 @@ mod tests {
             config_has_hosted: None,
             credentials_path: None,
             control_plane_url: None,
+            dev_ports: None,
         });
         // ready iff the host's mount-support check passed; either way it must
         // equal the required-checks-only verdict (advisory fails ignored).
@@ -306,6 +362,7 @@ mod tests {
             config_has_hosted: None,
             credentials_path: None,
             control_plane_url: Some("https://api.example".into()),
+            dev_ports: None,
         });
         for name in ["mount-support", "chunk-cache", "config", "credentials"] {
             assert!(
@@ -318,5 +375,50 @@ mod tests {
         let text = report.render_human();
         assert!(text.contains("orlop doctor"));
         assert!(text.contains("control-plane"));
+    }
+
+    #[test]
+    fn clean_host_config_credentials_warnings_mention_dev_up() {
+        // issue #54: on a clean host the advisory warnings must not read as
+        // "your setup is incomplete" — they say they're not needed for dev up.
+        let tmp = tempfile::tempdir().unwrap();
+        let report = gather(DoctorInputs {
+            cache_root: Some(tmp.path().to_path_buf()),
+            config_path: None,
+            config_has_hosted: None,
+            credentials_path: None,
+            control_plane_url: None,
+            dev_ports: None,
+        });
+        let config = report.checks.iter().find(|c| c.name == "config").unwrap();
+        let creds = report.checks.iter().find(|c| c.name == "credentials").unwrap();
+        assert!(config.detail.contains("orlop dev up"), "got: {}", config.detail);
+        assert!(creds.detail.contains("orlop dev up"), "got: {}", creds.detail);
+    }
+
+    #[test]
+    fn dev_mode_checks_ports_and_omits_config_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pick a port nothing is listening on so the check passes deterministically.
+        let report = gather(DoctorInputs {
+            cache_root: Some(tmp.path().to_path_buf()),
+            config_path: None,
+            config_has_hosted: None,
+            credentials_path: None,
+            control_plane_url: Some("https://api.example".into()),
+            dev_ports: Some(vec![("control plane".into(), 0)]),
+        });
+        assert!(report.dev);
+        // Config/credentials/control-plane checks are absent in dev mode.
+        for absent in ["config", "credentials", "control-plane"] {
+            assert!(
+                !report.checks.iter().any(|c| c.name == absent),
+                "{absent} should be omitted in --dev mode"
+            );
+        }
+        // The port check is present and required.
+        let port = report.checks.iter().find(|c| c.name == "port-0").unwrap();
+        assert!(port.required);
+        assert!(report.render_human().contains("orlop dev up"));
     }
 }
