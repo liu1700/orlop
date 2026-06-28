@@ -1,0 +1,398 @@
+openapi: 3.0.3
+info:
+  title: orlop control-plane API
+  description: |
+    The control-plane (`orlop-control`) REST API for managing agent disks: the
+    contract underneath the Go SDK (`orlop/client`), documented so a consumer in
+    any language can implement against it.
+
+    This spec covers the provisioning surface the SDK exercises. It is versioned:
+    `info.version` is the **API** version (independent of the orlop release
+    version). The server advertises the same major on every response via the
+    `Orlop-API-Version` header, and the SDK sends it on every request, so SDK↔server
+    skew is detectable rather than surfacing as an opaque 4xx. See the
+    compatibility policy in [`control-plane.md`](../control-plane.md).
+
+    **Auth.** All endpoints require the control-plane **service token** as
+    `Authorization: Bearer <token>`. It is an operator credential and is never
+    exposed to agents.
+
+    **Paths.** Endpoints are served at the bare `/v1/...` paths below. A
+    same-origin edge deployment may also expose them under an `/api` prefix; the
+    bare paths are canonical.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8080
+    description: Local control plane (PORT, default 8080)
+  - url: "{baseUrl}"
+    description: Your control-plane base URL
+    variables:
+      baseUrl:
+        default: http://orlop-control:8080
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/entities:
+    post:
+      operationId: provisionEntity
+      summary: Allocate (idempotently) an agent's disk
+      description: >-
+        Creates the unique disk for an agent. Idempotent on `entity_id`:
+        re-provisioning an existing agent returns its existing handle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProvisionRequest"
+      responses:
+        "200":
+          description: The agent's disk handle.
+          headers:
+            Orlop-API-Version:
+              $ref: "#/components/headers/ApiVersion"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entity"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/entities/{type}/{id}:
+    parameters:
+      - $ref: "#/components/parameters/EntityType"
+      - $ref: "#/components/parameters/EntityId"
+    get:
+      operationId: resolveEntity
+      summary: Resolve an agent's existing disk
+      responses:
+        "200":
+          description: The agent's disk handle.
+          headers:
+            Orlop-API-Version:
+              $ref: "#/components/headers/ApiVersion"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entity"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: setEntityQuota
+      summary: Raise or lower an agent disk's hard size cap
+      description: >-
+        Adjusts the disk's hard cap in place, preserving the allocation handle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetQuotaRequest"
+      responses:
+        "200":
+          description: The (unchanged) disk handle.
+          headers:
+            Orlop-API-Version:
+              $ref: "#/components/headers/ApiVersion"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entity"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: revokeEntity
+      summary: Release an agent's disk allocation
+      description: "Idempotent: revoking an unknown agent is a no-op (also 204)."
+      responses:
+        "204":
+          description: Released (or nothing to release).
+          headers:
+            Orlop-API-Version:
+              $ref: "#/components/headers/ApiVersion"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/entities/{type}/{id}/reassign:
+    parameters:
+      - $ref: "#/components/parameters/EntityType"
+      - $ref: "#/components/parameters/EntityId"
+    post:
+      operationId: reassignEntity
+      summary: Re-home an agent's disk to a new billing owner
+      description: >-
+        Flips the allocation's owner without moving data; the disk keeps its
+        per-agent tenant. Idempotent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReassignRequest"
+      responses:
+        "204":
+          description: Reassigned.
+          headers:
+            Orlop-API-Version:
+              $ref: "#/components/headers/ApiVersion"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/entities/account/{owner}/budget:
+    parameters:
+      - $ref: "#/components/parameters/Owner"
+    post:
+      operationId: setAccountBudget
+      summary: Set a user's account disk budget
+      description: >-
+        Sets the shared hard cap all of the user's agents draw from, enforced as
+        one quota on the account tenant directory.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountBudgetRequest"
+      responses:
+        "200":
+          description: The applied budget.
+          headers:
+            Orlop-API-Version:
+              $ref: "#/components/headers/ApiVersion"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountBudget"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/agents/{id}/enroll-token:
+    parameters:
+      - $ref: "#/components/parameters/EntityId"
+    post:
+      operationId: mintEnrollToken
+      summary: Mint a short-lived, agent-scoped enroll token
+      description: >-
+        Returns the token an agent trades at `/agent/enroll` for its per-agent
+        mTLS client certificate. The token is the only credential that reaches
+        the agent sandbox.
+      responses:
+        "200":
+          description: A fresh enroll token and its expiry.
+          headers:
+            Orlop-API-Version:
+              $ref: "#/components/headers/ApiVersion"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnrollToken"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/tenants/{owner}/usage:
+    parameters:
+      - $ref: "#/components/parameters/Owner"
+    get:
+      operationId: getTenantUsage
+      summary: Report a user's aggregate disk usage
+      description: >-
+        Aggregate `used_bytes` across the owner's per-user tenant. Returns 0 when
+        the owner has no disk or has never been placed on a server.
+      responses:
+        "200":
+          description: The owner's usage.
+          headers:
+            Orlop-API-Version:
+              $ref: "#/components/headers/ApiVersion"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenantUsage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The control-plane service token.
+
+  headers:
+    ApiVersion:
+      description: The control API major version the server implements.
+      schema:
+        type: string
+        example: "1"
+
+  parameters:
+    EntityType:
+      name: type
+      in: path
+      required: true
+      description: Entity namespace. Must be `agent`.
+      schema:
+        type: string
+        enum: [agent]
+    EntityId:
+      name: id
+      in: path
+      required: true
+      description: The agent id (1:1 with one disk).
+      schema:
+        type: string
+    Owner:
+      name: owner
+      in: path
+      required: true
+      description: The owning user id (a UUID); a non-UUID yields 400 invalid_request.
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      headers:
+        Orlop-API-Version:
+          $ref: "#/components/headers/ApiVersion"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid service token.
+      headers:
+        Orlop-API-Version:
+          $ref: "#/components/headers/ApiVersion"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: No such entity.
+      headers:
+        Orlop-API-Version:
+          $ref: "#/components/headers/ApiVersion"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    ProvisionRequest:
+      type: object
+      required: [entity_type, entity_id]
+      properties:
+        entity_type:
+          type: string
+          enum: [agent]
+        entity_id:
+          type: string
+          description: The agent id.
+        owner_id:
+          type: string
+          description: >-
+            The agent's owning user id; the server derives that user's per-user
+            tenant from it. Optional.
+        grant_bytes:
+          type: integer
+          format: int64
+          description: >-
+            Initial disk grant (the starting size, not the ceiling). 0 / omitted
+            ⇒ the server's default grant.
+        quota_bytes:
+          type: integer
+          format: int64
+          description: >-
+            Legacy alias for `grant_bytes` (it always set the grant). Accepted
+            for back-compat; `grant_bytes` wins when both are set.
+    SetQuotaRequest:
+      type: object
+      description: Send `grant_bytes` (preferred) or its legacy alias `quota_bytes`.
+      properties:
+        grant_bytes:
+          type: integer
+          format: int64
+        quota_bytes:
+          type: integer
+          format: int64
+    ReassignRequest:
+      type: object
+      required: [owner_id]
+      properties:
+        owner_id:
+          type: string
+          description: The new billing owner's user id.
+    AccountBudgetRequest:
+      type: object
+      required: [disk_bytes]
+      properties:
+        disk_bytes:
+          type: integer
+          format: int64
+          description: The shared hard cap for all of the user's agents.
+    Entity:
+      type: object
+      properties:
+        handle:
+          type: string
+          description: Opaque allocation handle.
+        virtual_path:
+          type: string
+          description: Stable mount path, e.g. /mnt/orlop/agents/<id>.
+    AccountBudget:
+      type: object
+      properties:
+        owner_id:
+          type: string
+        disk_bytes:
+          type: integer
+          format: int64
+    EnrollToken:
+      type: object
+      properties:
+        token:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+    TenantUsage:
+      type: object
+      properties:
+        owner_id:
+          type: string
+        used_bytes:
+          type: integer
+          format: int64
+    Error:
+      type: object
+      description: OAuth-style error body.
+      properties:
+        error:
+          type: string
+          description: A short error code, e.g. not_found, invalid_request, invalid_token.
+        error_description:
+          type: string
+          description: Optional human-readable detail.
+      required: [error]

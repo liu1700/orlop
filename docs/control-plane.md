@@ -12,6 +12,12 @@ See [`design-auth.md`](./design-auth.md) for the certificate model,
 [`database-backends.md`](./database-backends.md) for Postgres vs. SQLite, and
 [`control-plane-runbook.md`](./control-plane-runbook.md) for operator tasks.
 
+A machine-readable **OpenAPI spec** for the provisioning surface the Go SDK
+(`orlop/client`) exercises lives at
+[`openapi/orlop-control.yaml`](./openapi/orlop-control.yaml) — implement a client
+in any language from it. The versioning and SDK↔server compatibility policy is
+in [Versioning and compatibility](#versioning-and-compatibility) below.
+
 ## Conventions
 
 These apply to every endpoint below, so the per-endpoint sections stay short.
@@ -69,6 +75,37 @@ Errors use an OAuth-style body. `error_description` is omitted when empty.
 ```json
 { "error": "access_denied", "error_description": "tenant_suspended" }
 ```
+
+### Versioning and compatibility
+
+The control-plane API is versioned by a single **major** number, carried by the
+`/v1/...` path prefix. It is independent of the orlop **release** version: the
+API was byte-identical across v0.1.0 and v0.2.0, and stays at major `1` until a
+breaking change.
+
+**Skew is detectable, not silent.** Every response carries an `Orlop-API-Version`
+header naming the major the server implements, and the Go SDK sends the same
+header on every request. The SDK compares them and returns a typed
+`client.APIVersionError` on a **major** mismatch — so an incompatible pairing
+surfaces as an explicit "version skew" error instead of an opaque 4xx. A server
+that predates the header (no `Orlop-API-Version`) is treated as compatible, for
+back-compat.
+
+**Compatibility policy.**
+
+| Client major | Server major | Result |
+| --- | --- | --- |
+| `N` | `N` | **Supported.** Within a major, the server only adds endpoints/fields; clients must ignore unknown response fields. |
+| `N` | `M` (≠ `N`) | **Unsupported.** The SDK returns `APIVersionError`; upgrade one side to a matching major. |
+
+Concretely today: every released orlop SDK and server (v0.1.0 through v0.2.x)
+speaks API major `1`, so any combination of them is supported. A future breaking
+change ships under `/v2` with `Orlop-API-Version: 2` and is called out as a
+breaking change in the release notes (see [`upgrade-safety.md`](./upgrade-safety.md)).
+
+Other-language clients should: send `Authorization: Bearer <service token>`,
+optionally send `Orlop-API-Version: 1`, and check the response header to detect
+skew the same way the Go SDK does.
 
 ## Endpoints
 

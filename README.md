@@ -159,7 +159,7 @@ A `client.Fake` in-memory implementation is provided for consumer tests.
 | [`design-data-plane.md`](docs/design-data-plane.md) | Chunk store / journal design |
 | [`design-auth.md`](docs/design-auth.md) | Certificate / tenant isolation model |
 | [`design-identity.md`](docs/design-identity.md) | Host identity: verify a host-issued JWT and map it to a tenant |
-| [`control-plane.md`](docs/control-plane.md) | Control-plane API |
+| [`control-plane.md`](docs/control-plane.md) | Control-plane API + versioning/compat policy (OpenAPI: [`openapi/orlop-control.yaml`](docs/openapi/orlop-control.yaml)) |
 | [`control-plane-runbook.md`](docs/control-plane-runbook.md) | Operator workflows (CA, admin seeding) |
 | [`agent-memory.md`](docs/agent-memory.md) | What orlop gives an agent-memory stack, and where it stops |
 | [`audit-events.md`](docs/audit-events.md) | Audit event schema |

@@ -520,6 +520,7 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	router.Use(middleware.RequestID)
 	router.Use(middleware.RealIP)
 	router.Use(middleware.Recoverer)
+	router.Use(apiVersionHeader)
 	router.Use(requestLogger(logger))
 
 	router.Get("/healthz", healthz)
