@@ -75,10 +75,16 @@ enum Command {
     /// Offline preflight: check this host can mount a Orlop disk (FUSE/NFS
     /// support, a writable chunk-cache dir, config + credentials). No network
     /// is touched. Exits non-zero when a required check fails; `--json` prints
-    /// a machine-readable report.
+    /// a machine-readable report. `--dev` instead checks only what `orlop dev
+    /// up` needs (mount support, chunk cache, free ports) and skips the
+    /// config/credentials checks `dev up` doesn't use.
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Check readiness for `orlop dev up` (ports free, mount + cache),
+        /// omitting the config/credentials checks it supplies out of band.
+        #[arg(long)]
+        dev: bool,
     },
     /// Single-host developer stack: bring up the control plane, data-plane
     /// server, and a mounted disk in one command.
@@ -418,27 +424,43 @@ fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("failed to tail audit log {}", path.display()))?;
             }
         },
-        Command::Doctor { json } => {
-            // Resolve config state without failing on a missing/broken file:
-            // doctor's job is to *report* it, not bail.
-            let (config_path, config_has_hosted) = match resolve_config_path(&cli) {
-                Some(p) => {
-                    let has_hosted = Config::load(&p).ok().map(|c| c.hosted.is_some());
-                    (Some(p), has_hosted)
-                }
-                None => (None, None),
+        Command::Doctor { json, dev } => {
+            // In --dev mode, check only what `orlop dev up` needs: the ports it
+            // binds (defaults shared with `dev up`) plus mount + cache. Skip the
+            // config/credentials resolution entirely — dev up supplies them.
+            let dev_ports = dev.then(|| {
+                vec![
+                    ("control plane".to_string(), 8080u16),
+                    ("server ops".to_string(), 7878u16),
+                    ("server data".to_string(), 8443u16),
+                ]
+            });
+            let (config_path, config_has_hosted, credentials_path, control_plane_url) = if *dev {
+                (None, None, None, None)
+            } else {
+                // Resolve config state without failing on a missing/broken file:
+                // doctor's job is to *report* it, not bail.
+                let (config_path, config_has_hosted) = match resolve_config_path(&cli) {
+                    Some(p) => {
+                        let has_hosted = Config::load(&p).ok().map(|c| c.hosted.is_some());
+                        (Some(p), has_hosted)
+                    }
+                    None => (None, None),
+                };
+                let credentials_path = login::credentials_path().ok().filter(|p| p.exists());
+                let control_plane_url = credentials_path
+                    .as_deref()
+                    .and_then(|p| login::load(p).ok().flatten())
+                    .map(|c| c.control_plane_url);
+                (config_path, config_has_hosted, credentials_path, control_plane_url)
             };
-            let credentials_path = login::credentials_path().ok().filter(|p| p.exists());
-            let control_plane_url = credentials_path
-                .as_deref()
-                .and_then(|p| login::load(p).ok().flatten())
-                .map(|c| c.control_plane_url);
             let report = orlop::doctor::gather(orlop::doctor::DoctorInputs {
                 cache_root: chunk_cache_root().ok(),
                 config_path,
                 config_has_hosted,
                 credentials_path,
                 control_plane_url,
+                dev_ports,
             });
             if *json {
                 println!("{}", serde_json::to_string_pretty(&report)?);

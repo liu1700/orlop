@@ -16,12 +16,12 @@ this and let it drive:
 ```text
 Set up a single-node orlop stack by following
 https://orlop.dev/reference/standalone-quickstart.md. Install with
-`curl -fsSL https://orlop.dev/install.sh | sh`, run `orlop doctor`, then bring
-the whole stack up with `orlop dev up`. In a second shell, write a file to the
-mounted disk, stop the stack (Ctrl-C), bring it back up, and confirm the file
-survived. Check first that ports 8080, 7878, and 8443 are free and that FUSE
-(Linux) or the built-in NFS client (macOS) is available; stop if anything is
-missing.
+`curl -fsSL https://orlop.dev/install.sh | sh`, run `orlop doctor --dev` (which
+checks ports 8080/7878/8443 are free plus mount support and a writable cache),
+then bring the whole stack up with `orlop dev up`. In a second shell, write a
+file to the mounted disk, stop the stack (Ctrl-C or `orlop dev down`), bring it
+back up, and confirm the file survived. Stop if `orlop doctor --dev` reports
+anything not ready.
 ```
 
 ## Prerequisites
@@ -29,7 +29,8 @@ missing.
 - Linux or macOS, with three free ports: `8080` (control plane), `7878` (server
   ops), `8443` (server data).
 - Mount support: Linux uses FUSE (`/dev/fuse` and `fuse3`); macOS uses its
-  built-in NFS client. `orlop doctor` (step 1) confirms this host can mount.
+  built-in NFS client. `orlop doctor --dev` (step 1) confirms this host is ready
+  for `orlop dev up` — ports free, mount support, writable cache.
 
 ## 1. Install the binaries
 
@@ -38,8 +39,12 @@ architecture into `~/.local/bin`:
 
 ```bash
 curl -fsSL https://orlop.dev/install.sh | sh
-orlop doctor
+orlop doctor --dev    # ports free + mount support + writable cache for `dev up`
 ```
+
+Plain `orlop doctor` (no `--dev`) also checks for a config + credentials, but
+`orlop dev up` supplies those itself — so for this quickstart use `--dev` and
+ignore the config/credentials notes.
 
 Override the target dir with `ORLOP_BIN_DIR`, or pin a release with
 `ORLOP_VERSION=v0.2.1`. If the install dir isn't on your `PATH`, the script
@@ -57,7 +62,7 @@ GOWORK=off go build -o ./bin/orlop-server  ./cmd/orlop-server
 cargo build --release --bin orlop          # → target/release/orlop
 export PATH="$PWD/bin:$PWD/target/release:$PATH"
 
-orlop doctor
+orlop doctor --dev
 ```
 
 </details>
