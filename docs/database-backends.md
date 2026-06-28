@@ -71,6 +71,10 @@ Accepted `DATABASE_URL` forms:
 The schema is applied on every open (idempotent), so `migrate up` is optional;
 it exists mainly to create the file ahead of time.
 
+> `CREATE TABLE IF NOT EXISTS` creates missing tables on open but does **not**
+> add a column to a table that already exists. The boot-time schema self-check
+> catches that gap and fails fast — see [`upgrade-safety.md`](upgrade-safety.md).
+
 > The `postgres` CA-secrets backend needs a shared database pool, which SQLite
 > doesn't provide, so the control plane uses the **filesystem** CA backend with
 > SQLite. Set `ORLOP_SECRETS_DIR` and leave `ORLOP_SECRETS_BACKEND` unset;
@@ -86,8 +90,16 @@ practical path to "move to Postgres" is to stand up the Postgres database, point
 `DATABASE_URL` at it, run `migrate up`, and re-seed (`user seed`,
 `server register`), and agents re-enroll and re-mount as usual.
 
+## Upgrading in place
+
+Bumping the orlop version of a running deployment and re-running `migrate up`
+against the existing database is a supported, CI-tested path. The guarantee,
+the supported upgrade sources, and the migration policy that keeps it safe live
+in [`upgrade-safety.md`](upgrade-safety.md).
+
 ## See also
 
+- [`upgrade-safety.md`](upgrade-safety.md): in-place upgrade guarantee, schema self-check, migration policy
 - [`standalone-quickstart.md`](standalone-quickstart.md): one-command single-node bring-up (`orlop dev up`, SQLite)
 - [`manual-bring-up.md`](manual-bring-up.md): single-node bring-up by hand, where you set `DATABASE_URL` for either backend
 - [`control-plane-runbook.md`](control-plane-runbook.md): CA, admin seeding, operator workflows

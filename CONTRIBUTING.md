@@ -103,6 +103,15 @@ Run the checks for the side(s) you touched:
 Keep PRs scoped to one concern. If a change spans both languages (e.g. a
 protocol change), call that out in the PR description.
 
+### Touching the database schema
+
+Released migrations are frozen: never renumber, rewrite, or squash a migration
+that has already shipped in a tag — a deployed database is already at that
+version and will never re-run it. If you must squash the baseline, ship a
+forward bridge migration numbered above the highest released version and guarded
+with `IF NOT EXISTS`. The full policy, the CI upgrade guard, and the schema
+self-check are in [`docs/upgrade-safety.md`](docs/upgrade-safety.md).
+
 ## License
 
 By contributing you agree that your contributions are licensed under the

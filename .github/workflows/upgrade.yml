@@ -1,0 +1,92 @@
+name: upgrade-safety
+
+# Guards in-place upgrades (#39). For each recent released tag it provisions a
+# database with THAT tag's binary, then runs HEAD's `migrate up` against it.
+# HEAD's migrate self-checks the result against storage.RequiredSchema, so a
+# renumbered/squashed migration that leaves an older database incomplete fails
+# the build here instead of in a consumer's production.
+#
+# Runs on every PR (not path-filtered) so it can be a required status check that
+# always reports.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  postgres:
+    name: postgres upgrade ${{ matrix.from }} → HEAD
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each released tag whose database an in-place upgrade must still
+        # converge. Append new tags here as they ship; drop a tag only when it
+        # is no longer a supported upgrade source.
+        from: [v0.1.0, v0.2.0, v0.2.1]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: orlop
+          POSTGRES_DB: orlop
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:orlop@localhost:5432/orlop?sslmode=disable
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags + history, for the per-tag worktree build
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build HEAD orlop-control
+        run: go build -o "$RUNNER_TEMP/oc-head" ./cmd/orlop-control
+      - name: Build ${{ matrix.from }} orlop-control
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/from" "${{ matrix.from }}"
+          ( cd "$RUNNER_TEMP/from" && go build -o "$RUNNER_TEMP/oc-from" ./cmd/orlop-control )
+      - name: Provision database with ${{ matrix.from }}, then upgrade to HEAD
+        run: |
+          set -euxo pipefail
+          "$RUNNER_TEMP/oc-from"  migrate up   # released tag's schema
+          "$RUNNER_TEMP/oc-head"  migrate up   # HEAD migrations + schema self-check
+
+  sqlite:
+    name: sqlite upgrade ${{ matrix.from }} → HEAD
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Tags that ship the embedded SQLite backend (added before v0.2.0).
+        from: [v0.2.0, v0.2.1]
+    env:
+      DATABASE_URL: sqlite:/tmp/orlop.db
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build HEAD orlop-control
+        run: go build -o "$RUNNER_TEMP/oc-head" ./cmd/orlop-control
+      - name: Build ${{ matrix.from }} orlop-control
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/from" "${{ matrix.from }}"
+          ( cd "$RUNNER_TEMP/from" && go build -o "$RUNNER_TEMP/oc-from" ./cmd/orlop-control )
+      - name: Provision database with ${{ matrix.from }}, then upgrade to HEAD
+        run: |
+          set -euxo pipefail
+          rm -f /tmp/orlop.db /tmp/orlop.db-wal /tmp/orlop.db-shm
+          "$RUNNER_TEMP/oc-from"  migrate up   # released tag's schema
+          "$RUNNER_TEMP/oc-head"  migrate up   # HEAD schema + self-check

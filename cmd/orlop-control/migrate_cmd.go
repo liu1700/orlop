@@ -46,15 +46,28 @@ func runMigrateUp(ctx context.Context, out io.Writer, args []string) error {
 	// The SQLite backend applies its schema on open (no goose). Open it once so
 	// `migrate up` still initialises a fresh database file, then close.
 	if _, ok := sqlitePath(*databaseURL); ok {
-		_, _, closeStore, err := openStore(ctx, *databaseURL)
+		st, _, closeStore, err := openStore(ctx, *databaseURL)
 		if err != nil {
 			return err
 		}
-		_ = closeStore()
+		defer closeStore()
+		if err := verifyStoreSchema(ctx, st); err != nil {
+			return err
+		}
 		fmt.Fprintln(out, "sqlite schema applied")
 		return nil
 	}
 	if err := db.MigrateUp(ctx, *databaseURL); err != nil {
+		return err
+	}
+	// Self-check the result: a renumber/squash of an already-released migration
+	// can leave goose reporting success while the schema is incomplete (#39).
+	st, _, closeStore, err := openStore(ctx, *databaseURL)
+	if err != nil {
+		return err
+	}
+	defer closeStore()
+	if err := verifyStoreSchema(ctx, st); err != nil {
 		return err
 	}
 	fmt.Fprintln(out, "migrations applied")

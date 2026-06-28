@@ -32,6 +32,25 @@ func openStore(ctx context.Context, databaseURL string) (st storage.Store, pool 
 	return postgres.New(p), p, func() error { p.Close(); return nil }, nil
 }
 
+// schemaVerifier is implemented by both storage backends (postgres.Store,
+// sqlite.Store). It checks the live database against storage.RequiredSchema.
+type schemaVerifier interface {
+	VerifySchema(ctx context.Context) error
+}
+
+// verifyStoreSchema runs the backend's schema self-check if it has one. A gap
+// (a missing table or column the code requires) returns a *storage.SchemaGapError
+// whose message names what is absent and how to converge — so an in-place
+// upgrade that skipped a migration fails fast here rather than as an opaque
+// runtime error later. See issue #39.
+func verifyStoreSchema(ctx context.Context, st storage.Store) error {
+	v, ok := st.(schemaVerifier)
+	if !ok {
+		return nil
+	}
+	return v.VerifySchema(ctx)
+}
+
 // sqlitePath extracts the database path from a "sqlite:" URL, accepting
 // sqlite:FILE, sqlite://FILE, sqlite:///ABS/PATH, and sqlite::memory:.
 func sqlitePath(databaseURL string) (string, bool) {
