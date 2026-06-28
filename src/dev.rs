@@ -338,9 +338,13 @@ fn shutdown_result(reason: ExitReason, teardown_ok: bool) -> Result<()> {
     }
 }
 
-/// Fail-fast checks shared by the foreground and detached bring-up paths:
-/// refuse to stack a second instance on top of a live one, then surface a busy
-/// port with an actionable hint before we spawn anything.
+/// Fail-fast checks shared by the foreground and detached bring-up paths.
+///
+/// First refuse to stack a second instance on top of a live one, then run the
+/// same host checks as `orlop doctor --dev` (mount support, a writable chunk
+/// cache, the three ports free) so `dev up` self-preflights — the quickstart
+/// needs no separate `doctor` step (#56). Failures carry the same actionable
+/// fixes (e.g. "free port 8080, or pass a different --*-port").
 fn preflight(opts: &DevUpOpts) -> Result<()> {
     if let Some(state) = load_dev_state() {
         if state.supervisor_pid != 0 && crate::daemon::pid_alive(state.supervisor_pid) {
@@ -352,14 +356,29 @@ fn preflight(opts: &DevUpOpts) -> Result<()> {
             );
         }
     }
-    for (label, port, flag) in [
-        ("control plane", opts.control_port, "--control-port"),
-        ("server ops", opts.ops_port, "--ops-port"),
-        ("server data", opts.data_port, "--data-port"),
-    ] {
-        if port_in_use(port) {
-            bail!("port {port} ({label}) is already in use; free it or pass {flag} <port>");
+
+    let report = crate::doctor::gather(crate::doctor::DoctorInputs {
+        cache_root: crate::backend::dataplane::ChunkCache::default_root(),
+        config_path: None,
+        config_has_hosted: None,
+        credentials_path: None,
+        control_plane_url: None,
+        dev_ports: Some(vec![
+            ("control plane".to_string(), opts.control_port),
+            ("server ops".to_string(), opts.ops_port),
+            ("server data".to_string(), opts.data_port),
+        ]),
+    });
+    if !report.ready {
+        let mut msg = String::from("preflight failed — this host isn't ready for `orlop dev up`:");
+        for c in report.checks.iter().filter(|c| !c.ok && c.required) {
+            msg.push_str(&format!("\n  - {}: {}", c.name, c.detail));
+            if let Some(fix) = &c.fix {
+                msg.push_str(&format!("\n    fix: {fix}"));
+            }
         }
+        msg.push_str("\n(run `orlop doctor --dev` for the full report)");
+        bail!("{msg}");
     }
     Ok(())
 }
