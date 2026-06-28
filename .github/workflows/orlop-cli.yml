@@ -1,15 +1,10 @@
 name: orlop-cli
 
 on:
+  # Runs on every PR (not path-filtered) so it can be a required status check
+  # that always reports — otherwise a PR touching no Rust files would leave the
+  # required `build` check stuck "Expected" and unmergeable.
   pull_request:
-    paths:
-      - ".github/workflows/orlop-cli.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "tests/**"
-      - "config.example.yaml"
-      - "config.local.yaml"
   push:
     branches:
       - main

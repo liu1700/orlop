@@ -1,12 +1,10 @@
 name: go
 
 on:
+  # Runs on every PR (not path-filtered) so it can be a required status check
+  # that always reports — otherwise a PR touching no Go files would leave the
+  # required `go` check stuck "Expected" and unmergeable.
   pull_request:
-    paths:
-      - "**.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/go.yml"
   push:
     branches: [main]
 
