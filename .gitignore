@@ -44,3 +44,7 @@ AGENTS.md
 
 # pjdfstest raw results (regenerate via scripts/pjdfstest-docker.sh)
 pjdfstest-results/
+
+# Per-arch binaries staged into the container images at release time
+# (docker/*.Dockerfile COPY from here); never committed.
+docker/bin/*/
