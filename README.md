@@ -54,11 +54,18 @@ curl -fsSL https://orlop.dev/install.sh | sh
 ```
 
 A complete single-node stack (control + server + one mounted disk) runs on one
-host with no external dependencies: the control plane can use its embedded
-SQLite backend (`DATABASE_URL=sqlite:./orlop.db`), so not even Postgres is
-required. Follow [`docs/standalone-quickstart.md`](docs/standalone-quickstart.md)
-end to end; it walks `server register` → `token issue` → `orlop mount --from-env`
-→ write a file → unmount → remount and watch the data persist.
+host with no external dependencies — the control plane uses its embedded SQLite
+backend (`DATABASE_URL=sqlite:./orlop.db`), so not even Postgres is required:
+
+```bash
+orlop dev up        # control plane + server + a mounted disk, supervised; Ctrl-C tears it down
+orlop status        # what's running
+```
+
+Follow [`docs/standalone-quickstart.md`](docs/standalone-quickstart.md) to write
+a file, restart the stack, and watch the data persist. To run each piece by hand
+(`server register` → `token issue` → `orlop mount --from-env`), see
+[`docs/manual-bring-up.md`](docs/manual-bring-up.md).
 
 ## How it works
 
@@ -142,7 +149,8 @@ A `client.Fake` in-memory implementation is provided for consumer tests.
 
 | Doc | What's inside |
 |---|---|
-| [`standalone-quickstart.md`](docs/standalone-quickstart.md) | Run the whole thing on one host |
+| [`standalone-quickstart.md`](docs/standalone-quickstart.md) | Run the whole thing on one host with `orlop dev up` |
+| [`manual-bring-up.md`](docs/manual-bring-up.md) | The same single-node stack, brought up by hand |
 | [`database-backends.md`](docs/database-backends.md) | Postgres vs embedded SQLite: which to use and how |
 | [`design.md`](docs/design.md) | System overview and filesystem layout |
 | [`design-data-plane.md`](docs/design-data-plane.md) | Chunk store / journal design |

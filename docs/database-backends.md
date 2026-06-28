@@ -88,5 +88,6 @@ practical path to "move to Postgres" is to stand up the Postgres database, point
 
 ## See also
 
-- [`standalone-quickstart.md`](standalone-quickstart.md): single-node bring-up on either backend
+- [`standalone-quickstart.md`](standalone-quickstart.md): one-command single-node bring-up (`orlop dev up`, SQLite)
+- [`manual-bring-up.md`](manual-bring-up.md): single-node bring-up by hand, where you set `DATABASE_URL` for either backend
 - [`control-plane-runbook.md`](control-plane-runbook.md): CA, admin seeding, operator workflows
