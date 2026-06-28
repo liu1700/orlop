@@ -96,8 +96,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DevCommand {
-    /// Bring up a single-node stack (control plane + data plane + mounted disk)
-    /// and supervise it until Ctrl-C, which tears it all down. Automates the
+    /// Bring up a single-node stack (control plane + data plane + mounted disk).
+    /// Foreground by default — Ctrl-C tears it down; with --detach it returns
+    /// once the disk is mounted and `orlop dev down` stops it. Automates the
     /// standalone quickstart for local development.
     Up {
         /// Work directory for all stack state (db, secrets, data, logs).
@@ -118,6 +119,18 @@ enum DevCommand {
         /// Pool capacity to register for the data-plane server, in bytes.
         #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
         total_bytes: u64,
+        /// Run the supervisor in the background: bring the stack up, block until
+        /// the disk is mounted, then exit 0. Stop it later with `orlop dev down`.
+        #[arg(long, short = 'd')]
+        detach: bool,
+    },
+    /// Stop a running dev stack (started in the foreground or with --detach)
+    /// gracefully and wait for it to exit. Idempotent — a no-op if nothing runs.
+    Down {
+        /// Only stop the stack if its work dir matches this path (safety guard
+        /// for scripts). Defaults to whatever `orlop status` reports.
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -445,6 +458,7 @@ fn main() -> anyhow::Result<()> {
                 ops_port,
                 data_port,
                 total_bytes,
+                detach,
             } => {
                 let mountpoint = mountpoint.clone().or_else(|| cli.mountpoint.clone());
                 orlop::dev::run_dev_up(orlop::dev::DevUpOpts {
@@ -455,7 +469,11 @@ fn main() -> anyhow::Result<()> {
                     ops_port: *ops_port,
                     data_port: *data_port,
                     total_bytes: *total_bytes,
+                    detach: *detach,
                 })?;
+            }
+            DevCommand::Down { dir } => {
+                orlop::dev::run_dev_down(dir.clone())?;
             }
         },
         Command::Status { json } => {

@@ -78,7 +78,7 @@ orlop dev stack is up:
   data plane     ops localhost:7878  data localhost:8443
   disk mounted   ./orlop-dev/mnt  (agent demo)
 
-  stop:     Ctrl-C (tears the stack down and releases the lease)
+  stop:     Ctrl-C, or `orlop dev down` from another shell
 ```
 
 All state lives under `./orlop-dev` (override with `--dir`); the disk mounts at
@@ -87,6 +87,22 @@ All state lives under `./orlop-dev` (override with `--dir`); the disk mounts at
 ```bash
 orlop status        # control plane / data plane / mount + liveness; --json for machine output
 ```
+
+### Run it without holding a terminal (CI, agents, IDEs)
+
+`orlop dev up` blocks in the foreground until Ctrl-C. To drive the stack from a
+script, CI step, or agent, bring it up detached and stop it by name — no
+PID-hunting:
+
+```bash
+orlop dev up --detach     # -d: preflights, mounts, then returns 0 once ready
+orlop status              # ... do your work against ./orlop-dev/mnt ...
+orlop dev down            # graceful teardown; waits for unmount + exit, returns 0
+```
+
+`dev down` is idempotent (a no-op if nothing is running) and reconciles a stack
+whose supervisor died uncleanly, so it's safe to call from a CI cleanup step.
+The detached supervisor logs to `./orlop-dev/dev.log`.
 
 ## 3. Prove durability
 
@@ -97,10 +113,11 @@ echo "hello from a durable agent disk" > ./orlop-dev/mnt/hello.txt
 mkdir -p ./orlop-dev/mnt/sub && echo "nested" > ./orlop-dev/mnt/sub/note.md
 ```
 
-Now stop the stack with **Ctrl-C** in the first shell. The mount point goes
-empty — the data isn't on your local filesystem, it's in the data-plane server's
-store under `./orlop-dev/dg-data`, which Ctrl-C leaves intact. Bring the stack
-back up against the same directory and the files return:
+Now stop the stack with **Ctrl-C** in the first shell (or `orlop dev down` from
+another). The mount point goes empty — the data isn't on your local filesystem,
+it's in the data-plane server's store under `./orlop-dev/dg-data`, which teardown
+leaves intact. Bring the stack back up against the same directory and the files
+return:
 
 ```bash
 orlop dev up                       # same default --dir ./orlop-dev, reuses the data
@@ -114,9 +131,11 @@ data-plane server, not in the mount point.
 
 ## Cleanup
 
-Ctrl-C stops the stack; to discard the data too, remove the work directory:
+Ctrl-C (or `orlop dev down`) stops the stack; to discard the data too, remove
+the work directory:
 
 ```bash
+orlop dev down       # if it's still running detached
 rm -rf ./orlop-dev
 ```
 
