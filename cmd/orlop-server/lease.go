@@ -171,8 +171,14 @@ func (m *leaseManager) Grant(ctx context.Context, holder string, connID uint64, 
 				// lost. Rebinding used to keep the id, which let a stale pod's
 				// teardown Release(old id) destroy its successor's live lease.
 				oldID := existing.id
+				grantedAt := existing.grantedAt
 				m.removeLocked(existing)
 				res := m.installLocked(holder, connID, path, mode)
+				// The holder is CONTINUING, not newly arriving: keep the
+				// original grantedAt so a contending holder's YieldFor
+				// min-hold clock is not reset by every same-holder reconnect
+				// (otherwise cycling connections starves the contender).
+				m.byPath[path].grantedAt = grantedAt
 				m.mu.Unlock()
 				m.recordAudit("lease_release", holder, path, oldID, mode, "conn_takeover")
 				m.recordAudit("lease_grant", holder, path, idArrayFromBytes(res.LeaseID), mode, "conn_takeover")
@@ -282,6 +288,18 @@ func (m *leaseManager) Refresh(leaseID []byte, connID uint64) (*leaseRefreshResu
 	if !ok || (rec.connID != connID && rec.connID != 0) {
 		m.mu.Unlock()
 		return nil, errLeaseUnknown
+	}
+	if rec.connID == 0 {
+		// First refresh after a snapshot restore: bind the caller's conn so
+		// HeldByConn (the write-path session fence) passes again. Without the
+		// bind, a client that survives a fast server restart refreshes
+		// successfully forever while every sessioned write gets EACCES — a
+		// zombie mount that never triggers the client's terminal re-mount path.
+		rec.connID = connID
+		if m.byConn[connID] == nil {
+			m.byConn[connID] = map[[16]byte]struct{}{}
+		}
+		m.byConn[connID][rec.id] = struct{}{}
 	}
 	rec.expiresAt = time.Now().Add(m.cfg.ttl)
 	holder := rec.holder

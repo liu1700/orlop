@@ -354,3 +354,76 @@ func TestAuditEventsEmitted(t *testing.T) {
 		}
 	}
 }
+
+// TestSupersedeKeepsContenderClock: a same-holder conn takeover must not reset the
+// YieldFor min-hold clock — a contending holder blocked on the old record's revoke
+// must still win within a bounded number of revoke cycles, not be starved by the
+// holder cycling connections.
+func TestSupersedeKeepsContenderClock(t *testing.T) {
+	pusher := &fakePusher{}
+	cfg := leaseConfig{ttl: 30 * time.Second, minHold: 10 * time.Millisecond, revokeTimeout: 50 * time.Millisecond}
+	mgr := newLeaseManager(cfg, pusher.push, nil, nil)
+
+	if _, err := mgr.Grant(context.Background(), "agentA", 1, "/x", dataplane.LeaseExclusiveWrite); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond) // past min-hold
+
+	// Contender B starts waiting (pushes a revoke to conn 1, blocks).
+	done := make(chan error, 1)
+	go func() {
+		_, err := mgr.Grant(context.Background(), "agentB", 9, "/x", dataplane.LeaseExclusiveWrite)
+		done <- err
+	}()
+	time.Sleep(10 * time.Millisecond) // let B enter YieldFor
+
+	// Holder A's successor takes over from a new connection mid-revoke.
+	if _, err := mgr.Grant(context.Background(), "agentA", 2, "/x", dataplane.LeaseExclusiveWrite); err != nil {
+		t.Fatal(err)
+	}
+
+	// B must still win: grantedAt carried over ⇒ min-hold already elapsed ⇒ B
+	// re-revokes the new conn and force-evicts within another revokeTimeout.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("contender must eventually win after supersede, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("contender starved after same-holder conn takeover")
+	}
+}
+
+// TestRefreshBindsRestoredLease: the first refresh of a snapshot-restored lease
+// (connID 0) binds the caller's connection, so the write-path session fence
+// (HeldByConn) passes again instead of leaving a refresh-succeeds/writes-EACCES
+// zombie mount.
+func TestRefreshBindsRestoredLease(t *testing.T) {
+	mgr, _ := newTestMgr(t)
+	g, _ := mgr.Grant(context.Background(), "agentA", 1, "/x", dataplane.LeaseExclusiveWrite)
+	id := idArrayFromBytes(g.LeaseID)
+
+	// Simulate a restore: record survives with no live conn.
+	mgr.mu.Lock()
+	rec := mgr.byID[id]
+	delete(mgr.byConn, rec.connID)
+	rec.connID = 0
+	mgr.mu.Unlock()
+
+	if _, err := mgr.Refresh(g.LeaseID, 7); err != nil {
+		t.Fatalf("restored-lease refresh: %v", err)
+	}
+	if !mgr.HeldByConn(id, 7) {
+		t.Fatal("refresh must bind the restored lease to the caller's conn")
+	}
+	// Bound now: another conn can no longer refresh or release it.
+	if _, err := mgr.Refresh(g.LeaseID, 8); !errors.Is(err, errLeaseUnknown) {
+		t.Fatalf("wrong-conn refresh after bind should be refused, got %v", err)
+	}
+	if err := mgr.Release(g.LeaseID, 8); !errors.Is(err, errLeaseUnknown) {
+		t.Fatalf("wrong-conn release after bind should be refused, got %v", err)
+	}
+	if err := mgr.Release(g.LeaseID, 7); err != nil {
+		t.Fatal(err)
+	}
+}
