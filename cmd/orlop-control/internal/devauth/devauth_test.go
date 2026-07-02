@@ -50,8 +50,8 @@ func TestBearerToken(t *testing.T) {
 		"Bearer":          "",
 	}
 	for in, want := range cases {
-		if got := bearerToken(in); got != want {
-			t.Errorf("bearerToken(%q) = %q, want %q", in, got, want)
+		if got := BearerToken(in); got != want {
+			t.Errorf("BearerToken(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

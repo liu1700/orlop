@@ -31,9 +31,7 @@ type controlTenantUsageQuerier interface {
 
 // resolveTenantOpsAddr resolves a tenant's orlop-server ops address:
 // server_vms → server_pools. placed is false (with a nil error) when the tenant
-// has no server_vms row yet — it has never been mounted, so it has no usage. This
-// is the same chain dashboard_handlers.go handleAllocationUsage and the serverapi
-// adapters walk; a future cleanup could converge those onto this helper.
+// has no server_vms row yet — it has never been mounted, so it has no usage.
 func resolveTenantOpsAddr(ctx context.Context, q tenantPlacementQuerier, tenantID string) (opsAddr string, placed bool, err error) {
 	vm, err := q.GetServerVMByTenant(ctx, tenantID)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -73,9 +71,9 @@ func newControlTenantUsageHandlers(logger *slog.Logger, q controlTenantUsageQuer
 // paths (the production edge strips /api before forwarding), gated by svc. Like
 // /v1/entities this is a control-plane→control-plane surface, never user-facing.
 func mountControlTenantUsage(r chi.Router, svc func(http.Handler) http.Handler, h *controlTenantUsageHandlers) {
-	for _, prefix := range []string{"", "/api"} {
+	mountBoth(func(prefix string) {
 		r.With(svc).Get(prefix+"/v1/tenants/{owner}/usage", h.handleTenantUsage)
-	}
+	})
 }
 
 type tenantUsageDTO struct {

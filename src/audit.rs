@@ -18,16 +18,11 @@ use crate::write_handle::FlushStats;
 /// stay raw strings on the deserialise side.
 pub mod event {
     pub const LOOKUP: &str = "lookup";
-    pub const LOOKUP_SYNTHETIC: &str = "lookup_synthetic";
     pub const OPENDIR: &str = "opendir";
     pub const READDIR_ENTRY: &str = "readdir_entry";
     pub const READDIRPLUS_ENTRY: &str = "readdirplus_entry";
-    pub const READDIR_ENTRY_SYNTHETIC: &str = "readdir_entry_synthetic";
     pub const OPEN: &str = "open";
-    pub const OPEN_SYNTHETIC: &str = "open_synthetic";
     pub const READ: &str = "read";
-    pub const READ_SYNTHETIC: &str = "read_synthetic";
-    pub const READLINK_SYNTHETIC: &str = "readlink_synthetic";
     pub const CREATE: &str = "create";
     pub const FLUSH: &str = "flush";
     pub const UNLINK: &str = "unlink";
@@ -37,7 +32,6 @@ pub mod event {
     pub const SETATTR: &str = "setattr";
     pub const SYMLINK: &str = "symlink";
     pub const LEASE_DENIED: &str = "lease_denied";
-    pub const README_REAL_OVERRIDE: &str = "readme_real_override";
     pub const ENROLLMENT: &str = "enrollment";
 }
 
@@ -172,16 +166,6 @@ impl AuditEvent {
         }
     }
 
-    pub fn with_size(mut self, size: u64) -> Self {
-        self.size = Some(size);
-        self
-    }
-
-    pub fn with_offset(mut self, offset: i64) -> Self {
-        self.offset = Some(offset);
-        self
-    }
-
     pub fn with_to_path(mut self, p: &str) -> Self {
         self.to_path = Some(p.to_string());
         self
@@ -206,16 +190,6 @@ impl AuditEvent {
         if let Some(hint) = stats.recovery.as_ref() {
             self.recovery = FlatRecovery::from(hint);
         }
-        self
-    }
-
-    pub fn with_lease_id(mut self, id: &[u8; 16]) -> Self {
-        self.lease_id = Some(crate::backend::dataplane::cache::hex_encode(id));
-        self
-    }
-
-    pub fn with_reason(mut self, reason: &str) -> Self {
-        self.reason = Some(reason.to_string());
         self
     }
 
@@ -268,11 +242,11 @@ struct CompiledFilter {
 }
 
 impl CompiledFilter {
-    fn from(spec: TailFilter<'_>) -> anyhow::Result<Self> {
-        Ok(Self {
+    fn compile(spec: TailFilter<'_>) -> Self {
+        Self {
             events: spec.events.to_vec(),
             lease_id: spec.lease_id.map(str::to_string),
-        })
+        }
     }
 
     fn is_pass_through(&self) -> bool {
@@ -286,7 +260,7 @@ pub fn tail(
     limit: Option<usize>,
     follow: bool,
 ) -> anyhow::Result<()> {
-    let compiled = CompiledFilter::from(filter)?;
+    let compiled = CompiledFilter::compile(filter);
     let mut file = OpenOptions::new()
         .read(true)
         .create(true)
@@ -381,11 +355,10 @@ mod tests {
 
     fn compile(events: &[&str], lease_id: Option<&str>) -> CompiledFilter {
         let owned: Vec<String> = events.iter().map(|s| s.to_string()).collect();
-        CompiledFilter::from(TailFilter {
+        CompiledFilter::compile(TailFilter {
             events: &owned,
             lease_id,
         })
-        .expect("filter compiles")
     }
 
     #[test]

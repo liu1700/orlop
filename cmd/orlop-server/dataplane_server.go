@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -254,15 +253,8 @@ func identifyV2Peer(logger *slog.Logger, state *serverState, cert *x509.Certific
 		logger.Debug("data-plane cert has no agent scope; rejecting", "tenant", tenantID)
 		return nil, Identity{}, false
 	}
-	ident := Identity{
-		AgentID:       agentID,
-		TenantID:      tenantID,
-		CertSubject:   cert.Subject.String(),
-		ScopedAgentID: scopedAgentID,
-	}
-	if cert.SerialNumber != nil {
-		ident.CertSerial = cert.SerialNumber.String()
-	}
+	ident := identityFromCert(cert, tenantID)
+	ident.ScopedAgentID = scopedAgentID
 	return tenant, ident, true
 }
 
@@ -362,17 +354,38 @@ func sendResp[T any](w *frameWriter, frame dataplane.Frame, val T) {
 	w.send(dataplane.Frame{Op: frame.Op, Flags: dataplane.FlagResponse, RID: frame.RID, Payload: payload})
 }
 
+// authorizePath runs the two request-path gates shared by every path-addressed
+// handler, in the same order they were previously inlined: the tenant policy
+// check (deny → audit row + EACCES frame) followed by the per-agent subtree
+// moat (checkAgentPath, which writes its own audit row + EACCES on deny).
+// event is the audit event name; sessionID tags the deny row for sessioned
+// writes (nil for reads and unsessioned ops). Returns false when the caller
+// must stop — the error frame has already been written.
+func (s *serverState) authorizePath(ident Identity, w *frameWriter, frame dataplane.Frame, event, p string, sessionID *string) bool {
+	if !s.policy.Permits(policyPath(p)) {
+		s.recordDataAudit(ident, event, p, nil, false, sessionID)
+		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
+		return false
+	}
+	return s.checkAgentPath(ident, w, frame, p)
+}
+
+// resolveSessionFence unwraps a write request's optional session/allocation
+// ids and runs checkSessionFence on them. ok=false means the fence check has
+// already written the EACCES frame; callers must stop.
+func (s *serverState) resolveSessionFence(tenant *tenantState, w *frameWriter, frame dataplane.Frame, sessionIDPtr, allocationIDPtr *string) (sessionID, allocationID, activeLeaseHex string, ok bool) {
+	sessionID = derefSession(sessionIDPtr)
+	allocationID = derefSession(allocationIDPtr)
+	activeLeaseHex, ok = s.checkSessionFence(tenant, w, frame, sessionID, allocationID)
+	return sessionID, allocationID, activeLeaseHex, ok
+}
+
 func handleList(s *serverState, tenant *tenantState, ident Identity, w *frameWriter, frame dataplane.Frame) {
 	req, ok := decodeReq[dataplane.ListRequest](w, frame, "list")
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordDataAudit(ident, "list_entries", req.Path, nil, false, nil)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
-		return
-	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
+	if !s.authorizePath(ident, w, frame, "list_entries", req.Path, nil) {
 		return
 	}
 
@@ -406,7 +419,7 @@ func handleList(s *serverState, tenant *tenantState, ident Identity, w *frameWri
 		}
 		entries = append(entries, e)
 	}
-	writeFrameList(w, frame.RID, entries)
+	sendResp(w, frame, dataplane.ListResponse{Entries: entries})
 	s.recordDataAudit(ident, "list_entries", req.Path, nil, true, nil)
 }
 
@@ -415,12 +428,7 @@ func handleStat(s *serverState, tenant *tenantState, ident Identity, w *frameWri
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordDataAudit(ident, "head_file", req.Path, nil, false, nil)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
-		return
-	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
+	if !s.authorizePath(ident, w, frame, "head_file", req.Path, nil) {
 		return
 	}
 	// Source of truth, in order: manifest (file) → symlinks (symlink) →
@@ -430,10 +438,10 @@ func handleStat(s *serverState, tenant *tenantState, ident Identity, w *frameWri
 		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEIO(err.Error()))
 		return
 	}
-	base := filepath.Base(req.Path)
+	base := path.Base(req.Path)
 	var entry dataplane.EntryWire
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		entry = dataplane.EntryWire{Name: base, Kind: "file", Size: mf.Size, Mode: mf.Mode, Uid: mf.Uid, Gid: mf.Gid, Atime: mf.Atime}
 	default:
 		if target, mode, uid, gid, atime, isSym, sErr := tenant.manifests.SymlinkInfo(req.Path); sErr != nil {
@@ -470,12 +478,7 @@ func handleManifestGet(s *serverState, tenant *tenantState, ident Identity, w *f
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordManifestAudit(ident, "manifest_get", req.Path, 0, 0, false, nil)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
-		return
-	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
+	if !s.authorizePath(ident, w, frame, "manifest_get", req.Path, nil) {
 		return
 	}
 	mf, err := tenant.manifests.Get(req.Path)
@@ -511,12 +514,7 @@ func handleManifestPut(s *serverState, tenant *tenantState, ident Identity, w *f
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordManifestAudit(ident, "manifest_put", req.Path, 0, 0, false, req.SessionID)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
-		return
-	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
+	if !s.authorizePath(ident, w, frame, "manifest_put", req.Path, req.SessionID) {
 		return
 	}
 	if tenant.leases != nil {
@@ -538,9 +536,7 @@ func handleManifestPut(s *serverState, tenant *tenantState, ident Identity, w *f
 		Mtime:  req.Mtime,
 		Chunks: fromWireChunks(req.Chunks),
 	}
-	sessionID := derefSession(req.SessionID)
-	allocationID := derefSession(req.AllocationID)
-	activeLeaseHex, ok := s.checkSessionFence(tenant, w, frame, sessionID, allocationID)
+	sessionID, allocationID, activeLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
 	if !ok {
 		return
 	}
@@ -592,17 +588,10 @@ func handleManifestDelete(s *serverState, tenant *tenantState, ident Identity, w
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordDataAudit(ident, "manifest_delete", req.Path, nil, false, req.SessionID)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
+	if !s.authorizePath(ident, w, frame, "manifest_delete", req.Path, req.SessionID) {
 		return
 	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
-		return
-	}
-	delSessionID := derefSession(req.SessionID)
-	delAllocationID := derefSession(req.AllocationID)
-	delActiveLeaseHex, ok := s.checkSessionFence(tenant, w, frame, delSessionID, delAllocationID)
+	delSessionID, delAllocationID, delActiveLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
 	if !ok {
 		return
 	}
@@ -631,9 +620,7 @@ func handleManifestRename(s *serverState, tenant *tenantState, ident Identity, w
 	if !s.checkAgentPath(ident, w, frame, req.To) {
 		return
 	}
-	renSessionID := derefSession(req.SessionID)
-	renAllocationID := derefSession(req.AllocationID)
-	renActiveLeaseHex, ok := s.checkSessionFence(tenant, w, frame, renSessionID, renAllocationID)
+	renSessionID, renAllocationID, renActiveLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
 	if !ok {
 		return
 	}
@@ -651,12 +638,7 @@ func handleDirCreate(s *serverState, tenant *tenantState, ident Identity, w *fra
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordDataAudit(ident, "dir_create", req.Path, nil, false, req.SessionID)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
-		return
-	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
+	if !s.authorizePath(ident, w, frame, "dir_create", req.Path, req.SessionID) {
 		return
 	}
 	if err := tenant.manifests.DirCreate(req.Path, req.Mode); err != nil {
@@ -672,12 +654,7 @@ func handleDirRemove(s *serverState, tenant *tenantState, ident Identity, w *fra
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordDataAudit(ident, "dir_remove", req.Path, nil, false, req.SessionID)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
-		return
-	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
+	if !s.authorizePath(ident, w, frame, "dir_remove", req.Path, req.SessionID) {
 		return
 	}
 	if err := tenant.manifests.DirRemove(req.Path); err != nil {
@@ -699,17 +676,10 @@ func handleSetattr(s *serverState, tenant *tenantState, ident Identity, w *frame
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordDataAudit(ident, "setattr", req.Path, nil, false, req.SessionID)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
+	if !s.authorizePath(ident, w, frame, "setattr", req.Path, req.SessionID) {
 		return
 	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
-		return
-	}
-	sessionID := derefSession(req.SessionID)
-	allocationID := derefSession(req.AllocationID)
-	activeLeaseHex, ok := s.checkSessionFence(tenant, w, frame, sessionID, allocationID)
+	sessionID, allocationID, activeLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
 	if !ok {
 		return
 	}
@@ -785,12 +755,7 @@ func handleSymlink(s *serverState, tenant *tenantState, ident Identity, w *frame
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordDataAudit(ident, "symlink", req.Path, nil, false, req.SessionID)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
-		return
-	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
+	if !s.authorizePath(ident, w, frame, "symlink", req.Path, req.SessionID) {
 		return
 	}
 	if err := tenant.manifests.Symlink(req.Path, req.Target, req.Mode); err != nil {
@@ -808,17 +773,10 @@ func handleMknod(s *serverState, tenant *tenantState, ident Identity, w *frameWr
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordDataAudit(ident, "mknod", req.Path, nil, false, req.SessionID)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
+	if !s.authorizePath(ident, w, frame, "mknod", req.Path, req.SessionID) {
 		return
 	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
-		return
-	}
-	sessionID := derefSession(req.SessionID)
-	allocationID := derefSession(req.AllocationID)
-	if _, ok := s.checkSessionFence(tenant, w, frame, sessionID, allocationID); !ok {
+	if _, _, _, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID); !ok {
 		return
 	}
 	if err := tenant.manifests.Mknod(req.Path, req.Mode, req.Rdev); err != nil {
@@ -835,12 +793,7 @@ func handleReadlink(s *serverState, tenant *tenantState, ident Identity, w *fram
 	if !ok {
 		return
 	}
-	if !s.policy.Permits(policyPath(req.Path)) {
-		s.recordDataAudit(ident, "readlink", req.Path, nil, false, nil)
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
-		return
-	}
-	if !s.checkAgentPath(ident, w, frame, req.Path) {
+	if !s.authorizePath(ident, w, frame, "readlink", req.Path, nil) {
 		return
 	}
 	target, err := tenant.manifests.Readlink(req.Path)
@@ -1079,15 +1032,6 @@ func fromWireChunks(in []dataplane.ChunkRef) []ChunkRef {
 	return out
 }
 
-func writeFrameList(w *frameWriter, rid uint64, entries []dataplane.EntryWire) {
-	payload, err := msgpack.Marshal(dataplane.ListResponse{Entries: entries})
-	if err != nil {
-		writeFrameError(w, dataplane.OpList, rid, dataplane.ErrEIO(err.Error()))
-		return
-	}
-	w.send(dataplane.Frame{Op: dataplane.OpList, Flags: dataplane.FlagResponse, RID: rid, Payload: payload})
-}
-
 // buildCasConflictHint constructs the recovery hint attached to ESTALE
 // responses (issues #103 + #100). Pulls the server's current version from
 // `*VersionConflictError` when available so the client can skip a
@@ -1274,26 +1218,33 @@ func decodeLeaseHex(s string) ([16]byte, error) {
 	return id, nil
 }
 
-// recordDataAudit logs a request that came in over the binary plane. Mirrors
-// recordAudit but doesn't take an *http.Request — identity and metadata are
-// passed explicitly.
-// sessionID is non-nil for writes performed inside a `orlop session begin`
-// window; nil for reads and unsessioned writes.
-func (s *serverState) recordDataAudit(ident Identity, event, path string, size *uint64, allowed bool, sessionID *string) {
-	rec := AuditRecord{
+// dataAuditBase builds the fields every data-plane audit event shares —
+// caller identity, server uid/gid, command, and the allow/deny verdict. The
+// record functions below add their per-event fields before writing.
+func (s *serverState) dataAuditBase(ident Identity, event string, allowed bool) AuditRecord {
+	return AuditRecord{
 		Event:       event,
-		Path:        path,
-		Size:        size,
 		AgentID:     ident.AgentID,
 		TenantID:    ident.TenantID,
 		CertSerial:  ident.CertSerial,
 		CertSubject: ident.CertSubject,
 		UID:         uintPtr(s.uid),
 		GID:         uintPtr(s.gid),
-		SessionID:   sessionID,
 		Command:     "orlop-server",
 		Allowed:     allowed,
 	}
+}
+
+// recordDataAudit logs a request that came in over the binary plane. Mirrors
+// recordAudit but doesn't take an *http.Request — identity and metadata are
+// passed explicitly.
+// sessionID is non-nil for writes performed inside a `orlop session begin`
+// window; nil for reads and unsessioned writes.
+func (s *serverState) recordDataAudit(ident Identity, event, path string, size *uint64, allowed bool, sessionID *string) {
+	rec := s.dataAuditBase(ident, event, allowed)
+	rec.Path = path
+	rec.Size = size
+	rec.SessionID = sessionID
 	s.audit.Record(rec)
 }
 
@@ -1302,19 +1253,9 @@ func (s *serverState) recordDataAudit(ident Identity, event, path string, size *
 // version == 0 is treated as "unknown" and omitted. sessionID is non-nil
 // for writes performed inside a `orlop session begin` window.
 func (s *serverState) recordManifestAudit(ident Identity, event, path string, size, version uint64, allowed bool, sessionID *string) {
-	rec := AuditRecord{
-		Event:       event,
-		Path:        path,
-		AgentID:     ident.AgentID,
-		TenantID:    ident.TenantID,
-		CertSerial:  ident.CertSerial,
-		CertSubject: ident.CertSubject,
-		UID:         uintPtr(s.uid),
-		GID:         uintPtr(s.gid),
-		SessionID:   sessionID,
-		Command:     "orlop-server",
-		Allowed:     allowed,
-	}
+	rec := s.dataAuditBase(ident, event, allowed)
+	rec.Path = path
+	rec.SessionID = sessionID
 	if size > 0 {
 		rec.Size = &size
 	}
@@ -1330,20 +1271,10 @@ func (s *serverState) recordManifestAudit(ident Identity, event, path string, si
 // addressed, not path-addressed. sessionID is non-nil for chunk_put
 // inside a session window; nil for chunk_get and unsessioned writes.
 func (s *serverState) recordChunkAudit(ident Identity, event string, hash []byte, size uint64, allowed bool, sessionID *string) {
-	rec := AuditRecord{
-		Event:       event,
-		AgentID:     ident.AgentID,
-		TenantID:    ident.TenantID,
-		CertSerial:  ident.CertSerial,
-		CertSubject: ident.CertSubject,
-		UID:         uintPtr(s.uid),
-		GID:         uintPtr(s.gid),
-		SessionID:   sessionID,
-		Command:     "orlop-server",
-		Allowed:     allowed,
-		Hash:        hex.EncodeToString(hash),
-		Size:        &size,
-	}
+	rec := s.dataAuditBase(ident, event, allowed)
+	rec.Hash = hex.EncodeToString(hash)
+	rec.Size = &size
+	rec.SessionID = sessionID
 	s.audit.Record(rec)
 }
 
@@ -1352,18 +1283,8 @@ func (s *serverState) recordChunkAudit(ident Identity, event string, hash []byte
 // fired on every write and produces too much log volume to be useful at
 // per-chunk granularity.
 func (s *serverState) recordChunkHasAudit(ident Identity, count uint64, allowed bool) {
-	rec := AuditRecord{
-		Event:       "chunk_has",
-		AgentID:     ident.AgentID,
-		TenantID:    ident.TenantID,
-		CertSerial:  ident.CertSerial,
-		CertSubject: ident.CertSubject,
-		UID:         uintPtr(s.uid),
-		GID:         uintPtr(s.gid),
-		Command:     "orlop-server",
-		Allowed:     allowed,
-		Count:       &count,
-	}
+	rec := s.dataAuditBase(ident, "chunk_has", allowed)
+	rec.Count = &count
 	s.audit.Record(rec)
 }
 

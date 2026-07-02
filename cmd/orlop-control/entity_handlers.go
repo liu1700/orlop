@@ -14,16 +14,16 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
 
-// agentDiskInitialGrantBytes is the initial elastic grant for a freshly-
+// agentDiskInitialGrantBytes is the fixed initial grant for a freshly-
 // provisioned agent disk when the caller specifies no quota_bytes. It is
 // deliberately well below the promised ceiling (users.quota_bytes, 10 GiB in
-// migration 0001): the storage autoscaler grows the grant toward that ceiling as
-// real usage climbs, so we don't reserve 10 GiB of pool capacity per user up
-// front. See docs/design/elastic-storage-allocation.md.
+// migration 0001) so we don't reserve 10 GiB of pool capacity per user up
+// front; the cap changes only via PATCH (handleSetQuota), never by usage.
 const agentDiskInitialGrantBytes = 1 * 1024 * 1024 * 1024 // 1 GiB
 
 // agentVirtualPath is the stable mount path for an agent's disk. It must match
@@ -116,7 +116,7 @@ func newEntityHandlers(logger *slog.Logger, q entityQuerier, mintEnroll enrollTo
 // control-plane→control-plane calls, never a user-facing surface, so they do
 // NOT go through the user-facing bearer path (RequireEnrollBearer).
 func mountEntities(r chi.Router, svc func(http.Handler) http.Handler, h *entityHandlers) {
-	for _, prefix := range []string{"", "/api"} {
+	mountBoth(func(prefix string) {
 		r.With(svc).Post(prefix+"/v1/entities", h.handleProvision)
 		r.With(svc).Get(prefix+"/v1/entities/{type}/{id}", h.handleResolve)
 		r.With(svc).Patch(prefix+"/v1/entities/{type}/{id}", h.handleSetQuota)
@@ -124,7 +124,7 @@ func mountEntities(r chi.Router, svc func(http.Handler) http.Handler, h *entityH
 		r.With(svc).Post(prefix+"/v1/agents/{id}/enroll-token", h.handleEnrollToken)
 		r.With(svc).Post(prefix+"/v1/entities/{type}/{id}/reassign", h.handleReassign)
 		r.With(svc).Post(prefix+"/v1/entities/account/{owner}/budget", h.handleSetAccountBudget)
-	}
+	})
 }
 
 // Dynamic tenant-id prefixes. These tenants are derived server-side from an
@@ -311,19 +311,14 @@ func (h *entityHandlers) handleSetQuota(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	// grant_bytes is the new name (it resizes size_bytes, the grant); quota_bytes is
-	// the legacy alias, accepted for back-compat. grant_bytes wins when both are set.
-	var body struct {
-		GrantBytes int64 `json:"grant_bytes"`
-		QuotaBytes int64 `json:"quota_bytes"`
-	}
+	// the legacy alias, accepted for back-compat. Same grant-wins rule as
+	// handleProvision (provisionEntityRequest.grant).
+	var body provisionEntityRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed body")
 		return
 	}
-	newGrant := body.GrantBytes
-	if newGrant <= 0 {
-		newGrant = body.QuotaBytes
-	}
+	newGrant := body.grant()
 	if newGrant <= 0 {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "grant_bytes must be > 0")
 		return
@@ -630,7 +625,7 @@ func RequireServiceToken(expected string) func(http.Handler) http.Handler {
 				writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 				return
 			}
-			got := bearerToken(r.Header.Get("Authorization"))
+			got := devauth.BearerToken(r.Header.Get("Authorization"))
 			if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
 				writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 				return

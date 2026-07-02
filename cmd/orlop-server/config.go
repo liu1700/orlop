@@ -13,21 +13,20 @@ import (
 )
 
 type rawConfig struct {
-	AuditLog              string         `yaml:"audit_log"`
-	Tenant                rawTenant      `yaml:"tenant"`
-	Tenants               []rawTenant    `yaml:"tenants"`
-	Store                 *rawStore      `yaml:"store"`
-	Routes                *rawRoutes     `yaml:"routes"`
-	Policy                rawPolicy      `yaml:"policy"`
-	Server                rawServer      `yaml:"server"`
-	TLS                   rawTLS         `yaml:"tls"`
-	Lease                 LeaseConfig    `yaml:"lease"`
-	GC                    GCConfig       `yaml:"gc"`
-	TenantsRoot           string         `yaml:"tenants_root"`
-	MetadataRoot          string         `yaml:"metadata_root"`
-	RegisteredTenantsPath string         `yaml:"registered_tenants_path"`
-	Quota                 rawQuota       `yaml:"quota"`
-	rest                  map[string]any `yaml:",inline"`
+	AuditLog              string      `yaml:"audit_log"`
+	Tenant                rawTenant   `yaml:"tenant"`
+	Tenants               []rawTenant `yaml:"tenants"`
+	Store                 *rawStore   `yaml:"store"`
+	Routes                *rawRoutes  `yaml:"routes"`
+	Policy                rawPolicy   `yaml:"policy"`
+	Server                rawServer   `yaml:"server"`
+	TLS                   rawTLS      `yaml:"tls"`
+	Lease                 LeaseConfig `yaml:"lease"`
+	GC                    GCConfig    `yaml:"gc"`
+	TenantsRoot           string      `yaml:"tenants_root"`
+	MetadataRoot          string      `yaml:"metadata_root"`
+	RegisteredTenantsPath string      `yaml:"registered_tenants_path"`
+	Quota                 rawQuota    `yaml:"quota"`
 }
 
 type rawQuota struct {
@@ -69,9 +68,8 @@ type rawTenant struct {
 }
 
 type rawPolicy struct {
-	Readonly *bool    `yaml:"readonly"`
-	Allow    []string `yaml:"allow"`
-	Deny     []string `yaml:"deny"`
+	Allow []string `yaml:"allow"`
+	Deny  []string `yaml:"deny"`
 }
 
 type rawServer struct {
@@ -140,8 +138,40 @@ type gcConfig struct {
 	DryRun          bool
 }
 
+// Validate rejects malformed gc duration strings so a typo'd gc block fails
+// LoadConfig loudly instead of silently running with defaults. Unset fields
+// are fine (defaults apply in Effective); Interval "0" is the explicit
+// disable switch.
+func (c GCConfig) Validate() error {
+	if c.Interval != "" && c.Interval != "0" {
+		if _, err := time.ParseDuration(c.Interval); err != nil {
+			return fmt.Errorf("gc.interval: %w", err)
+		}
+	}
+	if c.RetentionWindow != "" {
+		d, err := time.ParseDuration(c.RetentionWindow)
+		if err != nil {
+			return fmt.Errorf("gc.retention_window: %w", err)
+		}
+		if d < time.Hour {
+			return fmt.Errorf("gc.retention_window must be at least 1h, got %q", c.RetentionWindow)
+		}
+	}
+	if c.TenantBudget != "" {
+		d, err := time.ParseDuration(c.TenantBudget)
+		if err != nil {
+			return fmt.Errorf("gc.tenant_budget: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("gc.tenant_budget must be positive, got %q", c.TenantBudget)
+		}
+	}
+	return nil
+}
+
 // Effective returns a gcConfig with defaults applied for any zero/empty fields.
 // Interval == "0" explicitly disables the loop (Effective().Interval == 0).
+// Malformed values are rejected up front by Validate at LoadConfig.
 func (c GCConfig) Effective() gcConfig {
 	cfg := gcConfig{
 		Interval:        24 * time.Hour,
@@ -296,8 +326,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 
 	tenants, err := resolveTenantConfigs(raw)
-	if err != nil && !(errors.Is(err, errNoStaticTenants) && raw.TenantsRoot != "") {
+	if err != nil && (!errors.Is(err, errNoStaticTenants) || raw.TenantsRoot == "") {
 		return Config{}, err
+	}
+
+	if err := raw.GC.Validate(); err != nil {
+		return Config{}, fmt.Errorf("config %s: %w", path, err)
 	}
 
 	auditLog := raw.AuditLog

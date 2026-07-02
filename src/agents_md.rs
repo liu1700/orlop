@@ -122,46 +122,6 @@ pub fn inject(path: &Path, stanza: &str) -> Result<InjectAction> {
     })
 }
 
-/// Remove the Orlop block from the cwd's AGENTS.md, leaving everything else
-/// intact. Used by `orlop unmount` / future cleanup paths.
-pub fn remove_from_cwd() -> Result<RemoveAction> {
-    let cwd = std::env::current_dir().context("get cwd")?;
-    let path = cwd.join("AGENTS.md");
-    if !path.exists() {
-        return Ok(RemoveAction::Missing);
-    }
-    let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let (Some(start), Some(end)) = (body.find(BEGIN_MARKER), body.find(END_MARKER)) else {
-        return Ok(RemoveAction::NotInjected);
-    };
-    if start >= end {
-        return Ok(RemoveAction::NotInjected);
-    }
-    let before = body[..start].trim_end_matches('\n');
-    let after = body[end + END_MARKER.len()..].trim_start_matches('\n');
-    let new_body = match (before.is_empty(), after.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => format!("{}\n", before),
-        (true, false) => format!("{}\n", after),
-        (false, false) => format!("{}\n\n{}\n", before, after),
-    };
-    if new_body.is_empty() {
-        fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
-        Ok(RemoveAction::FileRemoved)
-    } else {
-        fs::write(&path, new_body).with_context(|| format!("write {}", path.display()))?;
-        Ok(RemoveAction::Removed)
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum RemoveAction {
-    Removed,
-    FileRemoved,
-    NotInjected,
-    Missing,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,26 +182,4 @@ mod tests {
         assert!(!body.contains("/mnt/orlop"));
     }
 
-    #[test]
-    fn remove_block_preserves_surroundings() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("AGENTS.md");
-        fs::write(&path, "# rules\n\nA\n").unwrap();
-        inject(&path, &stanza()).unwrap();
-        // emulate user-edited tail content after the block
-        let mut body = fs::read_to_string(&path).unwrap();
-        body.push_str("\n## later section\n\nB\n");
-        fs::write(&path, &body).unwrap();
-
-        let cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        let action = remove_from_cwd().unwrap();
-        std::env::set_current_dir(cwd).unwrap();
-
-        assert_eq!(action, RemoveAction::Removed);
-        let after = fs::read_to_string(&path).unwrap();
-        assert!(after.contains("# rules"));
-        assert!(after.contains("## later section"));
-        assert!(!after.contains(BEGIN_MARKER));
-    }
 }

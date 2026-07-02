@@ -22,9 +22,6 @@ JOIN users   u   ON u.id = t.user_id
 JOIN tenants ten ON ten.id = t.tenant_id
 WHERE t.token_hash = $1;
 
--- name: RevokeAccessToken :exec
-UPDATE access_tokens SET revoked_at = now() WHERE token_hash = $1;
-
 -- name: ConsumeAgentEnrollToken :one
 -- Atomically spend a single-use agent-enroll token (issue #6). Matches only an
 -- un-consumed 'agent_enroll' row; a replay or a lost concurrent race matches

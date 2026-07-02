@@ -120,9 +120,7 @@ func (m *serverMetrics) handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{Registry: m.registry})
 }
 
-// observeDuration records elapsed time for a single op invocation.
-// Pass `defer m.observeDuration(op, time.Now())()` ... actually we use an
-// explicit started value so callers can record on the success path only.
+// observeDuration records the elapsed time since started for a single op invocation.
 func (m *serverMetrics) observeDuration(op string, started time.Time) {
 	if m == nil {
 		return

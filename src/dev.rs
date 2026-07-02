@@ -13,7 +13,6 @@
 
 use std::fs;
 use std::io::Read;
-use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -23,6 +22,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::doctor::port_in_use;
 
 /// Options for `orlop dev up`.
 pub struct DevUpOpts {
@@ -736,15 +737,6 @@ fn is_executable(p: &Path) -> bool {
     fs::metadata(p)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-
-/// A TCP connect to 127.0.0.1:port succeeds iff something is listening.
-fn port_in_use(port: u16) -> bool {
-    TcpStream::connect_timeout(
-        &([127, 0, 0, 1], port).into(),
-        Duration::from_millis(200),
-    )
-    .is_ok()
 }
 
 fn random_hex_16() -> Result<String> {

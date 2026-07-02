@@ -1,14 +1,13 @@
 use crate::store::Manifest;
 
 /// Slice the byte range [offset, offset+size) from a manifest's chunk list,
-/// fetching all needed chunks in one batch via `fetch_chunks`. Used by FUSE
-/// read on write handles. `size = 0` means "from `offset` to EOF".
+/// fetching all needed chunks in one batch via `fetch_chunks`. Used by the
+/// FUSE and NFS read paths. `size = 0` means "from `offset` to EOF".
 ///
 /// `fetch_chunks` receives the unique-ordered list of hashes the slice needs
 /// and returns their bytes in the same order. Batching at this layer lets
 /// `DataStore` issue parallel chunk_get RPCs instead of one per chunk.
-#[allow(dead_code)] // wired in Task 23
-pub(crate) fn assemble_range<F>(
+pub fn assemble_range<F>(
     mf: &Manifest,
     offset: u64,
     size: u32,

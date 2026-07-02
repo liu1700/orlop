@@ -37,7 +37,7 @@ type Identifier interface {
 }
 
 // ErrNoIdentity is returned by an Identifier when it cannot resolve the
-// caller. The router translates this into 401.
+// caller. authMiddleware translates this into 403.
 var ErrNoIdentity = errors.New("no caller identity")
 
 var ErrNoTenantIdentity = errors.New("client certificate is missing tenant identity")
@@ -76,23 +76,31 @@ func (c certIdentifier) Identify(r *http.Request) (Identity, error) {
 		return Identity{}, ErrNoIdentity
 	}
 	cert := r.TLS.PeerCertificates[0]
-	agentID := certAgentID(cert)
-	if agentID == "" {
+	if certAgentID(cert) == "" {
 		return Identity{}, ErrNoIdentity
 	}
 	tenantID, err := certTenantID(cert, c.trustDomain)
+	ident := identityFromCert(cert, tenantID)
+	if err != nil {
+		return ident, err
+	}
+	return ident, nil
+}
+
+// identityFromCert builds the audited Identity shared by every cert-derived
+// caller: agent id from the cert (CN first, see certAgentID), the resolved
+// tenant id, and the cert subject. The serial is optional — SerialNumber may
+// be nil on hand-built test certs — so the nil dance lives here.
+func identityFromCert(cert *x509.Certificate, tenantID string) Identity {
 	ident := Identity{
-		AgentID:     agentID,
+		AgentID:     certAgentID(cert),
 		TenantID:    tenantID,
 		CertSubject: cert.Subject.String(),
 	}
 	if cert.SerialNumber != nil {
 		ident.CertSerial = cert.SerialNumber.String()
 	}
-	if err != nil {
-		return ident, err
-	}
-	return ident, nil
+	return ident
 }
 
 func certAgentID(cert *x509.Certificate) string {

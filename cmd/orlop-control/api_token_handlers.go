@@ -20,7 +20,7 @@ const apiTokenNameMaxLen = 50
 // apiTokenHandlers serves the API-token routes for issuing, listing, and
 // revoking long-lived API tokens. Authenticates the caller as either the
 // dashboard admin-session cookie (browser) or a device-flow Bearer token
-// (CLI), via adminOrBearerIdentity().
+// (CLI), via adminIdentity().
 //
 // Public path is /api/v1/tokens; the production Caddy is configured with
 // `handle_path /api/*` which strips the `/api` prefix before forwarding,
@@ -60,7 +60,7 @@ type createTokenResponse struct {
 }
 
 func (h *apiTokenHandlers) handleCreate(w http.ResponseWriter, r *http.Request) {
-	ident, err := adminOrBearerIdentity(r, h.devAuth)
+	ident, err := adminIdentity(r, h.devAuth)
 	if err != nil {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 		return
@@ -130,7 +130,7 @@ type listTokenItem struct {
 }
 
 func (h *apiTokenHandlers) handleList(w http.ResponseWriter, r *http.Request) {
-	ident, err := adminOrBearerIdentity(r, h.devAuth)
+	ident, err := adminIdentity(r, h.devAuth)
 	if err != nil {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 		return
@@ -155,7 +155,7 @@ func (h *apiTokenHandlers) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *apiTokenHandlers) handleRevoke(w http.ResponseWriter, r *http.Request) {
-	ident, err := adminOrBearerIdentity(r, h.devAuth)
+	ident, err := adminIdentity(r, h.devAuth)
 	if err != nil {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 		return

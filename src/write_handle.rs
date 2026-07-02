@@ -219,7 +219,11 @@ pub struct WriteHandle {
     pub(crate) loaded: bool,
     pub(crate) mode: u32,
     pub(crate) mtime_ns: u64,
+    // Read only by the FUSE handlers (fs.rs, linux-only); the macOS NFS path
+    // constructs handles with zeros and never looks at them.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) mount_idx: usize,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) opener_pid: u32,
     pub(crate) spill_threshold: u64,
     /// Some(_) = cached mode (holder of lease); None = uncached (no lease).
@@ -269,11 +273,6 @@ impl WriteHandle {
         }
     }
 
-    /// True when holding a lease (cached mode); false means uncached (per-write flush).
-    pub fn is_cached(&self) -> bool {
-        self.cached
-    }
-
     /// Pull the current manifest + chunks into the buffer. Idempotent.
     pub fn load_if_needed(&mut self, store: &dyn Store) -> anyhow::Result<()> {
         if self.loaded {
@@ -307,7 +306,7 @@ impl WriteHandle {
         self.dirty = true;
         if !self.cached {
             // Uncached mode: flush synchronously so every write goes round-trip.
-            let _stats = self.flush_now(store)?;
+            let _stats = self.flush(store)?;
         }
         Ok(data.len())
     }
@@ -328,13 +327,8 @@ impl WriteHandle {
     }
 
     /// Flush the buffer to the store. Returns stats for audit.
-    /// Public alias kept for callers outside this module.
+    /// Retries up to MAX_CAS_RETRIES times on ESTALE with exponential backoff.
     pub fn flush(&mut self, store: &dyn Store) -> anyhow::Result<FlushStats> {
-        self.flush_now(store)
-    }
-
-    /// Inner flush — retries up to MAX_CAS_RETRIES times on ESTALE with exponential backoff.
-    pub(crate) fn flush_now(&mut self, store: &dyn Store) -> anyhow::Result<FlushStats> {
         const MAX_CAS_RETRIES: u32 = 3;
         const RETRY_BACKOFF_MS: [u64; 3] = [50, 100, 200];
 
@@ -474,7 +468,7 @@ impl WriteHandle {
         let store2 = Arc::clone(&store);
         lease.on_revoke(Box::new(move || {
             let mut wh = wh_arc.lock();
-            let _ = wh.flush_now(&*store2);
+            let _ = wh.flush(&*store2);
             // Switch to uncached mode — subsequent writes flush through.
             wh.cached = false;
             wh.lease = None;

@@ -36,16 +36,6 @@ func (q *Queries) AddCertRevocation(ctx context.Context, arg AddCertRevocationPa
 	return err
 }
 
-const deleteExpiredCertRevocations = `-- name: DeleteExpiredCertRevocations :exec
-DELETE FROM cert_revocations WHERE expires_at <= now()
-`
-
-// Housekeeping: drop rows whose certs have already expired.
-func (q *Queries) DeleteExpiredCertRevocations(ctx context.Context) error {
-	_, err := q.db.Exec(ctx, deleteExpiredCertRevocations)
-	return err
-}
-
 const listActiveCertRevocations = `-- name: ListActiveCertRevocations :many
 SELECT cert_serial, expires_at
 FROM cert_revocations

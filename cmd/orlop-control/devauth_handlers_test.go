@@ -50,8 +50,10 @@ func httpOpenTestPool(t *testing.T) *pgxpool.Pool {
 		// are listed explicitly so tests that only touch them (Phase 2
 		// anonymous sandbox flow) still get a clean slate, since the older
 		// tables they descend from may not be referenced.
-		_, _ = pool.Exec(context.Background(),
-			"TRUNCATE TABLE sessions_anonymous, disk_allocations, server_pool, refresh_tokens, access_tokens, device_authorizations, agent_enrollments, cert_revocations, server_vms, users, tenants RESTART IDENTITY CASCADE")
+		if _, err := pool.Exec(context.Background(),
+			"TRUNCATE TABLE sessions_anonymous, disk_allocations, server_pool, access_tokens, agent_enrollments, cert_revocations, server_vms, users, tenants RESTART IDENTITY CASCADE"); err != nil {
+			t.Errorf("truncate: %v", err)
+		}
 		pool.Close()
 	})
 	return pool

@@ -20,16 +20,8 @@ SELECT * FROM users WHERE email = $1;
 -- name: SuspendUser :exec
 UPDATE users SET suspended_at = now() WHERE id = $1;
 
--- name: UnsuspendUser :exec
-UPDATE users SET suspended_at = NULL WHERE id = $1;
-
 -- name: GetUserForUpdate :one
 SELECT * FROM users WHERE id = $1 FOR UPDATE;
-
--- name: SetUserQuota :exec
--- Sets a user's aggregate quota. Used to provision the shared control-plane system
--- user with a high ceiling so per-agent caps are governed by each allocation's size.
-UPDATE users SET quota_bytes = $2 WHERE id = $1;
 
 -- name: SumActiveAllocationBytes :one
 SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total_bytes

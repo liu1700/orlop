@@ -12,7 +12,7 @@ use serde::Deserialize;
 use orlop::agents_md;
 use orlop::audit;
 use orlop::backend::{self, build_stores, TlsIdentity};
-use orlop::config::{Config, HostedConfig, MountConfig, MountKind};
+use orlop::config::{Config, HostedConfig, MountConfig};
 use orlop::enroll::{self, EnrolledCert};
 use orlop::login;
 use orlop::util;
@@ -194,7 +194,7 @@ fn main() -> anyhow::Result<()> {
             }
             let mountpoint = mountpoint
                 .clone()
-                .or_else(|| cfg.fuse_mountpoint())
+                .or_else(|| cfg.mountpoint.clone())
                 .ok_or_else(|| anyhow!("mountpoint is required in config or --mountpoint"))?;
 
             if *foreground {
@@ -210,7 +210,7 @@ fn main() -> anyhow::Result<()> {
             let log_file = daemon::log_file_path()?;
 
             let existing_pid = daemon::read_pid_file(&pid_file)?;
-            let alive = existing_pid.map_or(false, daemon::pid_alive);
+            let alive = existing_pid.is_some_and(daemon::pid_alive);
             let mp_active = daemon::is_mountpoint_active(&mountpoint);
 
             match daemon::classify(existing_pid, alive, mp_active) {
@@ -294,7 +294,7 @@ fn main() -> anyhow::Result<()> {
                                 log_file.display()
                             )
                         }
-                        Err(()) => {
+                        Err(_) => {
                             if let Ok(Some(pid)) = daemon::read_pid_file(&pid_file) {
                                 daemon::send_signal(pid, libc::SIGKILL);
                             }
@@ -313,7 +313,7 @@ fn main() -> anyhow::Result<()> {
                     drop(pipe_reader);
                     let writer = std::sync::Arc::new(std::sync::Mutex::new(Some(pipe_writer)));
                     let writer_for_cb = std::sync::Arc::clone(&writer);
-                    let ready_cb: Box<dyn FnOnce(Result<(), String>) + Send> =
+                    let ready_cb: ReadySignal =
                         Box::new(move |result| {
                             if let Some(mut w) = writer_for_cb.lock().unwrap().take() {
                                 let _ = match result {
@@ -363,7 +363,7 @@ fn main() -> anyhow::Result<()> {
             let target = target
                 .clone()
                 .or_else(|| cli.mountpoint.clone())
-                .or_else(|| loaded_cfg.as_ref().and_then(|cfg| cfg.fuse_mountpoint()))
+                .or_else(|| loaded_cfg.as_ref().and_then(|cfg| cfg.mountpoint.clone()))
                 .ok_or_else(|| anyhow!("unmount target is required"))?;
 
             // Daemon path: if we wrote a PID file, prefer SIGTERM-then-wait so the
@@ -813,23 +813,21 @@ impl MountLeaseClient {
     }
 
     fn acquire(&self) -> anyhow::Result<MountLeaseResp> {
-        let resp = self
-            .client
-            .post(self.url(""))
-            .json(&self.body())
-            .send()
-            .with_context(|| format!("POST {}", self.url("")))?;
-        self.decode_lease_response(resp, "acquire")
+        self.post_lease("", "acquire")
     }
 
     fn refresh(&self) -> anyhow::Result<MountLeaseResp> {
+        self.post_lease("/refresh", "refresh")
+    }
+
+    fn post_lease(&self, suffix: &str, op: &str) -> anyhow::Result<MountLeaseResp> {
         let resp = self
             .client
-            .post(self.url("/refresh"))
+            .post(self.url(suffix))
             .json(&self.body())
             .send()
-            .with_context(|| format!("POST {}", self.url("/refresh")))?;
-        self.decode_lease_response(resp, "refresh")
+            .with_context(|| format!("POST {}", self.url(suffix)))?;
+        self.decode_lease_response(resp, op)
     }
 
     fn release(&self) -> anyhow::Result<()> {
@@ -1010,14 +1008,12 @@ fn cert_renewal_loop(
         // fresh one to re-enroll. Failure is non-fatal — fall back to the
         // existing token (see maybe_refresh_enroll_token).
         //
-        // NOTE: this only fires for long-lived pods; one-shot pods exit before
-        // the 1h cert (and thus this renewal loop) ever fires. It is wired and
-        // unit-tested here for the response-parsing helper, but the full SA-token
-        // -> control-plane -> fresh-enroll-token round-trip is only verifiable
-        // end-to-end inside a real cluster.
+        // NOTE: only long-lived pods reach this (one-shot pods exit before the
+        // 1h cert renews); the full SA-token round-trip is only verifiable
+        // in-cluster — unit tests cover the response parsing.
         maybe_refresh_enroll_token(tokens, cert_dir);
 
-        match renew_cert(tokens, cert_dir, audit) {
+        match enroll_with_tokens(tokens, cert_dir, audit) {
             Ok(enrolled) => {
                 eprintln!(
                     "renewed hosted client certificate serial={} expires_at={}",
@@ -1042,14 +1038,6 @@ fn cert_renewal_loop(
     }
 }
 
-fn renew_cert(
-    tokens: &mut login::TokenManager,
-    cert_dir: &Path,
-    audit: &audit::AuditLog,
-) -> anyhow::Result<EnrolledCert> {
-    enroll_with_tokens(tokens, cert_dir, audit)
-}
-
 /// Env var holding the path to the pod's projected ServiceAccount token file.
 const ENV_SA_TOKEN_PATH: &str = "ORLOP_SA_TOKEN_PATH";
 /// Env var holding the control-plane enroll-token refresh URL.
@@ -1061,8 +1049,8 @@ const ENV_REFRESH_URL: &str = "ORLOP_REFRESH_URL";
 /// control-plane wired the projected SA token + refresh endpoint into the
 /// sidecar), read the SA token, POST it to the refresh URL, and on success
 /// rewrite `credentials.json` with the fresh enroll token so the subsequent
-/// `renew_cert` re-enrolls with it; the in-memory `TokenManager` is reloaded
-/// from the rewritten file.
+/// re-enrollment uses it; the in-memory `TokenManager` is reloaded from the
+/// rewritten file.
 ///
 /// Graceful fallback: any failure (env unset, file unreadable, network error,
 /// non-2xx, malformed body) logs a warning and returns without touching
@@ -1113,7 +1101,7 @@ fn refresh_enroll_token(
     }
     let fresh_token = parse_refresh_response(&body)?;
 
-    // Rewrite credentials.json so renew_cert re-enrolls with the fresh token,
+    // Rewrite credentials.json so the next re-enrollment uses the fresh token,
     // preserving the control-plane URL from the current credentials.
     let control_plane = tokens.credentials().control_plane_url.clone();
     let creds = login::Credentials::for_enroll(control_plane, fresh_token);
@@ -1186,25 +1174,26 @@ fn auth_state_invalid(err: &anyhow::Error) -> bool {
         || msg.contains("tenant is suspended")
 }
 
-/// Parsed `orlop mount --from-env` inputs. The in-pod mounter is driven
-/// entirely by env (the control plane injects these via the sidecar spec),
-/// so there is no config file and no separate auth step: the enroll token
-/// IS the identity, traded for a 1h client cert by `/agent/enroll`.
+/// Parsed `orlop mount --from-env` inputs — the in-pod mounter's env contract
+/// (documented in docs/container-images.md): ORLOP_AGENT_ID, ORLOP_MOUNT_POINT,
+/// ORLOP_CONTROL_PLANE and ORLOP_ENROLL_TOKEN are required; ORLOP_CERT_DIR is
+/// optional (pins the cert location, e.g. a tmpfs — default is a fresh
+/// per-process tempdir). There is no config file and no separate auth step:
+/// the enroll token IS the identity, traded for a 1h client cert by
+/// `/agent/enroll`. `agent_id` is informational, surfaced in logs so pod logs
+/// tie a mount to an agent.
 #[derive(Debug, Clone, PartialEq)]
 struct EnvMountSpec {
-    /// Informational; surfaced in logs so pod logs tie a mount to an agent.
     agent_id: String,
     mount_point: PathBuf,
     control_plane: String,
     enroll_token: String,
-    /// Honor `ORLOP_CERT_DIR` when set so an operator can pin the cert
-    /// location (e.g. a tmpfs); otherwise a fresh per-process tempdir.
     cert_dir: Option<PathBuf>,
 }
 
 impl EnvMountSpec {
     /// Read the spec from `getter` (an env lookup). Missing/empty required
-    /// vars yield a precise "set ORLOP_X" error; `ORLOP_CERT_DIR` is optional.
+    /// vars yield a precise "set ORLOP_X" error.
     fn from_env_with(getter: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         fn required(getter: &impl Fn(&str) -> Option<String>, key: &str) -> anyhow::Result<String> {
             match getter(key) {
@@ -1230,20 +1219,13 @@ impl EnvMountSpec {
     }
 }
 
-/// `orlop mount --from-env` entry point. Trades the env-supplied enroll token
-/// for a short-lived (1h) client cert via `/agent/enroll`, then mounts over
-/// the existing mTLS data path. Reuses the standard hosted mount engine by
-/// synthesizing a `Config` + on-disk `Credentials` and routing through
-/// `run_mount_payload`; that also reuses `CertManager`, whose renewal task is
-/// the refresh safety net (re-enrolls ~10 min before the 1h cert expires and
-/// atomically replaces the on-disk cert files via `enroll::persist`).
-///
-// NOTE: refresh keeps the cert files on disk fresh, but the live mTLS data
-// connection does NOT hot-swap the cert — quinn/rustls captured the identity
-// at dial time, so a rotated cert only takes effect on the next dial (i.e. a
-// remount). This is intentional and harmless for the common case: the in-pod
-// mounter runs in a one-shot pod that exits well before the 1h cert expires,
-// so the renewal never fires. Live rotation is deliberately not built.
+/// `orlop mount --from-env` entry point: synthesizes a hosted `Config` +
+/// on-disk `Credentials` from [`EnvMountSpec`] and routes through the standard
+/// `run_mount_payload` engine, including `CertManager` renewal (re-enrolls
+/// ~10 min before the 1h cert expires). Note the live mTLS connection does NOT
+/// hot-swap a renewed cert — rustls captured the identity at dial time, so it
+/// takes effect on the next dial. Intentional: the common one-shot pod exits
+/// before the renewal ever fires.
 fn run_env_mount(no_inject: bool) -> anyhow::Result<()> {
     let spec = EnvMountSpec::from_env()?;
 
@@ -1323,6 +1305,10 @@ fn default_env_audit_log(cert_dir: &Path) -> PathBuf {
     cert_dir.join("audit.log")
 }
 
+/// Callback the daemon grandchild uses to report mount readiness to its
+/// parent's pipe (`READY\n` on success, `ERR <msg>\n` on failure).
+type ReadySignal = Box<dyn FnOnce(Result<(), String>) + Send>;
+
 /// Body of `orlop mount` — acquires lease, sets up backends, calls
 /// `orlop::mount::mount`, optionally injects AGENTS.md, then blocks on
 /// `wait()` until SIGTERM/SIGINT. Called from both the foreground path
@@ -1337,7 +1323,7 @@ fn run_mount_payload(
     mountpoint: PathBuf,
     creds_override: Option<&Path>,
     no_inject: bool,
-    ready_signal: Option<Box<dyn FnOnce(Result<(), String>) + Send>>,
+    ready_signal: Option<ReadySignal>,
     original_cwd: Option<PathBuf>, // parent's cwd before daemonize chdir'd to /
 ) -> anyhow::Result<()> {
     if std::env::var("ORLOP_DAEMON_TEST_SKIP_MOUNT").is_ok() {
@@ -1418,7 +1404,6 @@ fn run_mount_payload(
         );
         let mount_cfg = MountConfig {
             name: "orlop".to_string(),
-            kind: MountKind::Remote,
             mount: hosted.mount_root.clone().unwrap_or_else(|| "/".to_string()),
             readonly: cfg.policy.readonly,
             deny: cfg.policy.deny.clone(),
@@ -1444,7 +1429,7 @@ fn run_mount_payload(
         (backends, Some(cert_manager), lease_manager)
     } else {
         (
-            build_stores(&cfg.fuse_mounts()?, None, Arc::clone(&chunk_cache))?,
+            build_stores(&cfg.mounts, None, Arc::clone(&chunk_cache))?,
             None,
             None,
         )

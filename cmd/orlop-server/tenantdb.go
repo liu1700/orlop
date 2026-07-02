@@ -9,14 +9,14 @@ import (
 )
 
 // TenantDB is the per-tenant SQLite handle that backs the chunk store,
-// manifest store, session journal, and session table. The data it holds
-// is the entire on-disk state for one tenant's namespace; a hosted tenant
-// is a `<storeRoot>/routes.db` plus the chunk objects under
+// manifest store, and session journal. The data it holds is the entire
+// on-disk state for one tenant's namespace; a hosted tenant is a
+// `<storeRoot>/routes.db` plus the chunk objects under
 // `<storeRoot>/objects/`.
 //
 // The struct is just a typed wrapper around `*sql.DB` — schema setup happens
-// on Open, and every consumer (ManifestStore, SessionStore, SessionJournal,
-// the GC loop) shares the same underlying handle via DB().
+// on Open, and every consumer (ManifestStore, SessionJournal, the GC loop)
+// shares the same underlying handle via DB().
 type TenantDB struct {
 	db *sql.DB
 }
@@ -137,8 +137,8 @@ func (t *TenantDB) Close() error {
 	return t.db.Close()
 }
 
-// DB returns the raw *sql.DB. ManifestStore, SessionStore, SessionJournal,
-// and the GC loop share the same handle rather than opening duplicate ones.
+// DB returns the raw *sql.DB. ManifestStore, SessionJournal, and the GC loop
+// share the same handle rather than opening duplicate ones.
 func (t *TenantDB) DB() *sql.DB {
 	return t.db
 }

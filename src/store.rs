@@ -85,24 +85,22 @@ pub trait Store: Send + Sync {
     fn dir_create(&self, path: &str, mode: u32) -> anyhow::Result<()>;
     fn dir_remove(&self, path: &str) -> anyhow::Result<()>;
 
-    /// Change the permission bits of a file, directory, or symlink (chmod).
-    /// Unlike `manifest_put`, this works for directories too (which carry no
-    /// manifest). Default errors; `DataStore` implements it over the wire.
+    // The setattr_* primitives work on files, directories, and symlinks alike
+    // (no manifest required), are store-and-readback only (no permission
+    // enforcement), and default to an error — `DataStore` implements them
+    // over the wire.
+
+    /// Change the permission bits (chmod).
     fn setattr_mode(&self, _path: &str, _mode: u32) -> anyhow::Result<()> {
         anyhow::bail!("setattr_mode not supported by this store")
     }
 
-    /// Change the owner (uid/gid) of a file, directory, or symlink (chown).
-    /// Store-and-readback only, no permission enforcement. Works for every kind
-    /// (no manifest required). Default errors; `DataStore` implements it over
-    /// the wire.
+    /// Change the owner uid/gid (chown).
     fn setattr_owner(&self, _path: &str, _uid: u32, _gid: u32) -> anyhow::Result<()> {
         anyhow::bail!("setattr_owner not supported by this store")
     }
 
-    /// Set the access time (atime, unix ns) of a file, directory, or symlink
-    /// (utimensat). Store-and-readback only. Default errors; `DataStore`
-    /// implements it over the wire.
+    /// Set the access time (atime, unix ns; utimensat).
     fn setattr_atime(&self, _path: &str, _atime: i64) -> anyhow::Result<()> {
         anyhow::bail!("setattr_atime not supported by this store")
     }

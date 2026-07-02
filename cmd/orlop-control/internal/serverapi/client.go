@@ -11,8 +11,10 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -126,6 +128,49 @@ func (e ErrAdmin) Error() string {
 	return fmt.Sprintf("serverapi: admin request failed status=%d code=%s: %s", e.Status, e.Code, e.Message)
 }
 
+// doJSON performs one admin request end to end: it marshals reqBody (when
+// non-nil) as the JSON request body, sends method+reqURL, and decodes a 2xx
+// response into okOut (when non-nil). On a non-2xx it decodes the error
+// envelope — tolerating a malformed body — and returns its contents alongside
+// the status; err is non-nil only for transport / marshal / decode failures.
+// Callers keep their own status checks, logging, and typed-error mapping.
+func (c *Client) doJSON(ctx context.Context, method, reqURL string, reqBody, okOut any) (status int, errBody adminErrorBody, err error) {
+	var body io.Reader
+	if reqBody != nil {
+		b, err := json.Marshal(reqBody)
+		if err != nil {
+			return 0, adminErrorBody{}, fmt.Errorf("serverapi: marshal request: %w", err)
+		}
+		body = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
+	if err != nil {
+		return 0, adminErrorBody{}, fmt.Errorf("serverapi: build request: %w", err)
+	}
+	if reqBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, adminErrorBody{}, fmt.Errorf("serverapi: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if okOut != nil {
+			if err := json.NewDecoder(resp.Body).Decode(okOut); err != nil {
+				return resp.StatusCode, adminErrorBody{}, fmt.Errorf("serverapi: decode response: %w", err)
+			}
+		}
+		return resp.StatusCode, adminErrorBody{}, nil
+	}
+	var env adminErrorEnvelope
+	_ = json.NewDecoder(resp.Body).Decode(&env)
+	return resp.StatusCode, env.Error, nil
+}
+
 // RegisterTenant calls POST https://<opsAddr>/control/tenants on orlop-server.
 // opsAddr is the orlop-server ops listener address (HTTPS) — see server_pool.ops_addr.
 // Returns projectID on success.
@@ -136,35 +181,18 @@ func (e ErrAdmin) Error() string {
 //   - ErrAdmin for any other non-2xx.
 //   - Wrapped error for transport / TLS / decode failures.
 func (c *Client) RegisterTenant(ctx context.Context, opsAddr, tenantID, ownerTenantID, name string, sizeBytes int64) (projectID uint32, err error) {
-	body, err := json.Marshal(registerTenantRequest{
+	var ok registerTenantResponse
+	status, e, err := c.doJSON(ctx, http.MethodPost, "https://"+opsAddr+"/control/tenants", registerTenantRequest{
 		TenantID:      tenantID,
 		OwnerTenantID: ownerTenantID,
 		Name:          name,
 		SizeBytes:     sizeBytes,
-	})
+	}, &ok)
 	if err != nil {
-		return 0, fmt.Errorf("serverapi: marshal request: %w", err)
+		return 0, err
 	}
 
-	url := "https://" + opsAddr + "/control/tenants"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("serverapi: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("serverapi: do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		var ok registerTenantResponse
-		if err := json.NewDecoder(resp.Body).Decode(&ok); err != nil {
-			return 0, fmt.Errorf("serverapi: decode response: %w", err)
-		}
+	if status == http.StatusOK {
 		c.logger.Info("tenant_admin_register_ok",
 			"ops_addr", opsAddr,
 			"tenant_id", tenantID,
@@ -173,25 +201,20 @@ func (c *Client) RegisterTenant(ctx context.Context, opsAddr, tenantID, ownerTen
 		return ok.ProjectID, nil
 	}
 
-	// Non-2xx: try to decode error envelope; fall through gracefully if malformed.
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
-
 	c.logger.Error("tenant_admin_register_failed",
 		"ops_addr", opsAddr,
 		"tenant_id", tenantID,
-		"status", resp.StatusCode,
+		"status", status,
 		"code", e.Code,
 	)
 
 	switch {
-	case resp.StatusCode == http.StatusConflict && e.Code == codeSizeMismatch:
+	case status == http.StatusConflict && e.Code == codeSizeMismatch:
 		return 0, ErrSizeMismatch{Existing: e.ExistingSizeBytes}
-	case resp.StatusCode == http.StatusInternalServerError && e.Code == codeFSQuotaUnavailable:
+	case status == http.StatusInternalServerError && e.Code == codeFSQuotaUnavailable:
 		return 0, ErrQuotaUnavailable{Detail: e.Detail}
 	default:
-		return 0, ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+		return 0, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 	}
 }
 
@@ -201,41 +224,24 @@ type resizeTenantRequest struct {
 }
 
 // ResizeTenant calls PATCH https://<opsAddr>/control/tenants/{id} to change a
-// tenant's hard size cap in place, preserving its project ID. It is the
-// data-plane half of elastic storage — the storage autoscaler grows a tenant
-// toward its promised ceiling, and a cap upgrade raises an anon trial's
-// cap the same way. Idempotent: re-applying the current size returns the
-// unchanged projectID.
+// tenant's hard size cap in place, preserving its project ID — the data-plane
+// half of a cap change (a quota upgrade sets an agent disk's new fixed grant
+// this way). Idempotent: re-applying the current size returns the unchanged
+// projectID.
 //
 // Errors:
 //   - ErrQuotaUnavailable if 500 with code=fs_quota_unavailable.
 //   - ErrAdmin for any other non-2xx (including 404 when the tenant is unknown).
 //   - Wrapped error for transport / TLS / decode failures.
 func (c *Client) ResizeTenant(ctx context.Context, opsAddr, tenantID string, sizeBytes int64) (projectID uint32, err error) {
-	body, err := json.Marshal(resizeTenantRequest{SizeBytes: sizeBytes})
+	var ok registerTenantResponse
+	status, e, err := c.doJSON(ctx, http.MethodPatch, "https://"+opsAddr+"/control/tenants/"+tenantID,
+		resizeTenantRequest{SizeBytes: sizeBytes}, &ok)
 	if err != nil {
-		return 0, fmt.Errorf("serverapi: marshal request: %w", err)
+		return 0, err
 	}
 
-	url := "https://" + opsAddr + "/control/tenants/" + tenantID
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("serverapi: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("serverapi: do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		var ok registerTenantResponse
-		if err := json.NewDecoder(resp.Body).Decode(&ok); err != nil {
-			return 0, fmt.Errorf("serverapi: decode response: %w", err)
-		}
+	if status == http.StatusOK {
 		c.logger.Info("tenant_admin_resize_ok",
 			"ops_addr", opsAddr,
 			"tenant_id", tenantID,
@@ -245,21 +251,17 @@ func (c *Client) ResizeTenant(ctx context.Context, opsAddr, tenantID string, siz
 		return ok.ProjectID, nil
 	}
 
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
-
 	c.logger.Error("tenant_admin_resize_failed",
 		"ops_addr", opsAddr,
 		"tenant_id", tenantID,
-		"status", resp.StatusCode,
+		"status", status,
 		"code", e.Code,
 	)
 
-	if resp.StatusCode == http.StatusInternalServerError && e.Code == codeFSQuotaUnavailable {
+	if status == http.StatusInternalServerError && e.Code == codeFSQuotaUnavailable {
 		return 0, ErrQuotaUnavailable{Detail: e.Detail}
 	}
-	return 0, ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return 0, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
 // SetAccountQuota calls PATCH https://<opsAddr>/control/accounts/{owner}/quota to set
@@ -268,42 +270,23 @@ func (c *Client) ResizeTenant(ctx context.Context, opsAddr, tenantID string, siz
 //
 // Errors mirror ResizeTenant: ErrQuotaUnavailable, ErrAdmin, or a wrapped transport error.
 func (c *Client) SetAccountQuota(ctx context.Context, opsAddr, ownerTenantID string, sizeBytes int64) (projectID uint32, err error) {
-	body, err := json.Marshal(resizeTenantRequest{SizeBytes: sizeBytes})
+	var ok registerTenantResponse
+	status, e, err := c.doJSON(ctx, http.MethodPatch, "https://"+opsAddr+"/control/accounts/"+ownerTenantID+"/quota",
+		resizeTenantRequest{SizeBytes: sizeBytes}, &ok)
 	if err != nil {
-		return 0, fmt.Errorf("serverapi: marshal request: %w", err)
+		return 0, err
 	}
 
-	url := "https://" + opsAddr + "/control/accounts/" + ownerTenantID + "/quota"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("serverapi: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("serverapi: do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		var ok registerTenantResponse
-		if err := json.NewDecoder(resp.Body).Decode(&ok); err != nil {
-			return 0, fmt.Errorf("serverapi: decode response: %w", err)
-		}
+	if status == http.StatusOK {
 		c.logger.Info("account_quota_set_ok", "ops_addr", opsAddr, "owner_tenant", ownerTenantID, "size_bytes", ok.SizeBytes)
 		return ok.ProjectID, nil
 	}
 
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
-	c.logger.Error("account_quota_set_failed", "ops_addr", opsAddr, "owner_tenant", ownerTenantID, "status", resp.StatusCode, "code", e.Code)
-	if resp.StatusCode == http.StatusInternalServerError && e.Code == codeFSQuotaUnavailable {
+	c.logger.Error("account_quota_set_failed", "ops_addr", opsAddr, "owner_tenant", ownerTenantID, "status", status, "code", e.Code)
+	if status == http.StatusInternalServerError && e.Code == codeFSQuotaUnavailable {
 		return 0, ErrQuotaUnavailable{Detail: e.Detail}
 	}
-	return 0, ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return 0, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
 // UnregisterTenant calls DELETE https://<opsAddr>/control/tenants/{id} on
@@ -314,29 +297,17 @@ func (c *Client) SetAccountQuota(ctx context.Context, opsAddr, ownerTenantID str
 // Idempotent: returns nil if the server already considers the tenant
 // gone (404 with code=not_found). Any other non-2xx returns ErrAdmin.
 func (c *Client) UnregisterTenant(ctx context.Context, opsAddr, tenantID string) error {
-	url := "https://" + opsAddr + "/control/tenants/" + tenantID
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	status, e, err := c.doJSON(ctx, http.MethodDelete, "https://"+opsAddr+"/control/tenants/"+tenantID, nil, nil)
 	if err != nil {
-		return fmt.Errorf("serverapi: build request: %w", err)
+		return err
 	}
-	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("serverapi: do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNoContent {
+	if status == http.StatusNoContent {
 		c.logger.Info("tenant_admin_unregister_ok", "ops_addr", opsAddr, "tenant_id", tenantID)
 		return nil
 	}
 
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
-
-	if resp.StatusCode == http.StatusNotFound && e.Code == "not_found" {
+	if status == http.StatusNotFound && e.Code == "not_found" {
 		c.logger.Info("tenant_admin_unregister_already_gone", "ops_addr", opsAddr, "tenant_id", tenantID)
 		return nil
 	}
@@ -344,10 +315,10 @@ func (c *Client) UnregisterTenant(ctx context.Context, opsAddr, tenantID string)
 	c.logger.Error("tenant_admin_unregister_failed",
 		"ops_addr", opsAddr,
 		"tenant_id", tenantID,
-		"status", resp.StatusCode,
+		"status", status,
 		"code", e.Code,
 	)
-	return ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
 // TenantUsage is the decoded response from GetTenantUsage.
@@ -366,24 +337,13 @@ type tenantUsageResponse struct {
 // GetTenantUsage calls GET https://<opsAddr>/control/tenants/{id}/usage on
 // orlop-server. Returns ErrAdmin on non-2xx (including 404 for unknown tenants).
 func (c *Client) GetTenantUsage(ctx context.Context, opsAddr, tenantID string) (TenantUsage, error) {
-	url := "https://" + opsAddr + "/control/tenants/" + tenantID + "/usage"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var ok tenantUsageResponse
+	status, e, err := c.doJSON(ctx, http.MethodGet, "https://"+opsAddr+"/control/tenants/"+tenantID+"/usage", nil, &ok)
 	if err != nil {
-		return TenantUsage{}, fmt.Errorf("serverapi: build request: %w", err)
+		return TenantUsage{}, err
 	}
-	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return TenantUsage{}, fmt.Errorf("serverapi: do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		var ok tenantUsageResponse
-		if err := json.NewDecoder(resp.Body).Decode(&ok); err != nil {
-			return TenantUsage{}, fmt.Errorf("serverapi: decode response: %w", err)
-		}
+	if status == http.StatusOK {
 		return TenantUsage{
 			TenantID:  ok.TenantID,
 			UsedBytes: ok.UsedBytes,
@@ -391,16 +351,13 @@ func (c *Client) GetTenantUsage(ctx context.Context, opsAddr, tenantID string) (
 		}, nil
 	}
 
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
 	c.logger.Error("tenant_admin_usage_failed",
 		"ops_addr", opsAddr,
 		"tenant_id", tenantID,
-		"status", resp.StatusCode,
+		"status", status,
 		"code", e.Code,
 	)
-	return TenantUsage{}, ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return TenantUsage{}, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
 // JournalEntry is one row decoded from GET /control/tenants/{id}/journal.
@@ -437,15 +394,7 @@ func (c *Client) QueryJournal(
 	limit uint32,
 	cursor string,
 ) (JournalQueryResult, error) {
-	url := "https://" + opsAddr + "/control/tenants/" + tenantID + "/journal"
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return JournalQueryResult{}, fmt.Errorf("serverapi: build request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-
-	q := req.URL.Query()
+	q := url.Values{}
 	if allocationID != "" {
 		q.Set("allocation_id", allocationID)
 	}
@@ -455,32 +404,24 @@ func (c *Client) QueryJournal(
 	if cursor != "" {
 		q.Set("cursor", cursor)
 	}
-	req.URL.RawQuery = q.Encode()
+	reqURL := "https://" + opsAddr + "/control/tenants/" + tenantID + "/journal?" + q.Encode()
 
-	resp, err := c.httpClient.Do(req)
+	var result JournalQueryResult
+	status, e, err := c.doJSON(ctx, http.MethodGet, reqURL, nil, &result)
 	if err != nil {
-		return JournalQueryResult{}, fmt.Errorf("serverapi: do request: %w", err)
+		return JournalQueryResult{}, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		var result JournalQueryResult
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return JournalQueryResult{}, fmt.Errorf("serverapi: decode response: %w", err)
-		}
+	if status == http.StatusOK {
 		return result, nil
 	}
 
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
 	c.logger.Error("tenant_admin_journal_failed",
 		"ops_addr", opsAddr,
 		"tenant_id", tenantID,
-		"status", resp.StatusCode,
+		"status", status,
 		"code", e.Code,
 	)
-	return JournalQueryResult{}, ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return JournalQueryResult{}, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
 // QueryJournalAfterSeq calls GET <opsAddr>/control/tenants/{id}/journal with
@@ -492,15 +433,7 @@ func (c *Client) QueryJournalAfterSeq(
 	limit uint32,
 	afterSeq uint64,
 ) (JournalQueryResult, error) {
-	url := "https://" + opsAddr + "/control/tenants/" + tenantID + "/journal"
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return JournalQueryResult{}, fmt.Errorf("serverapi: build request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-
-	q := req.URL.Query()
+	q := url.Values{}
 	if allocationID != "" {
 		q.Set("allocation_id", allocationID)
 	}
@@ -508,26 +441,17 @@ func (c *Client) QueryJournalAfterSeq(
 		q.Set("limit", fmt.Sprintf("%d", limit))
 	}
 	q.Set("after_seq", fmt.Sprintf("%d", afterSeq))
-	req.URL.RawQuery = q.Encode()
+	reqURL := "https://" + opsAddr + "/control/tenants/" + tenantID + "/journal?" + q.Encode()
 
-	resp, err := c.httpClient.Do(req)
+	var result JournalQueryResult
+	status, e, err := c.doJSON(ctx, http.MethodGet, reqURL, nil, &result)
 	if err != nil {
-		return JournalQueryResult{}, fmt.Errorf("serverapi: do request: %w", err)
+		return JournalQueryResult{}, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		var result JournalQueryResult
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return JournalQueryResult{}, fmt.Errorf("serverapi: decode response: %w", err)
-		}
+	if status == http.StatusOK {
 		return result, nil
 	}
-
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
-	return JournalQueryResult{}, ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return JournalQueryResult{}, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
 // StreamJournal opens GET <opsAddr>/control/tenants/{id}/journal/stream and
@@ -550,8 +474,8 @@ func (c *Client) StreamJournal(
 	opsAddr, tenantID, allocationID string,
 	afterSeq uint64,
 ) (<-chan JournalEntry, error) {
-	url := "https://" + opsAddr + "/control/tenants/" + tenantID + "/journal/stream"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	reqURL := "https://" + opsAddr + "/control/tenants/" + tenantID + "/journal/stream"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("serverapi: build request: %w", err)
 	}
@@ -571,7 +495,7 @@ func (c *Client) StreamJournal(
 		return nil, fmt.Errorf("serverapi: do stream request: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := readAtMost(resp.Body, 1024)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		resp.Body.Close()
 		return nil, fmt.Errorf("serverapi: stream status %d: %s", resp.StatusCode, body)
 	}
@@ -628,15 +552,6 @@ func (c *Client) streamTransport() http.RoundTripper {
 	return http.DefaultTransport
 }
 
-func readAtMost(r interface{ Read(p []byte) (int, error) }, max int) ([]byte, error) {
-	buf := make([]byte, max)
-	n, err := r.Read(buf)
-	if n > 0 {
-		return buf[:n], nil
-	}
-	return nil, err
-}
-
 // JournalRevertResult mirrors orlop-server's controlJournalRevertResponse:
 // Ok=true means the revert landed; Ok=false carries a conflict reason
 // (no_journal_row, concurrent_writer, revert_blocked, ...).
@@ -666,51 +581,31 @@ func (c *Client) RevertJournalPath(
 	force bool,
 	agentID string,
 ) (JournalRevertResult, error) {
-	body, err := json.Marshal(map[string]any{
-		"allocation_id": allocationID,
-		"session_id":    sessionID,
-		"path":          path,
-		"seq":           seq,
-		"force":         force,
-		"agent_id":      agentID,
-	})
+	var result JournalRevertResult
+	status, e, err := c.doJSON(ctx, http.MethodPost, "https://"+opsAddr+"/control/tenants/"+tenantID+"/journal/revert",
+		map[string]any{
+			"allocation_id": allocationID,
+			"session_id":    sessionID,
+			"path":          path,
+			"seq":           seq,
+			"force":         force,
+			"agent_id":      agentID,
+		}, &result)
 	if err != nil {
-		return JournalRevertResult{}, fmt.Errorf("serverapi: marshal revert: %w", err)
+		return JournalRevertResult{}, err
 	}
-
-	url := "https://" + opsAddr + "/control/tenants/" + tenantID + "/journal/revert"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return JournalRevertResult{}, fmt.Errorf("serverapi: build revert request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return JournalRevertResult{}, fmt.Errorf("serverapi: do revert request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		var result JournalRevertResult
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return JournalRevertResult{}, fmt.Errorf("serverapi: decode revert: %w", err)
-		}
+	if status == http.StatusOK {
 		return result, nil
 	}
 
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
 	c.logger.Error("tenant_admin_revert_failed",
 		"ops_addr", opsAddr,
 		"tenant_id", tenantID,
 		"allocation_id", allocationID,
-		"status", resp.StatusCode,
+		"status", status,
 		"code", e.Code,
 	)
-	return JournalRevertResult{}, ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return JournalRevertResult{}, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
 // ClearActiveMountLease calls
@@ -721,30 +616,22 @@ func (c *Client) RevertJournalPath(
 // Force-Unmount). orlop-server installs the next session lazily on the first
 // write that arrives after a clear — see issue #175.
 func (c *Client) ClearActiveMountLease(ctx context.Context, opsAddr, tenantID, allocationID string) error {
-	url := "https://" + opsAddr + "/control/tenants/" + tenantID + "/allocations/" + allocationID + "/mount-lease"
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	status, e, err := c.doJSON(ctx, http.MethodDelete,
+		"https://"+opsAddr+"/control/tenants/"+tenantID+"/allocations/"+allocationID+"/mount-lease", nil, nil)
 	if err != nil {
-		return fmt.Errorf("serverapi: build request: %w", err)
+		return err
 	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("serverapi: do request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNoContent {
+	if status == http.StatusNoContent {
 		return nil
 	}
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
 	c.logger.Error("clear_active_mount_lease_failed",
 		"ops_addr", opsAddr,
 		"tenant_id", tenantID,
 		"allocation_id", allocationID,
-		"status", resp.StatusCode,
+		"status", status,
 		"code", e.Code,
 	)
-	return ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
 // CertRevocation is one entry pushed to a data-plane server's deny-list (issue #5).
@@ -761,33 +648,20 @@ func (c *Client) PushCertRevocations(ctx context.Context, opsAddr string, revs [
 	if len(revs) == 0 {
 		return nil
 	}
-	body, err := json.Marshal(map[string]any{"revocations": revs})
+	status, e, err := c.doJSON(ctx, http.MethodPut, "https://"+opsAddr+"/control/cert-revocations",
+		map[string]any{"revocations": revs}, nil)
 	if err != nil {
-		return fmt.Errorf("serverapi: marshal revocations: %w", err)
+		return err
 	}
-	url := "https://" + opsAddr + "/control/cert-revocations"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("serverapi: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("serverapi: do request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
+	if status == http.StatusOK {
 		return nil
 	}
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
 	c.logger.Error("push_cert_revocations_failed",
 		"ops_addr", opsAddr,
-		"status", resp.StatusCode,
+		"status", status,
 		"code", e.Code,
 	)
-	return ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
 // AgentPurgeResult is the decoded response from PurgeAgentData.
@@ -807,24 +681,14 @@ type AgentPurgeResult struct {
 // the whole tenant dir is already gone, which is at least as erased as a
 // per-agent purge — returns a zero result and nil.
 func (c *Client) PurgeAgentData(ctx context.Context, opsAddr, tenantID, agentID string) (AgentPurgeResult, error) {
-	url := "https://" + opsAddr + "/control/tenants/" + tenantID + "/agents/" + agentID
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	var out AgentPurgeResult
+	status, e, err := c.doJSON(ctx, http.MethodDelete,
+		"https://"+opsAddr+"/control/tenants/"+tenantID+"/agents/"+agentID, nil, &out)
 	if err != nil {
-		return AgentPurgeResult{}, fmt.Errorf("serverapi: build request: %w", err)
+		return AgentPurgeResult{}, err
 	}
-	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return AgentPurgeResult{}, fmt.Errorf("serverapi: do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		var out AgentPurgeResult
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			return AgentPurgeResult{}, fmt.Errorf("serverapi: decode response: %w", err)
-		}
+	if status == http.StatusOK {
 		c.logger.Info("tenant_admin_agent_purge_ok",
 			"ops_addr", opsAddr,
 			"tenant_id", tenantID,
@@ -836,11 +700,7 @@ func (c *Client) PurgeAgentData(ctx context.Context, opsAddr, tenantID, agentID 
 		return out, nil
 	}
 
-	var env adminErrorEnvelope
-	_ = json.NewDecoder(resp.Body).Decode(&env)
-	e := env.Error
-
-	if resp.StatusCode == http.StatusNotFound && e.Code == "not_found" {
+	if status == http.StatusNotFound && e.Code == "not_found" {
 		c.logger.Info("tenant_admin_agent_purge_tenant_gone",
 			"ops_addr", opsAddr, "tenant_id", tenantID, "agent_id", agentID)
 		return AgentPurgeResult{}, nil
@@ -850,8 +710,8 @@ func (c *Client) PurgeAgentData(ctx context.Context, opsAddr, tenantID, agentID 
 		"ops_addr", opsAddr,
 		"tenant_id", tenantID,
 		"agent_id", agentID,
-		"status", resp.StatusCode,
+		"status", status,
 		"code", e.Code,
 	)
-	return AgentPurgeResult{}, ErrAdmin{Status: resp.StatusCode, Code: e.Code, Message: e.Message}
+	return AgentPurgeResult{}, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }

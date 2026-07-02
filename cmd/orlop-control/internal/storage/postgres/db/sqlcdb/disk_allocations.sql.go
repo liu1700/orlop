@@ -265,63 +265,6 @@ func (q *Queries) ListAllocationsForUser(ctx context.Context, userID pgtype.UUID
 	return items, nil
 }
 
-const listGrowableAllocations = `-- name: ListGrowableAllocations :many
-SELECT
-    da.id          AS allocation_id,
-    da.user_id     AS user_id,
-    da.size_bytes  AS size_bytes,
-    u.quota_bytes  AS ceiling_bytes,
-    COALESCE(da.tenant_id, u.tenant_id) AS tenant_id,
-    sp.ops_addr    AS ops_addr
-FROM disk_allocations da
-JOIN users u        ON u.id = da.user_id
-JOIN server_vms sv  ON sv.tenant_id = COALESCE(da.tenant_id, u.tenant_id)
-JOIN server_pool sp ON sp.data_addr = sv.data_addr
-WHERE da.revoked_at IS NULL
-  AND da.user_id IS NOT NULL
-  AND da.size_bytes < u.quota_bytes
-`
-
-type ListGrowableAllocationsRow struct {
-	AllocationID pgtype.UUID
-	UserID       pgtype.UUID
-	SizeBytes    int64
-	CeilingBytes int64
-	TenantID     string
-	OpsAddr      string
-}
-
-// Active, placed, registered allocations that still have room to grow toward
-// their promised ceiling (users.quota_bytes). The storage autoscaler polls this
-// to decide which tenants to expand. Anonymous allocations (user_id IS NULL) are
-// excluded — they bypass server_pool and are ephemeral.
-func (q *Queries) ListGrowableAllocations(ctx context.Context) ([]ListGrowableAllocationsRow, error) {
-	rows, err := q.db.Query(ctx, listGrowableAllocations)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListGrowableAllocationsRow{}
-	for rows.Next() {
-		var i ListGrowableAllocationsRow
-		if err := rows.Scan(
-			&i.AllocationID,
-			&i.UserID,
-			&i.SizeBytes,
-			&i.CeilingBytes,
-			&i.TenantID,
-			&i.OpsAddr,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listPurgePendingAllocations = `-- name: ListPurgePendingAllocations :many
 SELECT
     da.id          AS allocation_id,

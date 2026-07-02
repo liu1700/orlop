@@ -64,7 +64,7 @@ func (h *journalHandlers) handleJournalStream(w http.ResponseWriter, r *http.Req
 	}
 	afterSeq, _ := strconv.ParseUint(q.Get("after_seq"), 10, 64)
 
-	ident, err := adminOrBearerIdentity(r, h.devAuth)
+	ident, err := adminIdentity(r, h.devAuth)
 	if err != nil {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 		return
@@ -75,7 +75,7 @@ func (h *journalHandlers) handleJournalStream(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if _, err := h.alloc.GetForUser(r.Context(), allocUUID, ident.UserID); err != nil {
-		writeAllocOwnershipError(w, err)
+		writeAllocOwnershipError(w, err, nil, "")
 		return
 	}
 	tenantID := ident.TenantID

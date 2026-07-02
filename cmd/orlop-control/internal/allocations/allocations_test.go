@@ -47,8 +47,10 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("pgxpool.New: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(),
-			"TRUNCATE TABLE server_pool, disk_allocations, refresh_tokens, access_tokens, device_authorizations, agent_enrollments, cert_revocations, server_vms, users, tenants RESTART IDENTITY CASCADE")
+		if _, err := pool.Exec(context.Background(),
+			"TRUNCATE TABLE server_pool, disk_allocations, access_tokens, agent_enrollments, cert_revocations, server_vms, users, tenants RESTART IDENTITY CASCADE"); err != nil {
+			t.Errorf("truncate: %v", err)
+		}
 		pool.Close()
 	})
 	return pool

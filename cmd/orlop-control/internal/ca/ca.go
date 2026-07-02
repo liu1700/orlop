@@ -518,18 +518,6 @@ func (c *CA) RootPEM() []byte {
 	return append([]byte(nil), c.rootPEM...)
 }
 
-// TenantChainPEM returns the cert chain (intermediate || root) for the
-// given tenant, or false if no intermediate exists.
-func (c *CA) TenantChainPEM(tenantID string) ([]byte, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	t, ok := c.tenants[tenantID]
-	if !ok {
-		return nil, false
-	}
-	return append([]byte(nil), t.chainPEM...), true
-}
-
 // HasTenant reports whether an intermediate is loaded for tenantID.
 func (c *CA) HasTenant(tenantID string) bool {
 	c.mu.RLock()

@@ -14,33 +14,28 @@ pub struct ListRequest {
     pub path: String,
 }
 
+/// Directory entry on the wire. Every `#[serde(default)]` field is a
+/// msgpack-named append-only addition: an old server omits it and the zero
+/// value means "unset", for which callers pick a sensible fallback.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryWire {
     pub name: String,
     /// "file" or "dir".
     pub kind: String,
     pub size: u64,
-    /// POSIX permission + type bits. msgpack-named append-only field — an old
-    /// server omits it, in which case `attr()` falls back to a kind default.
-    /// 0 means "unset" (server didn't send it).
+    /// POSIX permission + type bits. 0 → `attr()` falls back to a kind default.
     #[serde(default)]
     pub mode: u32,
-    /// POSIX owner uid. msgpack-named append-only field — an old server omits
-    /// it; 0 (root) is the correct fallback on a single-identity mount.
+    /// POSIX owner uid. 0 (root) is the correct fallback on a single-identity mount.
     #[serde(default)]
     pub uid: u32,
-    /// POSIX owner gid. Same append-only/default semantics as `uid`.
+    /// POSIX owner gid. Same fallback semantics as `uid`.
     #[serde(default)]
     pub gid: u32,
-    /// Access time, unix nanoseconds. msgpack-named append-only field — an old
-    /// server omits it, in which case `attr()` falls back to mtime/now.
+    /// Access time, unix nanoseconds. 0 → `attr()` falls back to mtime/now.
     #[serde(default)]
     pub atime: i64,
-    /// Link destination, set only when `kind == "symlink"`.
-    #[serde(default)]
-    pub target: String,
-    /// Device number, set only when `kind` is a block/char device. msgpack-named
-    /// append-only field — an old server omits it (defaults to 0).
+    /// Device number, set only when `kind` is a block/char device.
     #[serde(default)]
     pub rdev: u64,
 }
@@ -62,11 +57,6 @@ pub struct StatResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PingRequest {
-    pub nonce: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PingResponse {
     pub nonce: u64,
 }
 
@@ -461,77 +451,6 @@ pub struct LeaseRevokeRequest {
     #[serde(with = "serde_bytes")]
     pub lease_id: Vec<u8>,
     pub reason: String,
-}
-
-// ---- Layer 7: journal RPCs -----------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JournalQueryRequest {
-    pub allocation_id: String,
-    #[serde(default)]
-    pub limit: u32,
-    #[serde(default)]
-    pub before_ts_ms: i64,
-}
-
-/// One row from the server's per-allocation write journal.
-///
-/// `before_version` is `None` for `Create`. `after_version` is `None` when
-/// the manifest has since been deleted (or, for `Delete` rows, always — the
-/// row that recorded the delete *is* the after-state). `rename_from` is
-/// empty for non-Rename rows.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JournalEntry {
-    pub session_id: String,
-    pub allocation_id: String,
-    pub seq: u64,
-    pub ts_unix_ms: i64,
-    pub path: String,
-    pub op: String,
-    pub agent_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before_version: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after_version: Option<u64>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub rename_from: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_before: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_after: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct JournalQueryResponse {
-    pub entries: Vec<JournalEntry>,
-    #[serde(default)]
-    pub next_before_ts_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JournalRevertPathRequest {
-    pub allocation_id: String,
-    pub paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct JournalRevertPathResponse {
-    #[serde(default)]
-    pub reverted_paths: Vec<String>,
-    #[serde(default)]
-    pub conflicts: Vec<RevertConflict>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RevertConflict {
-    pub path: String,
-    pub reason: String,
-}
-
-impl ErrorPayload {
-    pub fn ebusy(message: impl Into<String>) -> Self {
-        Self::new(super::protocol::errno::EBUSY, message)
-    }
 }
 
 #[cfg(test)]

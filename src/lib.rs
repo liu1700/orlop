@@ -1,4 +1,5 @@
 pub mod agents_md;
+pub mod assemble;
 pub mod audit;
 pub mod backend;
 pub mod config;
@@ -16,6 +17,8 @@ pub mod fs;
 pub mod lease;
 pub mod login;
 pub mod mount;
+// Not cfg-gated to macOS: building it everywhere lets its unit tests run on
+// Linux CI (only the mount path is macOS-specific).
 pub mod nfs;
 pub mod policy;
 pub mod store;

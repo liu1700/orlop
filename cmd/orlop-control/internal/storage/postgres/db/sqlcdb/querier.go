@@ -6,7 +6,6 @@ package sqlcdb
 
 import (
 	"context"
-	"net/netip"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -25,8 +24,6 @@ type Querier interface {
 	// deny-list is left untouched (the first revocation's reason/expiry win).
 	AddCertRevocation(ctx context.Context, arg AddCertRevocationParams) error
 	BindAllocation(ctx context.Context, arg BindAllocationParams) (DiskAllocation, error)
-	// Two-step: promote allocations, then mark sessions claimed.
-	ClaimAnonymousAllocations(ctx context.Context, arg ClaimAnonymousAllocationsParams) ([]pgtype.UUID, error)
 	// Atomically spend a single-use agent-enroll token (issue #6). Matches only an
 	// un-consumed 'agent_enroll' row; a replay or a lost concurrent race matches
 	// zero rows and returns pgx.ErrNoRows, which the caller treats as "already
@@ -38,21 +35,16 @@ type Querier interface {
 	// to decide between a per-agent subtree purge (other agents share the tenant
 	// dir) and a whole-tenant unregister (this was the last one).
 	CountActiveAllocationsForUser(ctx context.Context, userID pgtype.UUID) (int64, error)
-	CountAnonymousSessionsForIP(ctx context.Context, ipAddress netip.Addr) (int32, error)
-	CountUnclaimedAnonymousSessionsForDevice(ctx context.Context, deviceID string) (int32, error)
 	CreateAPIToken(ctx context.Context, arg CreateAPITokenParams) (CreateAPITokenRow, error)
 	CreateAccessToken(ctx context.Context, arg CreateAccessTokenParams) (AccessToken, error)
 	CreateAgentEnrollment(ctx context.Context, arg CreateAgentEnrollmentParams) (AgentEnrollment, error)
 	CreateServerVM(ctx context.Context, arg CreateServerVMParams) (ServerVm, error)
 	CreateTenant(ctx context.Context, arg CreateTenantParams) (Tenant, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
-	// Housekeeping: drop rows whose certs have already expired.
-	DeleteExpiredCertRevocations(ctx context.Context) error
 	// Remove a tenant's placement after its data-plane tenant was unregistered
 	// (last-allocation purge). The next enroll for this tenant re-Reserves a
 	// placement from the pool.
 	DeleteServerVM(ctx context.Context, tenantID string) (int64, error)
-	DeleteUnclaimedExpiredAnonymousAllocations(ctx context.Context) ([]pgtype.UUID, error)
 	// Idempotent: create the tenant if it does not already exist. The caller
 	// follows up with GetTenant when it needs the row. Used by /v1/entities
 	// provisioning to lazily ensure the customer's per-user tenant.
@@ -74,8 +66,6 @@ type Querier interface {
 	// agent id, a globally-unique UUID, so a lookup by agent_id alone resolves to
 	// at most one live row.
 	GetAllocationByAgent(ctx context.Context, agentID pgtype.Text) (DiskAllocation, error)
-	GetAnonymousSession(ctx context.Context, sessionID string) (AnonymousSession, error)
-	GetAnonymousSessionAllocation(ctx context.Context, sessionID string) (GetAnonymousSessionAllocationRow, error)
 	GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (ServerPool, error)
 	GetServerVMByTenant(ctx context.Context, tenantID string) (ServerVm, error)
 	GetTenant(ctx context.Context, id string) (Tenant, error)
@@ -83,8 +73,6 @@ type Querier interface {
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserForUpdate(ctx context.Context, id pgtype.UUID) (User, error)
 	InsertAllocation(ctx context.Context, arg InsertAllocationParams) (DiskAllocation, error)
-	InsertAnonymousAllocation(ctx context.Context, arg InsertAnonymousAllocationParams) (DiskAllocation, error)
-	InsertAnonymousSession(ctx context.Context, arg InsertAnonymousSessionParams) (AnonymousSession, error)
 	ListAPITokensByUser(ctx context.Context, userID pgtype.UUID) ([]ListAPITokensByUserRow, error)
 	// The deny-list the reconcile loop pushes to data-plane servers: serials whose
 	// certs have not yet expired (an expired cert fails verification anyway).
@@ -94,24 +82,15 @@ type Querier interface {
 	// tenant — the push targets for the deny-list reconcile.
 	ListActiveServerOpsAddrs(ctx context.Context) ([]string, error)
 	ListAllocationsForUser(ctx context.Context, userID pgtype.UUID) ([]DiskAllocation, error)
-	ListExpiredAnonymousSessions(ctx context.Context) ([]AnonymousSession, error)
-	// Active, placed, registered allocations that still have room to grow toward
-	// their promised ceiling (users.quota_bytes). The storage autoscaler polls this
-	// to decide which tenants to expand. Anonymous allocations (user_id IS NULL) are
-	// excluded — they bypass server_pool and are ephemeral.
-	ListGrowableAllocations(ctx context.Context) ([]ListGrowableAllocationsRow, error)
 	// The purge sweeper's work queue: revoked agent allocations whose backend
 	// data has not been erased yet. LEFT JOINs the placement chain — an unplaced
 	// tenant (never enrolled, ops_addr NULL) has no server-side data and is
 	// marked purged without a data-plane call.
 	ListPurgePendingAllocations(ctx context.Context, limit int32) ([]ListPurgePendingAllocationsRow, error)
-	ListTenants(ctx context.Context) ([]Tenant, error)
 	// CAS-claim the purge of a revoked allocation: only one caller transitions
 	// purged_at from NULL, so exactly one releases the pool reservation. Fails
 	// (zero rows) when the allocation is not revoked yet or already purged.
 	MarkAllocationPurged(ctx context.Context, id pgtype.UUID) (DiskAllocation, error)
-	MarkAnonymousAllocationDeleted(ctx context.Context, id pgtype.UUID) (DiskAllocation, error)
-	MarkServerVMProvisioned(ctx context.Context, arg MarkServerVMProvisionedParams) (ServerVm, error)
 	PickBestAvailableServer(ctx context.Context, freeBytes int64) (ServerPool, error)
 	// Re-home an agent's live allocation to a new billing owner (the orlop side of
 	// merging an anon trial's agent into an existing account). Only user_id changes;
@@ -135,16 +114,11 @@ type Querier interface {
 	// growth would stall the moment a server crossed its high-water mark.
 	ReserveCapacityForGrowth(ctx context.Context, arg ReserveCapacityForGrowthParams) (ServerPool, error)
 	RevokeAPIToken(ctx context.Context, arg RevokeAPITokenParams) error
-	RevokeAccessToken(ctx context.Context, tokenHash string) error
 	RevokeAllocation(ctx context.Context, arg RevokeAllocationParams) (DiskAllocation, error)
-	// Sets a user's aggregate quota. Used to provision the shared control-plane system
-	// user with a high ceiling so per-agent caps are governed by each allocation's size.
-	SetUserQuota(ctx context.Context, arg SetUserQuotaParams) error
 	SumActiveAllocationBytes(ctx context.Context, userID pgtype.UUID) (int64, error)
 	SuspendTenant(ctx context.Context, id string) error
 	SuspendUser(ctx context.Context, id pgtype.UUID) error
 	TouchAPITokenLastUsed(ctx context.Context, id pgtype.UUID) error
-	UnsuspendUser(ctx context.Context, id pgtype.UUID) error
 	// Raise (or lower) an allocation's hard size cap in place, preserving its id so the
 	// control-plane's stored disk handle stays valid. Used by the entity disk PATCH path
 	// to flip an anonymous agent's 128 MiB disk to the expandable registered size.

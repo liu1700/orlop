@@ -162,22 +162,22 @@ func newServerState(cfg Config, identifier Identifier, logger *slog.Logger) (*se
 	}
 
 	return &serverState{
-		tenants:     tenants,
-		policy:      policy,
-		audit:       audit,
-		metrics:     metrics,
-		identifier:  identifier,
-		uid:         uint32(os.Getuid()),
-		gid:         uint32(os.Getgid()),
-		conns:       conns,
-		logger:      logger,
-		quota:       qm,
-		quotaApply:  quotaApply,
+		tenants:         tenants,
+		policy:          policy,
+		audit:           audit,
+		metrics:         metrics,
+		identifier:      identifier,
+		uid:             uint32(os.Getuid()),
+		gid:             uint32(os.Getgid()),
+		conns:           conns,
+		logger:          logger,
+		quota:           qm,
+		quotaApply:      quotaApply,
 		trustDomain:     cfg.TrustDomain,
 		mountLeases:     newMountLeaseRegistry(),
 		certRevocations: newCertRevocationRegistry(),
 		connSem:         make(chan struct{}, maxDataPlaneSessions),
-		reqSem:      make(chan struct{}, maxInFlightRequests),
+		reqSem:          make(chan struct{}, maxInFlightRequests),
 		adminCfg: adminConfig{
 			TenantsRoot:           cfg.TenantsRoot,
 			MetadataRoot:          cfg.MetadataRoot,
@@ -355,15 +355,7 @@ func controlPlaneOnlyMiddleware(state *serverState) func(http.Handler) http.Hand
 				writeJSONError(w, http.StatusForbidden, "forbidden", "control plane cert required")
 				return
 			}
-			agentID := certAgentID(cert)
-			ident := Identity{
-				AgentID:     agentID,
-				TenantID:    controlPlaneTenantID,
-				CertSubject: cert.Subject.String(),
-			}
-			if cert.SerialNumber != nil {
-				ident.CertSerial = cert.SerialNumber.String()
-			}
+			ident := identityFromCert(cert, controlPlaneTenantID)
 			next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), ident)))
 		})
 	}

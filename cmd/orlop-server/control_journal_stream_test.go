@@ -385,4 +385,3 @@ func mapEmpty(ts *tenantState, allocID string) bool {
 	defer ts.journal.pubsub.mu.RUnlock()
 	return len(ts.journal.pubsub.subs[allocID]) == 0
 }
-

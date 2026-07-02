@@ -41,10 +41,8 @@ pub enum Op {
     LeaseRefresh = 0x11,
     LeaseRelease = 0x12,
     LeaseRevoke = 0x13,
-    JournalQuery = 0x15,
     Symlink = 0x16,
     Readlink = 0x17,
-    JournalRevertPath = 0x18,
     Mknod = 0x19,
 }
 
@@ -69,10 +67,8 @@ impl Op {
             0x11 => Some(Op::LeaseRefresh),
             0x12 => Some(Op::LeaseRelease),
             0x13 => Some(Op::LeaseRevoke),
-            0x15 => Some(Op::JournalQuery),
             0x16 => Some(Op::Symlink),
             0x17 => Some(Op::Readlink),
-            0x18 => Some(Op::JournalRevertPath),
             0x19 => Some(Op::Mknod),
             _ => None,
         }
@@ -90,6 +86,7 @@ pub mod flags {
 /// Errno-shaped error wire codes. Mirror libc errnos so the FUSE layer can
 /// translate directly. We define our own constants to avoid a libc dependency
 /// in the message types and so the Go side has identical numeric values.
+/// Mirrors the Go wire protocol; not all values are produced client-side.
 pub mod errno {
     pub const EIO: i32 = 5;
     pub const EACCES: i32 = 13;
@@ -133,10 +130,8 @@ mod tests {
             Op::LeaseRefresh,
             Op::LeaseRelease,
             Op::LeaseRevoke,
-            Op::JournalQuery,
             Op::Symlink,
             Op::Readlink,
-            Op::JournalRevertPath,
             Op::Mknod,
         ] {
             assert_eq!(Op::from_u8(op as u8), Some(op));

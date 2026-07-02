@@ -43,6 +43,7 @@ control-dev:
 # host filesystem, used as a smoke-test for the harness pipeline. Point
 # ORLOP_BENCH_MOUNT at a real orlop mount to measure orlop. BENCH_LABEL/
 # BENCH_DATA_PLANE/BENCH_WORKLOADS are passed through as run metadata.
+# Diff two result files: scripts/bench-compare.sh <base.json> <new.json>.
 bench:
 	@cargo build --release -p orlop-bench
 	@mkdir -p bench-results

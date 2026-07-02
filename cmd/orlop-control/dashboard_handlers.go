@@ -62,20 +62,15 @@ func newDashboardHandlers(logger *slog.Logger, svc *devauth.Service, store dashb
 
 var _ dashboardStore = (*postgres.Store)(nil)
 
-// mountDashboard registers routes on both bare and /api-prefixed paths.
-// Direct callers (CLI, tests, healthchecks) hit the bare path; the Next.js
-// web app's /api/[...path] proxy strips the /api/ prefix before forwarding,
-// so the bare mount is the one the proxy actually reaches. The /api-
-// prefixed mount lets a browser hit the control plane directly without
-// going through the Next.js proxy (used by integration tests and the
-// hosted-staging admin runbook).
+// mountDashboard registers routes on both bare and /api-prefixed paths (see
+// mountBoth for why).
 func mountDashboard(r chi.Router, h *dashboardHandlers) {
-	for _, prefix := range []string{"", "/api"} {
+	mountBoth(func(prefix string) {
 		r.Get(prefix+"/me", h.handleMe)
 		r.Get(prefix+"/allocations", h.handleListAllocations)
 		r.Get(prefix+"/allocations/{id}/usage", h.handleAllocationUsage)
 		r.Post(prefix+"/allocations/{id}/revoke", h.handleRevokeAllocation)
-	}
+	})
 }
 
 func (h *dashboardHandlers) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -169,20 +164,21 @@ func (h *dashboardHandlers) handleRevokeAllocation(w http.ResponseWriter, r *htt
 		return
 	}
 	if err := h.alloc.Revoke(r.Context(), allocID, ident.UserID); err != nil {
-		switch {
-		case errors.Is(err, allocations.ErrNotFound), errors.Is(err, allocations.ErrWrongUser):
-			// Same response for both: don't leak that another user owns it.
-			writeOAuthError(w, http.StatusNotFound, "not_found", "")
-		default:
-			h.logger.Error("dashboard_revoke_failed", "error", err,
-				"user_id", uuidString(ident.UserID),
-				"allocation_id", uuidString(allocID))
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
-		}
+		writeAllocOwnershipError(w, err, h.logger, "dashboard_revoke_failed",
+			"user_id", uuidString(ident.UserID),
+			"allocation_id", uuidString(allocID))
 		return
 	}
-	h.fenceAllocationBestEffort(r.Context(), allocID, "revoke")
+	fenceAllocationBestEffort(r.Context(), h.logger, h.store, h.fencer, allocID, "revoke")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// allocationFenceStore is the lookup pair the shared fence path walks
+// (allocation → owning user → tenant). Both dashboardStore and
+// mountLeaseStore satisfy it.
+type allocationFenceStore interface {
+	GetAllocation(ctx context.Context, id uuid.UUID) (storage.Allocation, error)
+	GetUser(ctx context.Context, id uuid.UUID) (storage.User, error)
 }
 
 // fenceAllocationBestEffort tells orlop-server to drop the active session for
@@ -190,23 +186,24 @@ func (h *dashboardHandlers) handleRevokeAllocation(w http.ResponseWriter, r *htt
 // next lease-refresh tick. Fence failures are logged but don't fail the
 // caller's operation — the DB is already updated, so the lease is gone from
 // orlop-control's POV; the worst case is the old #175 window reappearing for
-// this one revoke until the client's refresh catches up.
-func (h *dashboardHandlers) fenceAllocationBestEffort(ctx context.Context, allocID pgtype.UUID, reason string) {
-	if h.fencer == nil {
+// this one op until the client's refresh catches up. reason is stamped on the
+// warn logs for triage. fencer may be nil (no serverapi client): no-op.
+func fenceAllocationBestEffort(ctx context.Context, logger *slog.Logger, store allocationFenceStore, fencer mountLeaseFencer, allocID pgtype.UUID, reason string) {
+	if fencer == nil {
 		return
 	}
-	alloc, err := h.store.GetAllocation(ctx, toUUID(allocID))
+	alloc, err := store.GetAllocation(ctx, toUUID(allocID))
 	if err != nil {
-		h.logger.Warn("fence_lookup_alloc_failed", "error", err, "allocation_id", uuidString(allocID), "reason", reason)
+		logger.Warn("fence_lookup_alloc_failed", "error", err, "allocation_id", uuidString(allocID), "reason", reason)
 		return
 	}
-	user, err := h.store.GetUser(ctx, alloc.UserID)
+	user, err := store.GetUser(ctx, alloc.UserID)
 	if err != nil {
-		h.logger.Warn("fence_lookup_user_failed", "error", err, "allocation_id", uuidString(allocID), "reason", reason)
+		logger.Warn("fence_lookup_user_failed", "error", err, "allocation_id", uuidString(allocID), "reason", reason)
 		return
 	}
-	if err := h.fencer.FenceAllocation(ctx, user.TenantID, uuidString(allocID)); err != nil {
-		h.logger.Warn("fence_allocation_failed", "error", err, "tenant_id", user.TenantID, "allocation_id", uuidString(allocID), "reason", reason)
+	if err := fencer.FenceAllocation(ctx, user.TenantID, uuidString(allocID)); err != nil {
+		logger.Warn("fence_allocation_failed", "error", err, "tenant_id", user.TenantID, "allocation_id", uuidString(allocID), "reason", reason)
 	}
 }
 
@@ -238,9 +235,7 @@ type allocationUsageDTO struct {
 }
 
 func (h *dashboardHandlers) handleAllocationUsage(w http.ResponseWriter, r *http.Request) {
-	// Both surfaces hit this: browser dashboard uses the cookie, CLI uses the
-	// device-flow bearer token. Accept either.
-	ident, err := adminOrBearerIdentity(r, h.devAuth)
+	ident, err := adminIdentity(r, h.devAuth)
 	if err != nil {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 		return
@@ -258,16 +253,8 @@ func (h *dashboardHandlers) handleAllocationUsage(w http.ResponseWriter, r *http
 	// Ownership + revocation check via the same path the dashboard already trusts.
 	alloc, err := h.alloc.GetForUser(r.Context(), allocID, ident.UserID)
 	if err != nil {
-		switch {
-		case errors.Is(err, allocations.ErrNotFound), errors.Is(err, allocations.ErrWrongUser):
-			writeOAuthError(w, http.StatusNotFound, "not_found", "")
-		case errors.Is(err, allocations.ErrRevoked):
-			writeOAuthError(w, http.StatusGone, "revoked", "")
-		default:
-			h.logger.Error("dashboard_usage_get_alloc_failed", "error", err,
-				"user_id", uuidString(ident.UserID), "allocation_id", uuidString(allocID))
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
-		}
+		writeAllocOwnershipError(w, err, h.logger, "dashboard_usage_get_alloc_failed",
+			"user_id", uuidString(ident.UserID), "allocation_id", uuidString(allocID))
 		return
 	}
 
@@ -278,34 +265,28 @@ func (h *dashboardHandlers) handleAllocationUsage(w http.ResponseWriter, r *http
 		return
 	}
 
-	vm, err := h.store.GetServerVMByTenant(r.Context(), user.TenantID)
+	opsAddr, placed, err := resolveTenantOpsAddr(r.Context(), h.store, user.TenantID)
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			// Allocation exists but tenant has never been placed on a server
-			// (i.e. no `orlop mount` since allocation was created). Surface
-			// zero usage so the dashboard / CLI can render something sensible.
-			writeJSON(w, http.StatusOK, allocationUsageDTO{
-				AllocationID: uuidString(alloc.ID),
-				UsedBytes:    0,
-				SizeBytes:    alloc.SizeBytes,
-			})
-			return
-		}
-		h.logger.Error("dashboard_usage_get_server_vm_failed", "error", err, "tenant_id", user.TenantID)
+		h.logger.Error("dashboard_usage_resolve_ops_addr_failed", "error", err, "tenant_id", user.TenantID)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}
-	pool, err := h.store.GetServerPoolByDataAddr(r.Context(), vm.DataAddr)
-	if err != nil {
-		h.logger.Error("dashboard_usage_get_server_pool_failed", "error", err, "data_addr", vm.DataAddr)
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
+	if !placed {
+		// Allocation exists but tenant has never been placed on a server
+		// (i.e. no `orlop mount` since allocation was created). Surface
+		// zero usage so the dashboard / CLI can render something sensible.
+		writeJSON(w, http.StatusOK, allocationUsageDTO{
+			AllocationID: uuidString(alloc.ID),
+			UsedBytes:    0,
+			SizeBytes:    alloc.SizeBytes,
+		})
 		return
 	}
 
-	tu, err := h.usage.GetTenantUsage(r.Context(), pool.OpsAddr, user.TenantID)
+	tu, err := h.usage.GetTenantUsage(r.Context(), opsAddr, user.TenantID)
 	if err != nil {
 		h.logger.Error("dashboard_usage_remote_failed", "error", err,
-			"ops_addr", pool.OpsAddr, "tenant_id", user.TenantID)
+			"ops_addr", opsAddr, "tenant_id", user.TenantID)
 		writeOAuthError(w, http.StatusBadGateway, "usage_failed", "")
 		return
 	}

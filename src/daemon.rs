@@ -103,8 +103,21 @@ pub fn decode_ready(buf: &str) -> ReadyOutcome {
     }
 }
 
+/// Error from [`read_ready_with_timeout`]: the daemon did not write its
+/// ready line within the wall-clock budget.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReadyTimeout;
+
+impl std::fmt::Display for ReadyTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("timed out waiting for the daemon ready signal")
+    }
+}
+
+impl std::error::Error for ReadyTimeout {}
+
 /// Read from a pipe (or anything else implementing `Read + Send`) with a
-/// wall-clock budget. Returns `Err(())` on timeout; the caller is
+/// wall-clock budget. Returns `Err(ReadyTimeout)` on timeout; the caller is
 /// responsible for killing the grandchild and unlinking the PID file.
 ///
 /// The blocking read runs in a helper thread so the main thread can wait
@@ -114,7 +127,7 @@ pub fn decode_ready(buf: &str) -> ReadyOutcome {
 pub fn read_ready_with_timeout<R: Read + Send + 'static>(
     mut reader: R,
     timeout: Duration,
-) -> Result<ReadyOutcome, ()> {
+) -> Result<ReadyOutcome, ReadyTimeout> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut buf = String::new();
@@ -123,21 +136,17 @@ pub fn read_ready_with_timeout<R: Read + Send + 'static>(
     });
     match rx.recv_timeout(timeout) {
         Ok(buf) => Ok(decode_ready(&buf)),
-        Err(_) => Err(()),
+        Err(_) => Err(ReadyTimeout),
     }
 }
 
-/// `$XDG_CACHE_HOME/orlop` or `$HOME/.cache/orlop`. Matches the resolution
-/// used by `ChunkCache::default_root` so the daemon's PID/log files live
-/// alongside the chunk cache.
+/// `$XDG_CACHE_HOME/orlop` or `$HOME/.cache/orlop` — delegates to
+/// `ChunkCache::default_root` so the daemon's PID/log files live alongside
+/// the chunk cache by construction.
 fn cache_dir() -> anyhow::Result<PathBuf> {
-    let dir = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .ok_or_else(|| {
-            anyhow::anyhow!("cannot resolve cache directory: set XDG_CACHE_HOME or HOME")
-        })?
-        .join("orlop");
+    let dir = crate::backend::dataplane::ChunkCache::default_root().ok_or_else(|| {
+        anyhow::anyhow!("cannot resolve cache directory: set XDG_CACHE_HOME or HOME")
+    })?;
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
 }

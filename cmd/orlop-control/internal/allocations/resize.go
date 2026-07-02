@@ -128,7 +128,7 @@ func (s *Service) Resize(
 	}
 
 	s.logger.Info("allocation_resized",
-		"allocation_id", allocationID, "tenant_id", user.TenantID, "server_id", server.ID,
+		"allocation_id", allocationID, "tenant_id", tenant, "server_id", server.ID,
 		"old_size_bytes", oldSize, "new_size_bytes", newSizeBytes)
 	return fromStorage(row), nil
 }

@@ -266,18 +266,15 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
-	resp := map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"client_cert_pem": string(certPEM),
 		"client_key_pem":  string(keyPEM),
 		"ca_chain_pem":    string(chainPEM),
 		"server_addr":     serverAddr,
 		"expires_at":      leaf.NotAfter.UTC().Format(time.RFC3339),
-	}
-	if allocation != nil {
-		resp["allocation_id"] = allocation.ID.String()
-		resp["size_bytes"] = allocation.SizeBytes
-	}
-	writeJSON(w, http.StatusOK, resp)
+		"allocation_id":   allocation.ID.String(),
+		"size_bytes":      allocation.SizeBytes,
+	})
 }
 
 func writeRetryableEnrollError(w http.ResponseWriter, code string) {

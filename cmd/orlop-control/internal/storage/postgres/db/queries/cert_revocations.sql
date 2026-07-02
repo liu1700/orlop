@@ -13,10 +13,6 @@ FROM cert_revocations
 WHERE expires_at > now()
 ORDER BY expires_at;
 
--- name: DeleteExpiredCertRevocations :exec
--- Housekeeping: drop rows whose certs have already expired.
-DELETE FROM cert_revocations WHERE expires_at <= now();
-
 -- name: ListActiveServerOpsAddrs :many
 -- Distinct orlop-server ops addresses that currently host at least one placed
 -- tenant — the push targets for the deny-list reconcile.

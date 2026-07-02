@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/identity"
 )
 
@@ -34,7 +35,7 @@ func RequireHostIdentity(v identity.Verifier, logger *slog.Logger) func(http.Han
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			info := identity.AuthInfo{
-				Bearer: bearerToken(r.Header.Get("Authorization")),
+				Bearer: devauth.BearerToken(r.Header.Get("Authorization")),
 				TLS:    r.TLS,
 			}
 			id, err := v.Verify(r.Context(), info)
@@ -61,9 +62,9 @@ func RequireHostIdentity(v identity.Verifier, logger *slog.Logger) func(http.Han
 // host-identity middleware. GET /v1/whoami echoes the verified tenant subject —
 // a concrete, dependency-free exercise of the seam end to end.
 func mountHostIdentity(r chi.Router, mw func(http.Handler) http.Handler) {
-	for _, prefix := range []string{"", "/api"} {
+	mountBoth(func(prefix string) {
 		r.With(mw).Get(prefix+"/v1/whoami", handleWhoami)
-	}
+	})
 }
 
 func handleWhoami(w http.ResponseWriter, r *http.Request) {

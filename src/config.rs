@@ -64,10 +64,6 @@ pub struct FuseConfig {
     pub attr_ttl_seconds: u64,
     #[serde(default = "default_fuse_attr_ttl")]
     pub entry_ttl_seconds: u64,
-    #[serde(default = "default_remote_metadata_ttl")]
-    pub remote_metadata_ttl_seconds: u64,
-    #[serde(default = "default_remote_metadata_capacity")]
-    pub remote_metadata_capacity: u64,
     /// Mount with the kernel's `default_permissions` so the VFS enforces POSIX
     /// uid/gid/mode access checks (using the attrs we return from getattr).
     /// OFF by default: the product is a single-identity agent disk where the
@@ -83,8 +79,6 @@ impl Default for FuseConfig {
         Self {
             attr_ttl_seconds: default_fuse_attr_ttl(),
             entry_ttl_seconds: default_fuse_attr_ttl(),
-            remote_metadata_ttl_seconds: default_remote_metadata_ttl(),
-            remote_metadata_capacity: default_remote_metadata_capacity(),
             enforce_permissions: false,
         }
     }
@@ -92,10 +86,6 @@ impl Default for FuseConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
-    #[serde(default = "default_cache_entries")]
-    pub max_entries: usize,
-    #[serde(default = "default_cache_ttl")]
-    pub ttl_seconds: u64,
     #[serde(default = "default_write_buffer_bytes")]
     pub write_buffer_bytes: u64,
 }
@@ -103,8 +93,6 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            max_entries: default_cache_entries(),
-            ttl_seconds: default_cache_ttl(),
             write_buffer_bytes: default_write_buffer_bytes(),
         }
     }
@@ -134,8 +122,6 @@ impl Default for PolicyConfig {
 #[serde(rename_all = "snake_case")]
 pub struct MountConfig {
     pub name: String,
-    #[serde(rename = "type")]
-    pub kind: MountKind,
     pub mount: String,
     #[serde(default = "default_true")]
     pub readonly: bool,
@@ -150,88 +136,13 @@ pub struct MountConfig {
     pub server_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MountKind {
-    Remote,
-}
-
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let file = File::open(path)?;
-        let cfg: Self = serde_yaml::from_reader(file)?;
-        cfg.validate()
+        let cfg: Self = serde_yaml::from_reader(file)
             .with_context(|| format!("invalid config {}", path.display()))?;
         Ok(cfg)
     }
-
-    pub fn validate(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    pub fn fuse_mountpoint(&self) -> Option<PathBuf> {
-        self.mountpoint.clone()
-    }
-
-    pub fn fuse_mounts(&self) -> anyhow::Result<Vec<MountConfig>> {
-        Ok(self.mounts.clone())
-    }
-}
-
-/// Canonical user config path (`~/.config/orlop/config.yaml`). Lives next
-/// to `credentials.json` so both share one directory.
-pub fn default_config_path() -> anyhow::Result<PathBuf> {
-    Ok(crate::util::home_dir()?.join(".config/orlop/config.yaml"))
-}
-
-/// YAML body seeded as the default config when none exists yet. Mountpoint
-/// defaults under `$HOME` so first-time `orlop mount` doesn't require sudo;
-/// `hosted: {}` is the minimum needed to take the hosted code path —
-/// control_plane_url + cert_dir fall back to values from credentials.json.
-/// Policy defaults to read-write because the whole product premise is "save
-/// your stuff to a durable disk"; PolicyConfig's struct-level default of
-/// readonly=true is a defensive value for non-hosted / shared mounts, not a
-/// sensible default for a personal hosted disk.
-pub fn default_config_yaml(home: &Path) -> String {
-    let mountpoint = home.join(".orlop/mnt");
-    // Raw string (no `\` line-continuation): `\` would otherwise eat the
-    // newline AND any leading whitespace, dropping the 2-space indent on
-    // `readonly: false` so the YAML parses as {policy: null, readonly: false}.
-    format!(
-        r#"# Auto-generated default Orlop config. Edit to customize.
-
-# `mountpoint` is where the FUSE filesystem appears. Default lives under
-# $HOME so `orlop mount` works without sudo. Move it (e.g. to /mnt/orlop
-# after `sudo mkdir /mnt/orlop && sudo chown $USER /mnt/orlop`) if preferred.
-mountpoint: {mp}
-
-# Personal disk defaults to read-write. Flip to `readonly: true` if you
-# want a safety belt against agents writing to it, then remount.
-policy:
-  readonly: false
-
-# `hosted: {{}}` is the minimum needed for the hosted control plane.
-# control_plane_url and cert_dir both fall back to credentials.json when
-# omitted, so an empty mapping is enough for the standard setup.
-hosted: {{}}
-"#,
-        mp = mountpoint.display()
-    )
-}
-
-/// Write the default hosted config at `path` if no file exists there yet.
-/// Returns `Ok(true)` when a file was written, `Ok(false)` when one was
-/// already present (caller decides whether to log "wrote" vs "left alone").
-pub fn write_default_if_missing(path: &Path) -> anyhow::Result<bool> {
-    if path.exists() {
-        return Ok(false);
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let body = default_config_yaml(&crate::util::home_dir()?);
-    std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
-    Ok(true)
 }
 
 fn default_audit_log() -> PathBuf {
@@ -242,14 +153,6 @@ fn default_write_buffer_bytes() -> u64 {
     64 * 1024 * 1024 // 64 MiB
 }
 
-fn default_cache_entries() -> usize {
-    1024
-}
-
-fn default_cache_ttl() -> u64 {
-    300
-}
-
 fn default_true() -> bool {
     true
 }
@@ -258,20 +161,14 @@ fn default_fuse_attr_ttl() -> u64 {
     30
 }
 
-fn default_remote_metadata_ttl() -> u64 {
-    30
-}
-
-fn default_remote_metadata_capacity() -> u64 {
-    4096
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn loads_remote_mount_config() {
+        // `type: remote` is what older configs carried; serde ignores the
+        // now-removed key so they keep loading.
         let cfg: Config = serde_yaml::from_str(
             r#"
 mounts:
@@ -283,9 +180,7 @@ mounts:
         )
         .unwrap();
 
-        cfg.validate().unwrap();
-        let mount = &cfg.fuse_mounts().unwrap()[0];
-        assert!(matches!(mount.kind, MountKind::Remote));
+        let mount = &cfg.mounts[0];
         assert_eq!(
             mount.addr.as_deref(),
             Some("tenant.orlop-server.example.ts.net:7879"),
@@ -295,32 +190,7 @@ mounts:
     #[test]
     fn repository_example_configs_load() {
         Config::load(Path::new("config.example.yaml")).unwrap();
-        Config::load(Path::new("config.local.yaml")).unwrap();
-    }
-
-    #[test]
-    fn default_config_yaml_parses_with_policy_readonly_false() {
-        // Regression for #157: line-continuation `\` in the format! literal
-        // was eating the leading whitespace on `readonly: false`, parsing
-        // as {policy: null, readonly: false} — making fresh-user mounts ro.
-        let body = default_config_yaml(Path::new("/home/test"));
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
-        let policy = parsed.get("policy").expect("policy key present");
-        assert!(
-            policy.is_mapping(),
-            "policy must be a mapping, got: {policy:?}\n---\n{body}",
-        );
-        let readonly = policy
-            .get("readonly")
-            .expect("policy.readonly present")
-            .as_bool()
-            .expect("policy.readonly is bool");
-        assert!(!readonly, "policy.readonly must default to false");
-        // And the spurious top-level `readonly` key must NOT exist.
-        assert!(
-            parsed.get("readonly").is_none(),
-            "no top-level readonly key (would mean the indent broke again)",
-        );
+        Config::load(Path::new("config.full.yaml")).unwrap();
     }
 
     #[test]
@@ -334,7 +204,6 @@ hosted:
         )
         .unwrap();
 
-        cfg.validate().unwrap();
         assert!(cfg.hosted.is_some());
         assert_eq!(
             cfg.hosted.as_ref().unwrap().control_plane_url.as_deref(),

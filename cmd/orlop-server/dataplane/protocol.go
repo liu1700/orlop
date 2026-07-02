@@ -126,9 +126,7 @@ const (
 	ErrnoEACCES    int32 = 13
 	ErrnoENOENT    int32 = 2
 	ErrnoEINVAL    int32 = 22
-	ErrnoEROFS     int32 = 30
 	ErrnoEEXIST    int32 = 17
-	ErrnoEXDEV     int32 = 18
 	ErrnoENOTDIR   int32 = 20
 	ErrnoEISDIR    int32 = 21
 	ErrnoENOTEMPTY int32 = 39

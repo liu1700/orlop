@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -188,32 +188,7 @@ fn create_secure_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 fn write_secret(path: &Path, body: &[u8]) -> anyhow::Result<()> {
-    let tmp = tmp_path(path);
-    {
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("open {}", tmp.display()))?;
-        f.write_all(body)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("orlop.tmp"));
-    name.push(".tmp");
-    path.with_file_name(name)
+    util::write_secret_atomic(path, body)
 }
 
 /// Pre-enrolled cert sidecar written by the spawner / control for Phase 2

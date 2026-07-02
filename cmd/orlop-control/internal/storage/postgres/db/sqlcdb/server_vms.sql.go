@@ -67,29 +67,3 @@ func (q *Queries) GetServerVMByTenant(ctx context.Context, tenantID string) (Ser
 	)
 	return i, err
 }
-
-const markServerVMProvisioned = `-- name: MarkServerVMProvisioned :one
-UPDATE server_vms
-SET provisioned_at = now(), status = $2
-WHERE tenant_id = $1
-RETURNING id, tenant_id, data_addr, provisioned_at, status, created_at
-`
-
-type MarkServerVMProvisionedParams struct {
-	TenantID string
-	Status   string
-}
-
-func (q *Queries) MarkServerVMProvisioned(ctx context.Context, arg MarkServerVMProvisionedParams) (ServerVm, error) {
-	row := q.db.QueryRow(ctx, markServerVMProvisioned, arg.TenantID, arg.Status)
-	var i ServerVm
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.DataAddr,
-		&i.ProvisionedAt,
-		&i.Status,
-		&i.CreatedAt,
-	)
-	return i, err
-}

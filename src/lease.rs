@@ -173,10 +173,6 @@ impl LeaseHandle {
     pub fn on_revoke(&self, cb: Box<dyn Fn() + Send + Sync>) {
         self.entry.on_revoke.lock().push(cb);
     }
-
-    pub fn is_healthy(&self) -> bool {
-        self.entry.state.load(Ordering::Acquire) == STATE_HEALTHY
-    }
 }
 
 async fn push_dispatch(mgr: Arc<LeaseManager>, mut rx: UnboundedReceiver<Frame>) {
@@ -245,21 +241,4 @@ fn unix_now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn entry_state_constants() {
-        assert_eq!(STATE_HEALTHY, 0);
-        assert_eq!(STATE_REVOKING, 1);
-        assert_eq!(STATE_LOST, 2);
-    }
-
-    #[test]
-    fn refresh_interval_is_quarter_ttl() {
-        assert_eq!(REFRESH_INTERVAL, Duration::from_millis(7_500));
-    }
 }

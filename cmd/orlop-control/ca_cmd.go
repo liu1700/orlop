@@ -47,69 +47,72 @@ func runCA(ctx context.Context, out io.Writer, args []string) error {
 	}
 }
 
-func runCAInit(ctx context.Context, out io.Writer, args []string) error {
-	fs := flag.NewFlagSet("ca init", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
+// loadCAForCmd centralises the boilerplate shared by every `ca` subcommand:
+// it registers the --secrets-dir/--trust-domain/--org flag trio on fs (whose
+// subcommand-specific flags are already registered), parses args, requires a
+// secrets dir, and loads the CA from the filesystem backend at that dir.
+// validate (optional) runs after parsing but BEFORE the CA is loaded, so
+// invalid arguments can't leave a freshly-generated root behind.
+func loadCAForCmd(ctx context.Context, fs *flag.FlagSet, args []string, validate func() error) (*ca.CA, string, error) {
 	var (
-		root        = fs.Bool("root", false, "bootstrap the org root CA (offline operator workflow)")
-		tenant      = fs.String("tenant", "", "bootstrap a tenant intermediate for the given ID")
 		secretsDir  = fs.String("secrets-dir", os.Getenv("ORLOP_SECRETS_DIR"), "filesystem secrets directory")
 		trustDomain = fs.String("trust-domain", getenv("ORLOP_TRUST_DOMAIN", "orlop.example"), "SPIFFE trust domain")
 		org         = fs.String("org", getenv("ORLOP_ORG_NAME", "ORL"), "X.509 Organization name")
 	)
 	if err := fs.Parse(args); err != nil {
-		return err
+		return nil, "", err
 	}
 	if *secretsDir == "" {
-		return errors.New("--secrets-dir or ORLOP_SECRETS_DIR is required")
+		return nil, "", errors.New("--secrets-dir or ORLOP_SECRETS_DIR is required")
 	}
-	switch {
-	case *root && *tenant != "":
-		return errors.New("specify exactly one of --root or --tenant")
-	case !*root && *tenant == "":
-		return errors.New("specify exactly one of --root or --tenant")
+	if validate != nil {
+		if err := validate(); err != nil {
+			return nil, "", err
+		}
 	}
-
-	backend := secrets.NewFilesystem(*secretsDir)
-	c, err := ca.LoadOrInit(ctx, backend, ca.Env{
+	c, err := ca.LoadOrInit(ctx, secrets.NewFilesystem(*secretsDir), ca.Env{
 		TrustDomain: *trustDomain,
 		OrgName:     *org,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return c, *secretsDir, nil
+}
+
+func runCAInit(ctx context.Context, out io.Writer, args []string) error {
+	fs := flag.NewFlagSet("ca init", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var (
+		root   = fs.Bool("root", false, "bootstrap the org root CA (offline operator workflow)")
+		tenant = fs.String("tenant", "", "bootstrap a tenant intermediate for the given ID")
+	)
+	c, secretsDir, err := loadCAForCmd(ctx, fs, args, func() error {
+		if *root == (*tenant != "") {
+			return errors.New("specify exactly one of --root or --tenant")
+		}
+		return nil
 	})
 	if err != nil {
 		return err
 	}
 
 	if *root {
-		fmt.Fprintf(out, "root CA ready at %s\n", filepath.Join(*secretsDir, "ca", "root", "cert.pem"))
+		fmt.Fprintf(out, "root CA ready at %s\n", filepath.Join(secretsDir, "ca", "root", "cert.pem"))
 		return nil
 	}
 
 	if err := c.BootstrapTenant(ctx, *tenant); err != nil {
 		return fmt.Errorf("bootstrap tenant %q: %w", *tenant, err)
 	}
-	fmt.Fprintf(out, "tenant %q intermediate ready at %s\n", *tenant, filepath.Join(*secretsDir, "ca", "tenant", *tenant, "cert.pem"))
+	fmt.Fprintf(out, "tenant %q intermediate ready at %s\n", *tenant, filepath.Join(secretsDir, "ca", "tenant", *tenant, "cert.pem"))
 	return nil
 }
 
 func runCAList(ctx context.Context, out io.Writer, args []string) error {
 	fs := flag.NewFlagSet("ca list", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	var (
-		secretsDir  = fs.String("secrets-dir", os.Getenv("ORLOP_SECRETS_DIR"), "filesystem secrets directory")
-		trustDomain = fs.String("trust-domain", getenv("ORLOP_TRUST_DOMAIN", "orlop.example"), "SPIFFE trust domain")
-		org         = fs.String("org", getenv("ORLOP_ORG_NAME", "ORL"), "X.509 Organization name")
-	)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *secretsDir == "" {
-		return errors.New("--secrets-dir or ORLOP_SECRETS_DIR is required")
-	}
-	backend := secrets.NewFilesystem(*secretsDir)
-	c, err := ca.LoadOrInit(ctx, backend, ca.Env{
-		TrustDomain: *trustDomain,
-		OrgName:     *org,
-	})
+	c, _, err := loadCAForCmd(ctx, fs, args, nil)
 	if err != nil {
 		return err
 	}
@@ -128,37 +131,25 @@ func runCAMintServerCert(ctx context.Context, out io.Writer, args []string) erro
 	fs := flag.NewFlagSet("ca mint-server-cert", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var (
-		tenant      = fs.String("tenant", "", "tenant ID to mint under (required)")
-		fqdn        = fs.String("fqdn", "", "server DNS name to embed as CN + SAN (required)")
-		outDir      = fs.String("out-dir", "", "directory to write cert.pem/key.pem/chain.pem (required)")
-		ttl         = fs.Duration("ttl", 90*24*time.Hour, "leaf validity duration")
-		secretsDir  = fs.String("secrets-dir", os.Getenv("ORLOP_SECRETS_DIR"), "filesystem secrets directory")
-		trustDomain = fs.String("trust-domain", getenv("ORLOP_TRUST_DOMAIN", "orlop.example"), "SPIFFE trust domain")
-		org         = fs.String("org", getenv("ORLOP_ORG_NAME", "ORL"), "X.509 Organization name")
+		tenant = fs.String("tenant", "", "tenant ID to mint under (required)")
+		fqdn   = fs.String("fqdn", "", "server DNS name to embed as CN + SAN (required)")
+		outDir = fs.String("out-dir", "", "directory to write cert.pem/key.pem/chain.pem (required)")
+		ttl    = fs.Duration("ttl", 90*24*time.Hour, "leaf validity duration")
 	)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *secretsDir == "" {
-		return errors.New("--secrets-dir or ORLOP_SECRETS_DIR is required")
-	}
-	if *tenant == "" {
-		return errors.New("--tenant is required")
-	}
-	if *fqdn == "" {
-		return errors.New("--fqdn is required")
-	}
-	if *outDir == "" {
-		return errors.New("--out-dir is required")
-	}
-	if *ttl <= 0 {
-		return errors.New("--ttl must be positive")
-	}
-
-	backend := secrets.NewFilesystem(*secretsDir)
-	c, err := ca.LoadOrInit(ctx, backend, ca.Env{
-		TrustDomain: *trustDomain,
-		OrgName:     *org,
+	c, _, err := loadCAForCmd(ctx, fs, args, func() error {
+		if *tenant == "" {
+			return errors.New("--tenant is required")
+		}
+		if *fqdn == "" {
+			return errors.New("--fqdn is required")
+		}
+		if *outDir == "" {
+			return errors.New("--out-dir is required")
+		}
+		if *ttl <= 0 {
+			return errors.New("--ttl must be positive")
+		}
+		return nil
 	})
 	if err != nil {
 		return err

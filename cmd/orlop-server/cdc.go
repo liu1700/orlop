@@ -8,7 +8,8 @@ import (
 )
 
 // Default chunking sizes per the design doc Layer 3:
-//   target 4 MiB, min 1 MiB, max 16 MiB.
+//
+//	target 4 MiB, min 1 MiB, max 16 MiB.
 const (
 	ChunkAvg = 4 * 1024 * 1024
 	ChunkMin = 1 * 1024 * 1024

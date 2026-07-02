@@ -20,7 +20,7 @@ func (f Frame) IsResponse() bool { return f.Flags&FlagResponse != 0 }
 // IsError reports whether the FlagError bit is set (only meaningful on responses).
 func (f Frame) IsError() bool { return f.Flags&FlagError != 0 }
 
-// WriteFrame serialises f to w. Returns the number of bytes written.
+// WriteFrame serialises f to w.
 func WriteFrame(w io.Writer, f Frame) error {
 	if uint64(len(f.Payload)) > uint64(MaxPayloadLen) {
 		return fmt.Errorf("frame payload %d exceeds MaxPayloadLen %d", len(f.Payload), MaxPayloadLen)

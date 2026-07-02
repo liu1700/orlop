@@ -114,22 +114,6 @@ func (q *Queries) GetUserForUpdate(ctx context.Context, id pgtype.UUID) (User, e
 	return i, err
 }
 
-const setUserQuota = `-- name: SetUserQuota :exec
-UPDATE users SET quota_bytes = $2 WHERE id = $1
-`
-
-type SetUserQuotaParams struct {
-	ID         pgtype.UUID
-	QuotaBytes int64
-}
-
-// Sets a user's aggregate quota. Used to provision the shared control-plane system
-// user with a high ceiling so per-agent caps are governed by each allocation's size.
-func (q *Queries) SetUserQuota(ctx context.Context, arg SetUserQuotaParams) error {
-	_, err := q.db.Exec(ctx, setUserQuota, arg.ID, arg.QuotaBytes)
-	return err
-}
-
 const sumActiveAllocationBytes = `-- name: SumActiveAllocationBytes :one
 SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total_bytes
 FROM disk_allocations
@@ -149,14 +133,5 @@ UPDATE users SET suspended_at = now() WHERE id = $1
 
 func (q *Queries) SuspendUser(ctx context.Context, id pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, suspendUser, id)
-	return err
-}
-
-const unsuspendUser = `-- name: UnsuspendUser :exec
-UPDATE users SET suspended_at = NULL WHERE id = $1
-`
-
-func (q *Queries) UnsuspendUser(ctx context.Context, id pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, unsuspendUser, id)
 	return err
 }
