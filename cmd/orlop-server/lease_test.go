@@ -71,7 +71,7 @@ func TestGrantIdempotent(t *testing.T) {
 func TestReleaseFreesPath(t *testing.T) {
 	mgr, _ := newTestMgr(t)
 	g, _ := mgr.Grant(context.Background(), "agentA", 1, "/x", dataplane.LeaseExclusiveWrite)
-	if err := mgr.Release(g.LeaseID); err != nil {
+	if err := mgr.Release(g.LeaseID, 1); err != nil {
 		t.Fatal(err)
 	}
 	// Different agent now grabs it.
@@ -99,7 +99,7 @@ func TestRefreshExtends(t *testing.T) {
 	g, _ := mgr.Grant(context.Background(), "agentA", 1, "/x", dataplane.LeaseExclusiveWrite)
 	first := g.ExpiresAtUnixMs
 	time.Sleep(5 * time.Millisecond)
-	r, err := mgr.Refresh(g.LeaseID)
+	r, err := mgr.Refresh(g.LeaseID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestRefreshExtends(t *testing.T) {
 
 func TestRefreshUnknownReturnsError(t *testing.T) {
 	mgr, _ := newTestMgr(t)
-	if _, err := mgr.Refresh(make([]byte, 16)); err == nil {
+	if _, err := mgr.Refresh(make([]byte, 16), 1); err == nil {
 		t.Fatal("expected error for unknown lease_id")
 	}
 }
@@ -129,7 +129,7 @@ func TestLeaseHandlerRoundTrip(t *testing.T) {
 		t.Fatalf("want errLeaseHeld, got %v", err)
 	}
 	// Release; agentB succeeds.
-	if err := mgr.Release(g.LeaseID); err != nil {
+	if err := mgr.Release(g.LeaseID, 1); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := mgr.Grant(context.Background(), "agentB", 2, "/file", dataplane.LeaseExclusiveWrite); err != nil {
@@ -176,7 +176,7 @@ func TestGrantAfterMinHoldRevokesAndRegrants(t *testing.T) {
 	if pushed[0].Op != dataplane.OpLeaseRevoke {
 		t.Fatalf("push op = %v, want LEASE_REVOKE", pushed[0].Op)
 	}
-	if err := mgr.Release(g.LeaseID); err != nil {
+	if err := mgr.Release(g.LeaseID, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-done; err != nil {
@@ -184,29 +184,66 @@ func TestGrantAfterMinHoldRevokesAndRegrants(t *testing.T) {
 	}
 }
 
-func TestIdempotentGrantRebindsConnID(t *testing.T) {
+func TestGrantNewConnSupersedesLease(t *testing.T) {
 	mgr, _ := newTestMgr(t)
-	g, _ := mgr.Grant(context.Background(), "agentA", 1, "/x", dataplane.LeaseExclusiveWrite)
+	g1, _ := mgr.Grant(context.Background(), "agentA", 1, "/x", dataplane.LeaseExclusiveWrite)
 
-	// Same agent reconnects on a new connID and re-grants.
+	// Same holder re-grants on a new connID (successor pod): FRESH id, old id dead.
 	g2, err := mgr.Grant(context.Background(), "agentA", 2, "/x", dataplane.LeaseExclusiveWrite)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(g.LeaseID) != string(g2.LeaseID) {
-		t.Fatal("expected same lease_id on idempotent re-grant")
+	if string(g1.LeaseID) == string(g2.LeaseID) {
+		t.Fatal("supersede must issue a fresh lease_id, not rebind the old one")
+	}
+	if mgr.HeldByConn(idArrayFromBytes(g1.LeaseID), 1) || mgr.HeldByConn(idArrayFromBytes(g1.LeaseID), 2) {
+		t.Fatal("old lease id must be dead after supersede")
+	}
+	if !mgr.HeldByConn(idArrayFromBytes(g2.LeaseID), 2) {
+		t.Fatal("fresh lease must be held by the new connection")
 	}
 
-	// ReleaseAllForConn(1) must NOT free the lease — it's bound to connID 2 now.
+	// Stale-conn cleanup must NOT free the live lease.
 	mgr.ReleaseAllForConn(1)
 	if _, err := mgr.Grant(context.Background(), "agentB", 3, "/x", dataplane.LeaseExclusiveWrite); !errors.Is(err, errLeaseHeld) {
 		t.Fatalf("lease should still be held after stale conn cleanup, got %v", err)
 	}
 
-	// ReleaseAllForConn(2) frees it.
+	// Cleanup of the CURRENT conn frees it.
 	mgr.ReleaseAllForConn(2)
 	if _, err := mgr.Grant(context.Background(), "agentB", 3, "/x", dataplane.LeaseExclusiveWrite); err != nil {
 		t.Fatalf("expected free path after current conn cleanup, got %v", err)
+	}
+}
+
+// TestStalePodCannotKillSuccessor is the prod scenario behind the fix: pod N
+// (conn 1) holds the mount lease; its successor pod N+1 (conn 2) takes over;
+// pod N's teardown then releases the id it was granted. That release must be
+// a no-op — before the fix it destroyed pod N+1's live lease and every
+// subsequent write of pod N+1 failed the session fence.
+func TestStalePodCannotKillSuccessor(t *testing.T) {
+	mgr, _ := newTestMgr(t)
+	gN, _ := mgr.Grant(context.Background(), "agentX", 1, "/", dataplane.LeaseExclusiveWrite)
+	gN1, _ := mgr.Grant(context.Background(), "agentX", 2, "/", dataplane.LeaseExclusiveWrite)
+
+	// Pod N tears down: releases the id it holds — already superseded.
+	if err := mgr.Release(gN.LeaseID, 1); !errors.Is(err, errLeaseUnknown) {
+		t.Fatalf("stale release should be unknown, got %v", err)
+	}
+	// Even a forged release of the LIVE id from the stale conn is refused.
+	if err := mgr.Release(gN1.LeaseID, 1); !errors.Is(err, errLeaseUnknown) {
+		t.Fatalf("wrong-conn release should be refused, got %v", err)
+	}
+	if !mgr.HeldByConn(idArrayFromBytes(gN1.LeaseID), 2) {
+		t.Fatal("successor's lease must survive the stale pod's teardown")
+	}
+	// And the stale conn cannot keep the live lease alive either.
+	if _, err := mgr.Refresh(gN1.LeaseID, 1); !errors.Is(err, errLeaseUnknown) {
+		t.Fatalf("wrong-conn refresh should be refused, got %v", err)
+	}
+	// The rightful holder still releases normally.
+	if err := mgr.Release(gN1.LeaseID, 2); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -282,7 +319,7 @@ func TestManifestPutFromNonHolderTriggersRevoke(t *testing.T) {
 	}
 
 	// agentA releases; YieldFor returns nil.
-	if err := mgr.Release(g.LeaseID); err != nil {
+	if err := mgr.Release(g.LeaseID, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-done; err != nil {
@@ -303,7 +340,7 @@ func TestAuditEventsEmitted(t *testing.T) {
 	mgr := newLeaseManager(cfg, pusher.push, audit, nil)
 
 	g, _ := mgr.Grant(context.Background(), "agentA", 1, "/file", dataplane.LeaseExclusiveWrite)
-	mgr.Release(g.LeaseID)
+	mgr.Release(g.LeaseID, 1)
 
 	audit.Flush()
 	data, err := os.ReadFile(auditPath)

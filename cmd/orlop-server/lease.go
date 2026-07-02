@@ -141,27 +141,45 @@ func (m *leaseManager) Grant(ctx context.Context, holder string, connID uint64, 
 		m.mu.Lock()
 		if existing := m.byPath[path]; existing != nil {
 			if existing.holder == holder && existing.mode == mode {
-				// Idempotent; rebind connID + extend expiry.
-				if existing.connID != connID {
-					if conn := m.byConn[existing.connID]; conn != nil {
-						delete(conn, existing.id)
-						if len(conn) == 0 {
-							delete(m.byConn, existing.connID)
+				if existing.connID == connID || existing.connID == 0 {
+					// Idempotent re-grant on the same connection — or the
+					// holder reclaiming a snapshot-restored lease (connID 0 =
+					// no live conn; live conn ids start at 1). Keep the id so
+					// the client's cached session hex stays valid; bind the
+					// live conn and extend expiry.
+					if existing.connID != connID {
+						existing.connID = connID
+						if m.byConn[connID] == nil {
+							m.byConn[connID] = map[[16]byte]struct{}{}
 						}
+						m.byConn[connID][existing.id] = struct{}{}
 					}
-					existing.connID = connID
-					if m.byConn[connID] == nil {
-						m.byConn[connID] = map[[16]byte]struct{}{}
+					existing.expiresAt = time.Now().Add(m.cfg.ttl)
+					res := &leaseGrantResult{
+						LeaseID:         append([]byte(nil), existing.id[:]...),
+						ExpiresAtUnixMs: existing.expiresAt.UnixMilli(),
+						Mode:            existing.mode,
 					}
-					m.byConn[connID][existing.id] = struct{}{}
+					m.mu.Unlock()
+					return res, nil
 				}
-				existing.expiresAt = time.Now().Add(m.cfg.ttl)
-				res := &leaseGrantResult{
-					LeaseID:         append([]byte(nil), existing.id[:]...),
-					ExpiresAtUnixMs: existing.expiresAt.UnixMilli(),
-					Mode:            existing.mode,
-				}
+				// Same holder on a NEW live connection: a successor mount
+				// (e.g. the next one-shot pod of the same agent) taking over.
+				// Supersede instead of rebinding the record: the old id dies
+				// and a fresh one is granted, so the previous connection can
+				// no longer refresh, release, or write against a lease it
+				// lost. Rebinding used to keep the id, which let a stale pod's
+				// teardown Release(old id) destroy its successor's live lease.
+				oldID := existing.id
+				m.removeLocked(existing)
+				res := m.installLocked(holder, connID, path, mode)
 				m.mu.Unlock()
+				m.recordAudit("lease_release", holder, path, oldID, mode, "conn_takeover")
+				m.recordAudit("lease_grant", holder, path, idArrayFromBytes(res.LeaseID), mode, "conn_takeover")
+				if m.metrics != nil {
+					m.metrics.leaseReleased(path)
+					m.metrics.leaseAcquired(path)
+				}
 				return res, nil
 			}
 			// Different holder snuck in between YieldFor and re-lock; loop.
@@ -247,7 +265,12 @@ func (m *leaseManager) HeldByConn(id [16]byte, connID uint64) bool {
 	return ok && rec.connID == connID
 }
 
-func (m *leaseManager) Refresh(leaseID []byte) (*leaseRefreshResult, error) {
+// Refresh extends the lease's expiry. connID must be the connection the lease
+// is currently bound to: a superseded holder (its lease replaced by a
+// conn_takeover Grant) must not keep the current holder's lease alive — it
+// gets errLeaseUnknown, which its refresh loop treats as terminal. A
+// snapshot-restored lease (connID 0, no live conn) accepts any caller.
+func (m *leaseManager) Refresh(leaseID []byte, connID uint64) (*leaseRefreshResult, error) {
 	if len(leaseID) != 16 {
 		return nil, errLeaseUnknown
 	}
@@ -256,7 +279,7 @@ func (m *leaseManager) Refresh(leaseID []byte) (*leaseRefreshResult, error) {
 
 	m.mu.Lock()
 	rec, ok := m.byID[key]
-	if !ok {
+	if !ok || (rec.connID != connID && rec.connID != 0) {
 		m.mu.Unlock()
 		return nil, errLeaseUnknown
 	}
@@ -272,7 +295,14 @@ func (m *leaseManager) Refresh(leaseID []byte) (*leaseRefreshResult, error) {
 	return &leaseRefreshResult{ExpiresAtUnixMs: expiry}, nil
 }
 
-func (m *leaseManager) Release(leaseID []byte) error {
+// Release frees the lease. connID must be the connection the lease is bound
+// to: a connection may only release leases it holds, so a stale holder's
+// teardown (releasing an id that was since superseded or that it never owned
+// on this connection) is an idempotent no-op instead of killing the live
+// holder's lease. A snapshot-restored lease (connID 0) accepts any caller.
+// Conn-close cleanup goes through ReleaseAllForConn, which is inherently
+// conn-scoped.
+func (m *leaseManager) Release(leaseID []byte, connID uint64) error {
 	if len(leaseID) != 16 {
 		return errLeaseUnknown
 	}
@@ -281,7 +311,7 @@ func (m *leaseManager) Release(leaseID []byte) error {
 
 	m.mu.Lock()
 	rec, ok := m.byID[key]
-	if !ok {
+	if !ok || (rec.connID != connID && rec.connID != 0) {
 		m.mu.Unlock()
 		return errLeaseUnknown
 	}
