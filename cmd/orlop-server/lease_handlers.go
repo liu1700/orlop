@@ -69,7 +69,7 @@ func handleLeaseRefresh(tenant *tenantState, w *frameWriter, frame dataplane.Fra
 		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEINVAL("malformed lease_refresh payload"))
 		return
 	}
-	r, err := tenant.leases.Refresh(req.LeaseID)
+	r, err := tenant.leases.Refresh(req.LeaseID, w.connID)
 	if err != nil {
 		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrLeaseUnknown(err.Error()))
 		return
@@ -89,8 +89,9 @@ func handleLeaseRelease(tenant *tenantState, w *frameWriter, frame dataplane.Fra
 		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEINVAL("malformed lease_release payload"))
 		return
 	}
-	// Idempotent: missing lease == already released; respond OK.
-	_ = tenant.leases.Release(req.LeaseID)
+	// Idempotent: missing lease == already released; a lease bound to another
+	// connection (a superseded holder's late teardown) is equally a no-op.
+	_ = tenant.leases.Release(req.LeaseID, w.connID)
 	payload, _ := msgpack.Marshal(dataplane.LeaseReleaseResponse{})
 	w.send(dataplane.Frame{Op: frame.Op, Flags: dataplane.FlagResponse, RID: frame.RID, Payload: payload})
 }
