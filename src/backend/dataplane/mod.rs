@@ -13,6 +13,6 @@ pub mod messages;
 pub mod protocol;
 pub mod store;
 
-pub use cache::{CacheStats, ChunkCache};
+pub use cache::ChunkCache;
 pub use client::{DataClient, DataClientConfig, TransportMode};
 pub use store::DataStore;

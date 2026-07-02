@@ -172,14 +172,13 @@ impl NFSFileSystem for OrlopNfs {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
 
-        let entry = self
-            .store
+        // Existence check only — the entry itself isn't needed here.
+        self.store
             .entry_for(&rel)
             .map_err(|_| nfsstat3::NFS3ERR_IO)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
         let id = self.inodes.intern(&rel);
         self.record(event::LOOKUP, &rel, true);
-        let _ = entry;
         Ok(id)
     }
 
@@ -232,22 +231,18 @@ impl NFSFileSystem for OrlopNfs {
             return Err(nfsstat3::NFS3ERR_NOENT);
         }
 
-        let mut out = Vec::new();
+        // assemble_range batches the chunk fetches (parallel chunk_get_many in
+        // DataStore) instead of one serial chunk_get per chunk. It treats
+        // count == 0 as "to EOF", so guard the empty-range case explicitly.
         let want_end = offset.saturating_add(count as u64).min(manifest.size);
-        for chunk_ref in &manifest.chunks {
-            let chunk_start = chunk_ref.offset;
-            let chunk_end = chunk_ref.offset + chunk_ref.len as u64;
-            if chunk_end <= offset || chunk_start >= want_end {
-                continue;
-            }
-            let bytes = self
-                .store
-                .chunk_get(&chunk_ref.hash)
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            let slice_start = offset.saturating_sub(chunk_start) as usize;
-            let slice_end = (want_end - chunk_start).min(bytes.len() as u64) as usize;
-            out.extend_from_slice(&bytes[slice_start..slice_end]);
-        }
+        let out = if want_end <= offset {
+            Vec::new()
+        } else {
+            crate::assemble::assemble_range(&manifest, offset, count, |hashes| {
+                self.store.chunk_get_many(hashes)
+            })
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+        };
         let eof = want_end >= manifest.size;
         self.record(event::READ, &path, true);
         Ok((out, eof))
@@ -476,8 +471,8 @@ impl NFSFileSystem for OrlopNfs {
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
                 self.record(event::RMDIR, &rel, true);
             }
-            // Symlink/special-node removal over NFS not wired yet (FUSE/k8s is
-            // the production path); creation + readlink + chmod are supported.
+            // Symlinks and special nodes are FUSE-only (fs.rs); every symlink
+            // op on this macOS NFS path returns NOTSUPP, including removal.
             EntryKind::Symlink
             | EntryKind::Fifo
             | EntryKind::Socket
@@ -561,7 +556,7 @@ impl NFSFileSystem for OrlopNfs {
         _symlink: &nfspath3,
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        // Orlop has no symlink semantics today.
+        // Symlinks are FUSE-only (fs.rs); the macOS NFS path returns NOTSUPP.
         Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 
@@ -946,7 +941,8 @@ mod tests {
         )
         .unwrap();
         let (_dir, audit, audit_path) = audit_log();
-        // Leak _dir so the tempdir survives the function return without leaking on test exit.
+        // Deliberately leak the tempdir guard so the directory survives the
+        // function return; it is never cleaned up (fine for a test process).
         std::mem::forget(_dir);
         let nfs = OrlopNfs::new(store.clone(), policy, audit.clone());
         (store, audit, audit_path, nfs)
@@ -1082,8 +1078,10 @@ mod tests {
             .lookup(nfs.root_dir(), &b"f.bin".to_vec().into())
             .await
             .unwrap();
-        let mut sattr = sattr3::default();
-        sattr.size = set_size3::size(4);
+        let sattr = sattr3 {
+            size: set_size3::size(4),
+            ..Default::default()
+        };
         let attr = nfs.setattr(id, sattr).await.expect("setattr");
         assert_eq!(attr.size, 4);
         let mf = store.manifest_get("f.bin").unwrap();
@@ -1101,8 +1099,10 @@ mod tests {
             .lookup(nfs.root_dir(), &b"f.bin".to_vec().into())
             .await
             .unwrap();
-        let mut sattr = sattr3::default();
-        sattr.mode = set_mode3::mode(0o600);
+        let sattr = sattr3 {
+            mode: set_mode3::mode(0o600),
+            ..Default::default()
+        };
         nfs.setattr(id, sattr).await.unwrap();
         assert_eq!(store.manifest_get("f.bin").unwrap().mode, 0o600);
     }

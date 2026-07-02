@@ -8,8 +8,7 @@ import (
 )
 
 type auditResp struct {
-	Events     []map[string]any `json:"events"`
-	NextCursor *string          `json:"next_cursor"`
+	Events []map[string]any `json:"events"`
 }
 
 func (s *serverState) getAudit(w http.ResponseWriter, r *http.Request) {

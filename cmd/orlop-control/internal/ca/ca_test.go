@@ -243,9 +243,11 @@ func TestCrossTenantCertDoesNotVerify(t *testing.T) {
 	}
 	leaf := parseAllCertsPEM(t, certPEM)[0]
 
-	betaChain, ok := c.TenantChainPEM("beta")
-	if !ok {
-		t.Fatal("expected beta chain")
+	// Beta's chain (intermediate || root) comes back with any cert minted
+	// under it.
+	_, _, betaChain, _, err := c.MintAgentCert("beta", "user-2", "", time.Hour)
+	if err != nil {
+		t.Fatal(err)
 	}
 	betaCerts := parseAllCertsPEM(t, betaChain)
 
@@ -306,7 +308,17 @@ func TestLoadOrInitIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	root1 := c1.RootPEM()
-	chain1, _ := c1.TenantChainPEM("acme")
+	// acmeChain observes acme's chain (intermediate || root) via the chain
+	// returned with a minted cert.
+	acmeChain := func(c *CA) []byte {
+		t.Helper()
+		_, _, chain, _, err := c.MintAgentCert("acme", "user-1", "", time.Hour)
+		if err != nil {
+			t.Fatalf("mint under acme: %v", err)
+		}
+		return chain
+	}
+	chain1 := acmeChain(c1)
 
 	c2, err := LoadOrInit(ctx, backend, env)
 	if err != nil {
@@ -315,11 +327,7 @@ func TestLoadOrInitIdempotent(t *testing.T) {
 	if !bytes.Equal(c2.RootPEM(), root1) {
 		t.Fatal("root cert changed across LoadOrInit calls")
 	}
-	chain2, ok := c2.TenantChainPEM("acme")
-	if !ok {
-		t.Fatal("tenant intermediate lost on reload")
-	}
-	if !bytes.Equal(chain1, chain2) {
+	if !bytes.Equal(chain1, acmeChain(c2)) {
 		t.Fatal("intermediate cert changed across reloads")
 	}
 
@@ -327,8 +335,7 @@ func TestLoadOrInitIdempotent(t *testing.T) {
 	if err := c2.BootstrapTenant(ctx, "acme"); err != nil {
 		t.Fatal(err)
 	}
-	chain3, _ := c2.TenantChainPEM("acme")
-	if !bytes.Equal(chain1, chain3) {
+	if !bytes.Equal(chain1, acmeChain(c2)) {
 		t.Fatal("BootstrapTenant on existing tenant rotated the cert")
 	}
 }

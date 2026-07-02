@@ -106,11 +106,10 @@ func newCertProvisioner(logger *slog.Logger, cfg Config) (*certProvisioner, erro
 // signOnce generates a fresh keypair, sends one CSR, and returns the signed
 // material. Any non-200 (or transport error) is returned so the caller can retry.
 func (p *certProvisioner) signOnce(ctx context.Context) (*signedCert, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate key: %w", err)
 	}
-	_ = pub
 	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
 		Subject:  pkix.Name{CommonName: p.fqdn},
 		DNSNames: []string{p.fqdn},

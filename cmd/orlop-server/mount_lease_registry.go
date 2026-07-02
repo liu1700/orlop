@@ -106,14 +106,3 @@ func (r *mountLeaseRegistry) Clear(allocationID string) {
 		st.active = ""
 	}
 }
-
-// IsFenced reports whether leaseHex is in the fenced set for allocationID.
-// Exported for tests; production callers go through Install / Get.
-func (r *mountLeaseRegistry) IsFenced(allocationID, leaseHex string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if st := r.state[allocationID]; st != nil {
-		return st.fenced[leaseHex]
-	}
-	return false
-}

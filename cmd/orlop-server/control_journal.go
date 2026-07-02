@@ -37,6 +37,13 @@ type controlJournalEntry struct {
 	SizeAfter     *uint64 `json:"size_after,omitempty"`
 }
 
+// controlJournalEntryFromRow converts a scanned journal row into the JSON wire
+// shape. The two structs are field-for-field identical, so this is a plain
+// struct conversion.
+func controlJournalEntryFromRow(row JournalQueryRow) controlJournalEntry {
+	return controlJournalEntry(row)
+}
+
 // tenantJournalQuery handles GET /control/tenants/{id}/journal.
 // It is protected by controlPlaneOnlyMiddleware.
 //
@@ -96,20 +103,7 @@ func (s *serverState) tenantJournalQuery(w http.ResponseWriter, r *http.Request)
 		}
 		entries := make([]controlJournalEntry, 0, len(rows))
 		for _, row := range rows {
-			entries = append(entries, controlJournalEntry{
-				SessionID:     row.SessionID,
-				AllocationID:  row.AllocationID,
-				Seq:           row.Seq,
-				TsUnixMs:      row.TsUnixMs,
-				Path:          row.Path,
-				Op:            row.Op,
-				AgentID:       row.AgentID,
-				BeforeVersion: row.BeforeVersion,
-				AfterVersion:  row.AfterVersion,
-				RenameFrom:    row.RenameFrom,
-				SizeBefore:    row.SizeBefore,
-				SizeAfter:     row.SizeAfter,
-			})
+			entries = append(entries, controlJournalEntryFromRow(row))
 		}
 		writeJSON(w, http.StatusOK, controlJournalResponse{Entries: entries})
 		return
@@ -139,20 +133,7 @@ func (s *serverState) tenantJournalQuery(w http.ResponseWriter, r *http.Request)
 
 	entries := make([]controlJournalEntry, 0, len(rows))
 	for _, row := range rows {
-		entries = append(entries, controlJournalEntry{
-			SessionID:     row.SessionID,
-			AllocationID:  row.AllocationID,
-			Seq:           row.Seq,
-			TsUnixMs:      row.TsUnixMs,
-			Path:          row.Path,
-			Op:            row.Op,
-			AgentID:       row.AgentID,
-			BeforeVersion: row.BeforeVersion,
-			AfterVersion:  row.AfterVersion,
-			RenameFrom:    row.RenameFrom,
-			SizeBefore:    row.SizeBefore,
-			SizeAfter:     row.SizeAfter,
-		})
+		entries = append(entries, controlJournalEntryFromRow(row))
 	}
 
 	writeJSON(w, http.StatusOK, controlJournalResponse{
@@ -269,21 +250,7 @@ func (s *serverState) tenantJournalStream(w http.ResponseWriter, r *http.Request
 // the same JSON shape as controlJournalEntry (used by tenantJournalQuery), so
 // SSE consumers and one-shot GET consumers see identical entry envelopes.
 func writeSSEEntry(w http.ResponseWriter, row JournalQueryRow) error {
-	entry := controlJournalEntry{
-		SessionID:     row.SessionID,
-		AllocationID:  row.AllocationID,
-		Seq:           row.Seq,
-		TsUnixMs:      row.TsUnixMs,
-		Path:          row.Path,
-		Op:            row.Op,
-		AgentID:       row.AgentID,
-		BeforeVersion: row.BeforeVersion,
-		AfterVersion:  row.AfterVersion,
-		RenameFrom:    row.RenameFrom,
-		SizeBefore:    row.SizeBefore,
-		SizeAfter:     row.SizeAfter,
-	}
-	buf, err := json.Marshal(entry)
+	buf, err := json.Marshal(controlJournalEntryFromRow(row))
 	if err != nil {
 		return err
 	}
@@ -295,9 +262,9 @@ func writeSSEEntry(w http.ResponseWriter, row JournalQueryRow) error {
 
 // journalQueryRowFromEntry lifts a pub/sub-delivered SessionJournalEntry into
 // the JournalQueryRow shape so writeSSEEntry can emit it through the same
-// path as catch-up rows. SizeAfter is filled from the embedded before-manifest
-// only when the op is delete (there is no live join here); the wire shape's
-// SizeBefore mirrors what Query returns for delete/update/rename rows.
+// path as catch-up rows. SizeBefore is decoded from the embedded
+// before-manifest, mirroring what Query returns for delete/update/rename
+// rows; SizeAfter stays nil (there is no live manifest join here).
 func journalQueryRowFromEntry(e SessionJournalEntry) JournalQueryRow {
 	row := JournalQueryRow{
 		SessionID:     e.SessionID,

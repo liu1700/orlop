@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +16,8 @@ use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::RootCertStore;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
@@ -28,14 +30,13 @@ use super::codec::{read_frame_async, write_frame_async, Frame};
 use super::messages::{
     ChunkGetRequest, ChunkGetResponse, ChunkHasRequest, ChunkHasResponse, ChunkPutRequest,
     ChunkPutResponse, ChunkRef, DirCreateRequest, DirCreateResponse, DirRemoveRequest,
-    DirRemoveResponse, EntryWire, ErrorPayload, JournalQueryRequest, JournalQueryResponse,
-    JournalRevertPathRequest, JournalRevertPathResponse, LeaseGrantRequest, LeaseGrantResponse,
-    LeaseMode, LeaseRefreshRequest, LeaseRefreshResponse, LeaseReleaseRequest, ListRequest,
-    ListResponse, ManifestDeleteRequest, ManifestDeleteResponse, ManifestGetRequest,
+    DirRemoveResponse, EntryWire, ErrorPayload, LeaseGrantRequest, LeaseGrantResponse, LeaseMode,
+    LeaseRefreshRequest, LeaseRefreshResponse, LeaseReleaseRequest, LeaseReleaseResponse,
+    ListRequest, ListResponse, ManifestDeleteRequest, ManifestDeleteResponse, ManifestGetRequest,
     ManifestGetResponse, ManifestPutRequest, ManifestPutResponse, ManifestRenameRequest,
-    ManifestRenameResponse, MknodRequest, MknodResponse, PingRequest, PingResponse,
-    ReadlinkRequest, ReadlinkResponse, SetattrRequest, SetattrResponse, StatRequest,
-    StatResponse, SymlinkRequest, SymlinkResponse,
+    ManifestRenameResponse, MknodRequest, MknodResponse, PingRequest, ReadlinkRequest,
+    ReadlinkResponse, SetattrRequest, SetattrResponse, StatRequest, StatResponse, SymlinkRequest,
+    SymlinkResponse,
 };
 use super::protocol::{errno, flags, Op, MAX_PAYLOAD_LEN};
 use crate::backend::tls::TlsIdentity;
@@ -56,6 +57,27 @@ pub enum TransportMode {
     Tcp,
 }
 
+impl TransportMode {
+    /// Parse the `ORLOP_TRANSPORT` opt-in (docs/design-data-plane.md).
+    /// Unset/empty → `Tcp`, the production default; a set-but-unrecognized
+    /// value is an error, not a silent fallback.
+    fn from_env_value(v: Option<&str>) -> Result<Self> {
+        match v.map(str::trim) {
+            None | Some("") => Ok(Self::Tcp),
+            Some(s) if s.eq_ignore_ascii_case("tcp") => Ok(Self::Tcp),
+            Some(s) if s.eq_ignore_ascii_case("quic") => Ok(Self::Quic),
+            Some(s) if s.eq_ignore_ascii_case("auto") => Ok(Self::Auto),
+            Some(other) => Err(anyhow!(
+                "invalid ORLOP_TRANSPORT {other:?} (expected tcp, quic, or auto)"
+            )),
+        }
+    }
+
+    fn from_env() -> Result<Self> {
+        Self::from_env_value(std::env::var("ORLOP_TRANSPORT").ok().as_deref())
+    }
+}
+
 #[derive(Clone)]
 pub struct DataClientConfig {
     /// `host:port` — used for both QUIC (UDP) and TCP fallback.
@@ -71,20 +93,25 @@ pub struct DataClientConfig {
 }
 
 impl DataClientConfig {
-    pub fn new(addr: impl Into<String>, server_name: impl Into<String>, tls: TlsIdentity) -> Self {
-        Self {
+    pub fn new(
+        addr: impl Into<String>,
+        server_name: impl Into<String>,
+        tls: TlsIdentity,
+    ) -> Result<Self> {
+        Ok(Self {
             addr: addr.into(),
             server_name: server_name.into(),
             tls,
             // QUIC throughput is bounded by the client kernel's UDP rmem cap,
             // which a non-root binary can't raise. Default to TCP for any
-            // production caller; the bench tool can override via CLI flag.
-            transport: TransportMode::Tcp,
+            // production caller; ORLOP_TRANSPORT=quic|auto is the documented
+            // opt-in (docs/design-data-plane.md).
+            transport: TransportMode::from_env()?,
             quic_connect_timeout: DEFAULT_QUIC_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
-        }
+        })
     }
 }
 
@@ -101,7 +128,6 @@ struct Inner {
     /// Never `Some(Auto)` — Auto is the *config* mode, not a dialed outcome.
     preferred_transport: Mutex<Option<TransportMode>>,
     next_rid: AtomicU64,
-    in_flight: AtomicUsize,
     state: Mutex<ConnState>,
     push_handler: Mutex<Option<UnboundedSender<Frame>>>,
 }
@@ -154,49 +180,45 @@ impl DataClient {
                 quic_config,
                 preferred_transport: Mutex::new(None),
                 next_rid: AtomicU64::new(1),
-                in_flight: AtomicUsize::new(0),
                 state: Mutex::new(ConnState::Disconnected),
                 push_handler: Mutex::new(None),
             }),
         })
     }
 
-    pub fn in_flight(&self) -> usize {
-        self.inner.in_flight.load(Ordering::Relaxed)
-    }
-
     pub fn list(&self, path: &str) -> Result<Vec<EntryWire>> {
-        let req = ListRequest {
-            path: path.to_string(),
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::List, payload)?;
-        let resp: ListResponse = rmp_serde::from_slice(&resp_payload)?;
+        let resp: ListResponse = self.rpc(
+            Op::List,
+            &ListRequest {
+                path: path.to_string(),
+            },
+        )?;
         Ok(resp.entries)
     }
 
     pub fn stat(&self, path: &str) -> Result<EntryWire> {
-        let req = StatRequest {
-            path: path.to_string(),
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::Stat, payload)?;
-        let resp: StatResponse = rmp_serde::from_slice(&resp_payload)?;
+        let resp: StatResponse = self.rpc(
+            Op::Stat,
+            &StatRequest {
+                path: path.to_string(),
+            },
+        )?;
         Ok(resp.entry)
     }
 
     pub fn manifest_get(&self, path: &str) -> Result<ManifestGetResponse> {
-        let req = ManifestGetRequest {
-            path: path.to_string(),
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::ManifestGet, payload)?;
-        let resp: ManifestGetResponse = rmp_serde::from_slice(&resp_payload)?;
-        Ok(resp)
+        self.rpc(
+            Op::ManifestGet,
+            &ManifestGetRequest {
+                path: path.to_string(),
+            },
+        )
     }
 
     pub fn chunk_get(&self, hash: &[u8]) -> Result<Vec<u8>> {
-        let payload = build_chunk_get_payload(hash)?;
+        let payload = encode_payload(&ChunkGetRequest {
+            hash: hash.to_vec(),
+        })?;
         let inner = Arc::clone(&self.inner);
         let resp_payload = self.block_on(async move {
             let handle = inner.ensure_connected().await?;
@@ -210,8 +232,10 @@ impl DataClient {
     /// `open_bi` round-trips overlap instead of serialising on a single
     /// `block_on`. Returns chunks in the same order as `hashes`.
     pub fn chunk_get_many(&self, hashes: &[[u8; 32]]) -> Result<Vec<Vec<u8>>> {
-        let payloads: Result<Vec<Vec<u8>>> =
-            hashes.iter().map(|h| build_chunk_get_payload(h)).collect();
+        let payloads: Result<Vec<Vec<u8>>> = hashes
+            .iter()
+            .map(|h| encode_payload(&ChunkGetRequest { hash: h.to_vec() }))
+            .collect();
         let payloads = payloads?;
         let inner = Arc::clone(&self.inner);
         let runtime = Arc::clone(&self.runtime);
@@ -238,24 +262,24 @@ impl DataClient {
     /// Returns a bitmap byte slice where bit i is set iff the server holds
     /// the i-th hash. `hashes` is a flat buffer of N×32-byte BLAKE3 digests.
     pub fn chunk_has(&self, hashes: &[u8]) -> Result<Vec<u8>> {
-        let req = ChunkHasRequest {
-            hashes: hashes.to_vec(),
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::ChunkHas, payload)?;
-        let resp: ChunkHasResponse = rmp_serde::from_slice(&resp_payload)?;
+        let resp: ChunkHasResponse = self.rpc(
+            Op::ChunkHas,
+            &ChunkHasRequest {
+                hashes: hashes.to_vec(),
+            },
+        )?;
         Ok(resp.present)
     }
 
     pub fn chunk_put(&self, hash: &[u8], bytes: &[u8], session_id: Option<String>) -> Result<bool> {
-        let req = ChunkPutRequest {
-            hash: hash.to_vec(),
-            bytes: bytes.to_vec(),
-            session_id,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::ChunkPut, payload)?;
-        let resp: ChunkPutResponse = rmp_serde::from_slice(&resp_payload)?;
+        let resp: ChunkPutResponse = self.rpc(
+            Op::ChunkPut,
+            &ChunkPutRequest {
+                hash: hash.to_vec(),
+                bytes: bytes.to_vec(),
+                session_id,
+            },
+        )?;
         Ok(resp.stored)
     }
 
@@ -269,20 +293,11 @@ impl DataClient {
     ) -> Result<Vec<bool>> {
         let mut payloads = Vec::with_capacity(items.len());
         for (hash, bytes) in items {
-            let req = ChunkPutRequest {
+            payloads.push(encode_payload(&ChunkPutRequest {
                 hash,
                 bytes,
                 session_id: session_id.clone(),
-            };
-            let payload = rmp_serde::to_vec_named(&req)?;
-            if payload.len() as u32 > MAX_PAYLOAD_LEN {
-                return Err(anyhow!(
-                    "payload {} exceeds MAX_PAYLOAD_LEN {}",
-                    payload.len(),
-                    MAX_PAYLOAD_LEN
-                ));
-            }
-            payloads.push(payload);
+            })?);
         }
         let inner = Arc::clone(&self.inner);
         let runtime = Arc::clone(&self.runtime);
@@ -320,19 +335,19 @@ impl DataClient {
         session_id: Option<String>,
         allocation_id: Option<String>,
     ) -> Result<u64> {
-        let req = ManifestPutRequest {
-            path: path.to_string(),
-            version_expected,
-            size,
-            mode,
-            mtime,
-            chunks,
-            session_id,
-            allocation_id,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::ManifestPut, payload)?;
-        let resp: ManifestPutResponse = rmp_serde::from_slice(&resp_payload)?;
+        let resp: ManifestPutResponse = self.rpc(
+            Op::ManifestPut,
+            &ManifestPutRequest {
+                path: path.to_string(),
+                version_expected,
+                size,
+                mode,
+                mtime,
+                chunks,
+                session_id,
+                allocation_id,
+            },
+        )?;
         Ok(resp.version)
     }
 
@@ -343,15 +358,15 @@ impl DataClient {
         session_id: Option<String>,
         allocation_id: Option<String>,
     ) -> Result<()> {
-        let req = ManifestDeleteRequest {
-            path: path.to_string(),
-            expected_version,
-            session_id,
-            allocation_id,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::ManifestDelete, payload)?;
-        let _: ManifestDeleteResponse = rmp_serde::from_slice(&resp_payload)?;
+        let _: ManifestDeleteResponse = self.rpc(
+            Op::ManifestDelete,
+            &ManifestDeleteRequest {
+                path: path.to_string(),
+                expected_version,
+                session_id,
+                allocation_id,
+            },
+        )?;
         Ok(())
     }
 
@@ -365,40 +380,40 @@ impl DataClient {
         session_id: Option<String>,
         allocation_id: Option<String>,
     ) -> Result<u64> {
-        let req = ManifestRenameRequest {
-            from: from.into(),
-            to: to.into(),
-            expected_version_from,
-            expected_version_to,
-            session_id,
-            allocation_id,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::ManifestRename, payload)?;
-        let resp: ManifestRenameResponse = rmp_serde::from_slice(&resp_payload)?;
+        let resp: ManifestRenameResponse = self.rpc(
+            Op::ManifestRename,
+            &ManifestRenameRequest {
+                from: from.into(),
+                to: to.into(),
+                expected_version_from,
+                expected_version_to,
+                session_id,
+                allocation_id,
+            },
+        )?;
         Ok(resp.new_version_at_to)
     }
 
     pub fn dir_create(&self, path: &str, mode: u32, session_id: Option<String>) -> Result<()> {
-        let req = DirCreateRequest {
-            path: path.into(),
-            mode,
-            session_id,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::DirCreate, payload)?;
-        let _: DirCreateResponse = rmp_serde::from_slice(&resp_payload)?;
+        let _: DirCreateResponse = self.rpc(
+            Op::DirCreate,
+            &DirCreateRequest {
+                path: path.into(),
+                mode,
+                session_id,
+            },
+        )?;
         Ok(())
     }
 
     pub fn dir_remove(&self, path: &str, session_id: Option<String>) -> Result<()> {
-        let req = DirRemoveRequest {
-            path: path.into(),
-            session_id,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::DirRemove, payload)?;
-        let _: DirRemoveResponse = rmp_serde::from_slice(&resp_payload)?;
+        let _: DirRemoveResponse = self.rpc(
+            Op::DirRemove,
+            &DirRemoveRequest {
+                path: path.into(),
+                session_id,
+            },
+        )?;
         Ok(())
     }
 
@@ -409,16 +424,16 @@ impl DataClient {
         session_id: Option<String>,
         allocation_id: Option<String>,
     ) -> Result<()> {
-        let req = SetattrRequest {
-            path: path.into(),
-            mode,
-            session_id,
-            allocation_id,
-            ..Default::default()
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::Setattr, payload)?;
-        let _: SetattrResponse = rmp_serde::from_slice(&resp_payload)?;
+        let _: SetattrResponse = self.rpc(
+            Op::Setattr,
+            &SetattrRequest {
+                path: path.into(),
+                mode,
+                session_id,
+                allocation_id,
+                ..Default::default()
+            },
+        )?;
         Ok(())
     }
 
@@ -434,18 +449,18 @@ impl DataClient {
         session_id: Option<String>,
         allocation_id: Option<String>,
     ) -> Result<()> {
-        let req = SetattrRequest {
-            path: path.into(),
-            mode,
-            uid: Some(uid),
-            gid: Some(gid),
-            session_id,
-            allocation_id,
-            ..Default::default()
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::Setattr, payload)?;
-        let _: SetattrResponse = rmp_serde::from_slice(&resp_payload)?;
+        let _: SetattrResponse = self.rpc(
+            Op::Setattr,
+            &SetattrRequest {
+                path: path.into(),
+                mode,
+                uid: Some(uid),
+                gid: Some(gid),
+                session_id,
+                allocation_id,
+                ..Default::default()
+            },
+        )?;
         Ok(())
     }
 
@@ -459,17 +474,17 @@ impl DataClient {
         session_id: Option<String>,
         allocation_id: Option<String>,
     ) -> Result<()> {
-        let req = SetattrRequest {
-            path: path.into(),
-            mode,
-            atime: Some(atime),
-            session_id,
-            allocation_id,
-            ..Default::default()
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::Setattr, payload)?;
-        let _: SetattrResponse = rmp_serde::from_slice(&resp_payload)?;
+        let _: SetattrResponse = self.rpc(
+            Op::Setattr,
+            &SetattrRequest {
+                path: path.into(),
+                mode,
+                atime: Some(atime),
+                session_id,
+                allocation_id,
+                ..Default::default()
+            },
+        )?;
         Ok(())
     }
 
@@ -481,16 +496,16 @@ impl DataClient {
         session_id: Option<String>,
         allocation_id: Option<String>,
     ) -> Result<()> {
-        let req = SymlinkRequest {
-            path: path.into(),
-            target: target.into(),
-            mode,
-            session_id,
-            allocation_id,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::Symlink, payload)?;
-        let _: SymlinkResponse = rmp_serde::from_slice(&resp_payload)?;
+        let _: SymlinkResponse = self.rpc(
+            Op::Symlink,
+            &SymlinkRequest {
+                path: path.into(),
+                target: target.into(),
+                mode,
+                session_id,
+                allocation_id,
+            },
+        )?;
         Ok(())
     }
 
@@ -502,122 +517,81 @@ impl DataClient {
         session_id: Option<String>,
         allocation_id: Option<String>,
     ) -> Result<()> {
-        let req = MknodRequest {
-            path: path.into(),
-            mode,
-            rdev,
-            session_id,
-            allocation_id,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::Mknod, payload)?;
-        let _: MknodResponse = rmp_serde::from_slice(&resp_payload)?;
+        let _: MknodResponse = self.rpc(
+            Op::Mknod,
+            &MknodRequest {
+                path: path.into(),
+                mode,
+                rdev,
+                session_id,
+                allocation_id,
+            },
+        )?;
         Ok(())
     }
 
     pub fn readlink(&self, path: &str) -> Result<String> {
-        let req = ReadlinkRequest { path: path.into() };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::Readlink, payload)?;
-        let resp: ReadlinkResponse = rmp_serde::from_slice(&resp_payload)?;
+        let resp: ReadlinkResponse = self.rpc(Op::Readlink, &ReadlinkRequest { path: path.into() })?;
         Ok(resp.target)
     }
 
-    /// Query the write journal for an allocation. Returns entries newest-first
-    /// up to `limit`; pass `before_ts_ms` from the previous response's
-    /// `next_before_ts_ms` to page backwards.
-    pub fn journal_query(
-        &self,
-        allocation_id: &str,
-        limit: u32,
-        before_ts_ms: Option<i64>,
-    ) -> Result<JournalQueryResponse> {
-        let req = JournalQueryRequest {
-            allocation_id: allocation_id.to_owned(),
-            limit,
-            before_ts_ms: before_ts_ms.unwrap_or(0),
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::JournalQuery, payload)?;
-        Ok(rmp_serde::from_slice(&resp_payload)?)
-    }
-
-    /// Revert specific paths in an allocation's journal. CAS conflicts come
-    /// back in the `conflicts` vec rather than as a wire error, so partial
-    /// success is visible to the caller.
-    pub fn journal_revert_path(
-        &self,
-        allocation_id: &str,
-        paths: &[String],
-    ) -> Result<JournalRevertPathResponse> {
-        let req = JournalRevertPathRequest {
-            allocation_id: allocation_id.to_owned(),
-            paths: paths.to_vec(),
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::JournalRevertPath, payload)?;
-        Ok(rmp_serde::from_slice(&resp_payload)?)
+    /// Handle to the client's dedicated tokio runtime (shared with LeaseManager).
+    pub fn runtime(&self) -> Arc<Runtime> {
+        Arc::clone(&self.runtime)
     }
 
     /// Register a single push handler. Server-pushed frames (no FlagResponse)
     /// are forwarded to `tx`. Set-once: replacing an existing handler returns
     /// the old one (caller usually discards).
-    pub fn runtime(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
-    }
-
     pub fn set_push_handler(&self, tx: UnboundedSender<Frame>) -> Option<UnboundedSender<Frame>> {
         let mut slot = self.inner.push_handler.lock();
         slot.replace(tx)
     }
 
     pub fn lease_grant(&self, path: &str, mode: LeaseMode) -> Result<LeaseGrantResponse> {
-        let req = LeaseGrantRequest {
-            path: path.to_string(),
-            mode,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::LeaseGrant, payload)?;
-        Ok(rmp_serde::from_slice(&resp_payload)?)
+        self.rpc(
+            Op::LeaseGrant,
+            &LeaseGrantRequest {
+                path: path.to_string(),
+                mode,
+            },
+        )
     }
 
     pub fn lease_refresh(&self, lease_id: &[u8; 16]) -> Result<LeaseRefreshResponse> {
-        let req = LeaseRefreshRequest {
-            lease_id: lease_id.to_vec(),
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let resp_payload = self.request(Op::LeaseRefresh, payload)?;
-        Ok(rmp_serde::from_slice(&resp_payload)?)
+        self.rpc(
+            Op::LeaseRefresh,
+            &LeaseRefreshRequest {
+                lease_id: lease_id.to_vec(),
+            },
+        )
     }
 
     pub fn lease_release(&self, lease_id: &[u8; 16], dirty_flushed: bool) -> Result<()> {
-        let req = LeaseReleaseRequest {
-            lease_id: lease_id.to_vec(),
-            dirty_flushed,
-        };
-        let payload = rmp_serde::to_vec_named(&req)?;
-        let _resp = self.request(Op::LeaseRelease, payload)?;
+        let _: LeaseReleaseResponse = self.rpc(
+            Op::LeaseRelease,
+            &LeaseReleaseRequest {
+                lease_id: lease_id.to_vec(),
+                dirty_flushed,
+            },
+        )?;
         Ok(())
     }
 
+    /// msgpack-encode `req`, send it as `op` on the control stream, decode the
+    /// typed response. Every request/response RPC method above rides this.
+    fn rpc<Req: Serialize, Resp: DeserializeOwned>(&self, op: Op, req: &Req) -> Result<Resp> {
+        let resp_payload = self.request(op, encode_payload(req)?)?;
+        Ok(rmp_serde::from_slice(&resp_payload)?)
+    }
+
     fn request(&self, op: Op, payload: Vec<u8>) -> Result<Vec<u8>> {
-        if payload.len() as u32 > MAX_PAYLOAD_LEN {
-            return Err(anyhow!(
-                "payload {} exceeds MAX_PAYLOAD_LEN {}",
-                payload.len(),
-                MAX_PAYLOAD_LEN
-            ));
-        }
         let inner = Arc::clone(&self.inner);
         let request_timeout = inner.cfg.request_timeout;
         self.block_on(async move {
             let handle = inner.ensure_connected().await?;
             let rid = inner.next_rid.fetch_add(1, Ordering::Relaxed);
-            inner.in_flight.fetch_add(1, Ordering::Relaxed);
-            let result =
-                send_on_control_stream(&handle, &inner, op, rid, payload, request_timeout).await;
-            inner.in_flight.fetch_sub(1, Ordering::Relaxed);
-            result
+            send_on_control_stream(&handle, &inner, op, rid, payload, request_timeout).await
         })
     }
 
@@ -636,11 +610,10 @@ impl DataClient {
     }
 }
 
-fn build_chunk_get_payload(hash: &[u8]) -> Result<Vec<u8>> {
-    let req = ChunkGetRequest {
-        hash: hash.to_vec(),
-    };
-    let payload = rmp_serde::to_vec_named(&req)?;
+/// msgpack-encode a request and enforce the frame size cap — the single
+/// MAX_PAYLOAD_LEN checkpoint for every outgoing request payload.
+fn encode_payload<Req: Serialize>(req: &Req) -> Result<Vec<u8>> {
+    let payload = rmp_serde::to_vec_named(req)?;
     if payload.len() as u32 > MAX_PAYLOAD_LEN {
         return Err(anyhow!(
             "payload {} exceeds MAX_PAYLOAD_LEN {}",
@@ -661,15 +634,12 @@ async fn chunk_get_one(
 ) -> Result<Vec<u8>> {
     let request_timeout = inner.cfg.request_timeout;
     let rid = inner.next_rid.fetch_add(1, Ordering::Relaxed);
-    inner.in_flight.fetch_add(1, Ordering::Relaxed);
-    let result = if let Some(quic) = handle.quic.as_ref() {
+    if let Some(quic) = handle.quic.as_ref() {
         let connection = quic.connection.clone();
         chunk_get_via_new_stream(&connection, rid, payload, request_timeout).await
     } else {
         send_on_control_stream(&handle, &inner, Op::ChunkGet, rid, payload, request_timeout).await
-    };
-    inner.in_flight.fetch_sub(1, Ordering::Relaxed);
-    result
+    }
 }
 
 /// Same shape as `chunk_get_one` but always rides the multiplexed control
@@ -682,10 +652,7 @@ async fn request_on_control_stream(
 ) -> Result<Vec<u8>> {
     let request_timeout = inner.cfg.request_timeout;
     let rid = inner.next_rid.fetch_add(1, Ordering::Relaxed);
-    inner.in_flight.fetch_add(1, Ordering::Relaxed);
-    let result = send_on_control_stream(&handle, &inner, op, rid, payload, request_timeout).await;
-    inner.in_flight.fetch_sub(1, Ordering::Relaxed);
-    result
+    send_on_control_stream(&handle, &inner, op, rid, payload, request_timeout).await
 }
 
 async fn send_on_control_stream(
@@ -1096,18 +1063,44 @@ fn random_nonce() -> u64 {
         .unwrap_or(0)
 }
 
-// PingResponse is reachable only on the wire today (heartbeat fires PONG into
-// the response stream where it's discarded as an unmatched rid). Reference it
-// here so the type stays in the API surface for follow-on work.
-#[allow(dead_code)]
-fn _typecheck_pong() -> PingResponse {
-    PingResponse { nonce: 0 }
+#[cfg(test)]
+mod transport_mode_tests {
+    use super::*;
+
+    #[test]
+    fn parses_orlop_transport_values() {
+        assert_eq!(
+            TransportMode::from_env_value(None).unwrap(),
+            TransportMode::Tcp
+        );
+        assert_eq!(
+            TransportMode::from_env_value(Some("")).unwrap(),
+            TransportMode::Tcp
+        );
+        assert_eq!(
+            TransportMode::from_env_value(Some("tcp")).unwrap(),
+            TransportMode::Tcp
+        );
+        assert_eq!(
+            TransportMode::from_env_value(Some("QUIC")).unwrap(),
+            TransportMode::Quic
+        );
+        assert_eq!(
+            TransportMode::from_env_value(Some(" auto ")).unwrap(),
+            TransportMode::Auto
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_orlop_transport_value() {
+        let err = TransportMode::from_env_value(Some("h3")).unwrap_err();
+        assert!(err.to_string().contains("ORLOP_TRANSPORT"), "{err}");
+    }
 }
 
 #[cfg(test)]
 mod push_router_tests {
     use super::*;
-    use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
     fn frame_is_response_routes_via_pending_not_push() {
@@ -1125,12 +1118,6 @@ mod push_router_tests {
             payload: vec![],
         };
         assert!(!f.is_response());
-    }
-
-    #[test]
-    fn unbounded_channel_can_register() {
-        let (tx, _rx) = unbounded_channel::<Frame>();
-        let _: UnboundedSender<Frame> = tx;
     }
 
     #[test]

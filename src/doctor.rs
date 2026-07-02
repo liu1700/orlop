@@ -190,16 +190,18 @@ fn credentials_check(credentials_path: Option<&Path>) -> Check {
     }
 }
 
+/// A TCP connect to 127.0.0.1:port succeeds iff something is listening.
+/// Best-effort probe shared with `orlop dev up`.
+pub(crate) fn port_in_use(port: u16) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(200)).is_ok()
+}
+
 /// Required (dev mode): a TCP connect to 127.0.0.1:port fails iff nothing is
 /// listening, i.e. `dev up` can bind it.
 fn port_free_check(label: &str, port: u16) -> Check {
-    use std::net::TcpStream;
-    use std::time::Duration;
-    let in_use = TcpStream::connect_timeout(
-        &([127, 0, 0, 1], port).into(),
-        Duration::from_millis(200),
-    )
-    .is_ok();
+    let in_use = port_in_use(port);
     let name = format!("port-{port}");
     if in_use {
         Check::req_fail(

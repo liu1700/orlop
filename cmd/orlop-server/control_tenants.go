@@ -20,7 +20,6 @@ var tenantIDRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}$`)
 const (
 	errCodeRegistrationDisabled = "registration_disabled"
 	errCodeInvalidRequest       = "invalid_request"
-	errCodeSizeMismatch         = "size_mismatch"
 	errCodeFSQuotaUnavailable   = "fs_quota_unavailable"
 )
 
@@ -130,11 +129,7 @@ func (s *serverState) registerTenant(w http.ResponseWriter, r *http.Request) {
 		var notQuota quota.ErrNotProjectQuotaFS
 		if errors.As(err, &notQuota) {
 			s.logger.Error("account quota unavailable", "owner_tenant", ownerTenant, "stderr", notQuota.Stderr)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			encodeJSON(w, map[string]any{
-				"error": map[string]any{"code": errCodeFSQuotaUnavailable, "message": notQuota.Stderr},
-			})
+			writeJSONError(w, http.StatusInternalServerError, errCodeFSQuotaUnavailable, notQuota.Stderr)
 			return 0, false
 		}
 		writeJSONError(w, http.StatusInternalServerError, "quota_failed", err.Error())
@@ -253,14 +248,7 @@ func (s *serverState) resizeTenant(w http.ResponseWriter, r *http.Request) {
 		var notQuota quota.ErrNotProjectQuotaFS
 		if errors.As(err, &notQuota) {
 			s.logger.Error("quota resize unavailable", "tenant_id", tenantID, "stderr", notQuota.Stderr)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			encodeJSON(w, map[string]any{
-				"error": map[string]any{
-					"code":    errCodeFSQuotaUnavailable,
-					"message": notQuota.Stderr,
-				},
-			})
+			writeJSONError(w, http.StatusInternalServerError, errCodeFSQuotaUnavailable, notQuota.Stderr)
 			return
 		}
 		writeJSONError(w, http.StatusInternalServerError, "quota_failed", err.Error())
@@ -391,11 +379,7 @@ func (s *serverState) setAccountQuota(w http.ResponseWriter, r *http.Request) {
 		var notQuota quota.ErrNotProjectQuotaFS
 		if errors.As(err, &notQuota) {
 			s.logger.Error("account quota unavailable", "owner_tenant", owner, "stderr", notQuota.Stderr)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			encodeJSON(w, map[string]any{
-				"error": map[string]any{"code": errCodeFSQuotaUnavailable, "message": notQuota.Stderr},
-			})
+			writeJSONError(w, http.StatusInternalServerError, errCodeFSQuotaUnavailable, notQuota.Stderr)
 			return
 		}
 		writeJSONError(w, http.StatusInternalServerError, "quota_failed", err.Error())

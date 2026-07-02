@@ -55,19 +55,6 @@ impl DataStore {
         self.allocation_id.lock().clone()
     }
 
-    /// Query the write journal for an allocation. Thin pass-through to
-    /// DataClient — exposed on DataStore so callers holding a `Store` handle
-    /// don't need a second client reference.
-    pub fn journal_query(
-        &self,
-        allocation_id: &str,
-        limit: u32,
-        before_ts_ms: Option<i64>,
-    ) -> anyhow::Result<super::messages::JournalQueryResponse> {
-        self.client
-            .journal_query(allocation_id, limit, before_ts_ms)
-    }
-
     fn virtual_path(&self, path: &str) -> String {
         join_virtual_path(&self.mount_path, path)
     }

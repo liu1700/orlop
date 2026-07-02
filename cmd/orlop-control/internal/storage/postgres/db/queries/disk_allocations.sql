@@ -115,26 +115,6 @@ UPDATE disk_allocations
    AND revoked_at IS NULL
 RETURNING *;
 
--- name: ListGrowableAllocations :many
--- Active, placed, registered allocations that still have room to grow toward
--- their promised ceiling (users.quota_bytes). The storage autoscaler polls this
--- to decide which tenants to expand. Anonymous allocations (user_id IS NULL) are
--- excluded — they bypass server_pool and are ephemeral.
-SELECT
-    da.id          AS allocation_id,
-    da.user_id     AS user_id,
-    da.size_bytes  AS size_bytes,
-    u.quota_bytes  AS ceiling_bytes,
-    COALESCE(da.tenant_id, u.tenant_id) AS tenant_id,
-    sp.ops_addr    AS ops_addr
-FROM disk_allocations da
-JOIN users u        ON u.id = da.user_id
-JOIN server_vms sv  ON sv.tenant_id = COALESCE(da.tenant_id, u.tenant_id)
-JOIN server_pool sp ON sp.data_addr = sv.data_addr
-WHERE da.revoked_at IS NULL
-  AND da.user_id IS NOT NULL
-  AND da.size_bytes < u.quota_bytes;
-
 -- name: MarkAllocationPurged :one
 -- CAS-claim the purge of a revoked allocation: only one caller transitions
 -- purged_at from NULL, so exactly one releases the pool reservation. Fails

@@ -75,8 +75,6 @@ func NewFilesystem(root string) *Filesystem {
 	return &Filesystem{root: root}
 }
 
-func (f *Filesystem) Root() string { return f.root }
-
 func (f *Filesystem) path(key string) string {
 	return filepath.Join(f.root, filepath.FromSlash(key))
 }

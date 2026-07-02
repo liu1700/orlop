@@ -65,10 +65,10 @@ func runSeed(_ context.Context, logger *slog.Logger, cfg Config, opts seedOpts) 
 
 	existing, err := tenant.manifests.Get(opts.virtualPath)
 	var expected uint64
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		expected = existing.Version
-	case err == ErrManifestNotFound:
+	case ErrManifestNotFound:
 		expected = 0
 	default:
 		return fmt.Errorf("manifest get %s: %w", opts.virtualPath, err)

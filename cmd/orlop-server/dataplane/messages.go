@@ -41,14 +41,6 @@ type StatResponse struct {
 	Entry EntryWire `msgpack:"entry"`
 }
 
-type PingRequest struct {
-	Nonce uint64 `msgpack:"nonce"`
-}
-
-type PingResponse struct {
-	Nonce uint64 `msgpack:"nonce"`
-}
-
 type ErrorPayload struct {
 	Errno   int32  `msgpack:"errno"`
 	Message string `msgpack:"message"`
@@ -77,23 +69,19 @@ type RecoveryHint struct {
 	SuggestedAction string      `msgpack:"suggested_action"`
 }
 
-// LastWriter mirrors the Rust struct. `SessionID` is reserved for Pillar 2
-// (issue #102) and stays nil for now.
+// LastWriter mirrors the Rust struct. `AgentID`/`SessionID` are set when the
+// journal names the writer that landed the conflicting version (see the
+// server's buildCasConflictHint) and stay nil otherwise.
 type LastWriter struct {
 	AgentID   *string `msgpack:"agent_id,omitempty"`
 	SessionID *string `msgpack:"session_id,omitempty"`
 	AtUnixMs  int64   `msgpack:"at_unix_ms"`
 }
 
-// Wire-string constants for `RecoveryHint.Kind`. Must stay in sync with the
-// Rust `RecoveryKind` enum's `as_wire_str` mapping.
-const (
-	RecoveryKindCasConflict    = "cas_conflict"
-	RecoveryKindNotFound       = "not_found"
-	RecoveryKindLockHeld       = "lock_held"
-	RecoveryKindReservedName   = "reserved_name"
-	RecoveryKindRevertConflict = "revert_conflict"
-)
+// RecoveryKindCasConflict is the only `RecoveryHint.Kind` the server emits.
+// Mirrors the Rust wire protocol (the `RecoveryKind` enum's `as_wire_str`
+// mapping).
+const RecoveryKindCasConflict = "cas_conflict"
 
 func ErrEIO(msg string) ErrorPayload       { return ErrorPayload{Errno: ErrnoEIO, Message: msg} }
 func ErrEACCES(msg string) ErrorPayload    { return ErrorPayload{Errno: ErrnoEACCES, Message: msg} }

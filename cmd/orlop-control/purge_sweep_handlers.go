@@ -45,9 +45,9 @@ func newPurgeSweepHandlers(logger *slog.Logger, q purgePendingLister, purge allo
 }
 
 func mountPurgeSweep(r chi.Router, svc func(http.Handler) http.Handler, h *purgeSweepHandlers) {
-	for _, prefix := range []string{"", "/api"} {
+	mountBoth(func(prefix string) {
 		r.With(svc).Post(prefix+"/v1/admin/purge-sweep", h.handleSweep)
-	}
+	})
 }
 
 type purgeSweepResponse struct {

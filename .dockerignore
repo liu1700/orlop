@@ -1,9 +1,6 @@
-# Docker build context exclusions. Without this the Rust target/ (29GB) and
-# web/node_modules ship to the daemon on every build.
+# Docker build context exclusions. Without this the Rust target/ (29GB)
+# ships to the daemon on every build.
 target/
-web/node_modules/
-web/.next/
-node_modules/
 .git/
 .worktrees/
 .claude/

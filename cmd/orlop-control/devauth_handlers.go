@@ -48,7 +48,7 @@ const apiTokenTouchInterval = 60 * time.Second
 // resolves Identity from the Authorization header and stores it in the request
 // context.
 //
-// Two token shapes are accepted; both go through bearerToken() so they
+// Two token shapes are accepted; both go through devauth.BearerToken() so they
 // recognise the same header forms (case-insensitive "Bearer", trailing
 // whitespace tolerated):
 //   - "orlop_<base32>": long-lived API token issued via /v1/tokens.
@@ -56,18 +56,11 @@ const apiTokenTouchInterval = 60 * time.Second
 //     revoked, or belongs to a suspended user or suspended tenant.
 //   - everything else: a per-pod agent-scoped enroll token
 //     (devauth.PurposeAgentEnroll, minted by IssueAgentEnrollToken),
-//     validated by devauth.Service.
+//     validated by svc.AuthenticateEnrollBearer.
 func RequireEnrollBearer(svc *devauth.Service, store storage.APITokenStore) func(http.Handler) http.Handler {
-	return requireBearer(store, svc.AuthenticateEnrollBearer)
-}
-
-// requireBearer is the shared body for the bearer middleware. authenticate
-// validates the OAuth-style (non-"orlop_") token and resolves an Identity; the
-// API-token ("orlop_") shape is handled here.
-func requireBearer(store storage.APITokenStore, authenticate func(context.Context, string) (devauth.Identity, error)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			raw := bearerToken(r.Header.Get("Authorization"))
+			raw := devauth.BearerToken(r.Header.Get("Authorization"))
 			if strings.HasPrefix(raw, tokens.Prefix) {
 				auth, err := store.GetAPITokenByHash(r.Context(), tokens.Hash(raw))
 				if err != nil || auth.Revoked {
@@ -106,7 +99,7 @@ func requireBearer(store storage.APITokenStore, authenticate func(context.Contex
 			}
 
 			// OAuth-style bearer (existing path).
-			ident, err := authenticate(r.Context(), r.Header.Get("Authorization"))
+			ident, err := svc.AuthenticateEnrollBearer(r.Context(), r.Header.Get("Authorization"))
 			if err != nil {
 				// Distinguish suspension causes so callers can show a
 				// precise message — matches the contract added by #160
@@ -173,13 +166,6 @@ func adminIdentity(r *http.Request, svc *devauth.Service) (devauth.Identity, err
 	return svc.AuthenticateAdminSession(r.Context(), c.Value)
 }
 
-// adminOrBearerIdentity resolves the dashboard cookie. It is named for the
-// historical CLI-bearer fallback that is now retired; the device-flow bearer
-// path is gone, so only the admin-session cookie is accepted.
-func adminOrBearerIdentity(r *http.Request, svc *devauth.Service) (devauth.Identity, error) {
-	return adminIdentity(r, svc)
-}
-
 func (h *devAuthHandlers) setAdminCookie(w http.ResponseWriter, r *http.Request, value string, maxAge int) {
 	http.SetCookie(w, h.adminCookie(r, value, maxAge))
 }
@@ -198,14 +184,6 @@ func (h *devAuthHandlers) adminCookie(r *http.Request, value string, maxAge int)
 		c.Domain = h.cookieDomain
 	}
 	return c
-}
-
-func bearerToken(header string) string {
-	const prefix = "Bearer "
-	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
-		return ""
-	}
-	return strings.TrimSpace(header[len(prefix):])
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

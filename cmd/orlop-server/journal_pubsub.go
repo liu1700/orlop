@@ -5,17 +5,16 @@ import (
 	"sync"
 )
 
-// journalSub is one subscriber's delivery handle: a buffered channel and the
-// context that bounds its lifetime. Bufferring (cap 64) absorbs short
-// consumer stalls; a full channel is the signal to drop the subscriber per
-// the spec's "bounded loss + browser reconnect/backfill" model.
+// journalSub is one subscriber's delivery handle: a buffered channel.
+// Buffering (cap 64) absorbs short consumer stalls; a full channel is the
+// signal to drop the subscriber per the spec's "bounded loss + browser
+// reconnect/backfill" model.
 //
 // closeOnce funnels the three close paths (explicit unsub, ctx-cancel,
 // slow-consumer drop) through a single close so a channel is never closed
 // twice.
 type journalSub struct {
 	ch        chan SessionJournalEntry
-	ctx       context.Context
 	closeOnce sync.Once
 }
 
@@ -43,10 +42,7 @@ func newJournalPubSub() *journalPubSub {
 // the unsubscribe func, by the ctx-cancel watchdog, or by the slow-consumer
 // drop path. Calling the returned unsub more than once is safe.
 func (p *journalPubSub) Subscribe(ctx context.Context, allocID string) (<-chan SessionJournalEntry, func()) {
-	sub := &journalSub{
-		ch:  make(chan SessionJournalEntry, journalSubBuffer),
-		ctx: ctx,
-	}
+	sub := &journalSub{ch: make(chan SessionJournalEntry, journalSubBuffer)}
 
 	p.mu.Lock()
 	p.subs[allocID] = append(p.subs[allocID], sub)

@@ -5,12 +5,12 @@
 //! `ChunkCache::get` hash-verifies on every hit; mismatches are deleted,
 //! audited (`cache_corrupt`), and reported as a miss so the caller refetches.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 
 use crate::audit::AuditLog;
 
@@ -22,21 +22,6 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS chunks_last_access ON chunks(last_access);
 "#;
-
-#[derive(Debug, Clone, Copy)]
-pub struct CacheStats {
-    pub count: u64,
-    pub total_bytes: u64,
-    pub max_bytes: u64,
-}
-
-/// Result of `prune_dry_run`: the LRU-ordered list of `(hash, size)` pairs
-/// that *would* be evicted to bring total usage under low-water, without
-/// mutating any state on disk or in the index.
-pub struct DryRunPlan {
-    pub would_evict: Vec<(Vec<u8>, u64)>,
-    pub bytes_freed: u64,
-}
 
 pub struct ChunkCache {
     root: PathBuf,
@@ -77,10 +62,6 @@ impl ChunkCache {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
             .map(|base| base.join("orlop"))
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     fn chunk_path(&self, hash: &[u8]) -> PathBuf {
@@ -170,30 +151,6 @@ impl ChunkCache {
         Ok(n as u64)
     }
 
-    pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
-    }
-
-    pub fn stats(&self) -> Result<CacheStats> {
-        let db = self.db.lock();
-        let (count, total): (i64, i64) = db.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM chunks",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok(CacheStats {
-            count: count as u64,
-            total_bytes: total as u64,
-            max_bytes: self.max_bytes,
-        })
-    }
-
-    /// Evict least-recently-used chunks until `total_bytes <= max_bytes`.
-    /// Returns the number of evictions. Delegates to `prune_to_target`.
-    pub fn prune(&self) -> Result<u64> {
-        self.prune_to_target(self.max_bytes, "high_water")
-    }
-
     /// Low-water mark: evict down to this size to avoid churn at the boundary.
     /// Currently fixed at 90% of `max_bytes`. If churn becomes a concern,
     /// promote this to a config field.
@@ -207,65 +164,38 @@ impl ChunkCache {
         self.prune_to_target(self.low_water_bytes(), "low_water")
     }
 
-    /// Compute the eviction plan that `prune_to_low_water` *would* produce,
-    /// without removing any files or mutating the index. Useful for
-    /// reporting / debugging cache pressure.
-    pub fn prune_dry_run(&self) -> Result<DryRunPlan> {
-        let target = self.low_water_bytes();
-        let mut total = self.total_bytes()?;
-        let mut would_evict: Vec<(Vec<u8>, u64)> = Vec::new();
-        let mut bytes_freed: u64 = 0;
-        if total <= target {
-            return Ok(DryRunPlan {
-                would_evict,
-                bytes_freed,
-            });
-        }
-        let db = self.db.lock();
-        let mut stmt =
-            db.prepare("SELECT hash, size FROM chunks ORDER BY last_access ASC, hash ASC")?;
-        let rows = stmt.query_map([], |r| {
-            let h: Vec<u8> = r.get(0)?;
-            let size: i64 = r.get(1)?;
-            Ok((h, size as u64))
-        })?;
-        for row in rows {
-            let (h, size) = row?;
-            if total <= target {
-                break;
-            }
-            bytes_freed = bytes_freed.saturating_add(size);
-            total = total.saturating_sub(size);
-            would_evict.push((h, size));
-        }
-        Ok(DryRunPlan {
-            would_evict,
-            bytes_freed,
-        })
-    }
-
     fn prune_to_target(&self, target: u64, reason: &str) -> Result<u64> {
         let mut total = self.total_bytes()?;
+        // One LRU-ordered scan picks every victim up front, instead of a
+        // SELECT ... LIMIT 1 + DELETE round-trip per evicted row.
+        let victims: Vec<(Vec<u8>, u64)> = {
+            let db = self.db.lock();
+            let mut stmt =
+                db.prepare("SELECT hash, size FROM chunks ORDER BY last_access ASC, hash ASC")?;
+            let rows = stmt.query_map([], |r| {
+                let h: Vec<u8> = r.get(0)?;
+                let size: i64 = r.get(1)?;
+                Ok((h, size as u64))
+            })?;
+            let mut victims = Vec::new();
+            for row in rows {
+                if total <= target {
+                    break;
+                }
+                let (hash, size) = row?;
+                total = total.saturating_sub(size);
+                victims.push((hash, size));
+            }
+            victims
+        };
         let mut evicted = 0u64;
         let mut bytes_freed = 0u64;
-        while total > target {
-            let row: Option<(Vec<u8>, i64)> = self
-                .db
-                .lock()
-                .query_row(
-                    "SELECT hash, size FROM chunks ORDER BY last_access ASC, hash ASC LIMIT 1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((hash, size)) = row else { break };
-            let path = self.chunk_path(&hash);
-            let _ = std::fs::remove_file(&path);
+        for (hash, size) in victims {
+            let _ = std::fs::remove_file(self.chunk_path(&hash));
             self.db
                 .lock()
                 .execute("DELETE FROM chunks WHERE hash = ?", params![hash])?;
-            total = total.saturating_sub(size as u64);
-            bytes_freed = bytes_freed.saturating_add(size as u64);
+            bytes_freed = bytes_freed.saturating_add(size);
             evicted += 1;
         }
         if let Some(audit) = self.audit.as_ref().filter(|_| evicted > 0) {
@@ -295,9 +225,11 @@ impl ChunkCache {
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{:02x}", b));
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
     }
     out
 }
@@ -316,9 +248,9 @@ mod tests {
     #[test]
     fn open_creates_root_and_db() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::open(dir.path().to_path_buf(), 1024 * 1024, None).unwrap();
-        assert!(cache.root().join("chunks").is_dir());
-        assert!(cache.root().join("index.sqlite").is_file());
+        let _cache = ChunkCache::open(dir.path().to_path_buf(), 1024 * 1024, None).unwrap();
+        assert!(dir.path().join("chunks").is_dir());
+        assert!(dir.path().join("index.sqlite").is_file());
     }
 
     #[test]
@@ -352,24 +284,21 @@ mod tests {
     }
 
     #[test]
-    fn stats_returns_total_and_count() {
+    fn total_bytes_sums_all_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let cache = ChunkCache::open(dir.path().to_path_buf(), 1024, None).unwrap();
         let a = b"aaa".to_vec();
         let b = b"bbbb".to_vec();
         cache.put(blake3::hash(&a).as_bytes(), &a).unwrap();
         cache.put(blake3::hash(&b).as_bytes(), &b).unwrap();
-        let s = cache.stats().unwrap();
-        assert_eq!(s.count, 2);
-        assert_eq!(s.total_bytes, 7);
-        assert_eq!(s.max_bytes, 1024);
+        assert_eq!(cache.total_bytes().unwrap(), 7);
     }
 
     #[test]
-    fn prune_evicts_lru_until_under_max() {
+    fn prune_to_target_evicts_lru_until_under_target() {
         let dir = tempfile::tempdir().unwrap();
-        // Cap = 5 bytes; we'll insert three 3-byte chunks → 9 bytes total.
-        let cache = ChunkCache::open(dir.path().to_path_buf(), 5, None).unwrap();
+        // Target = 5 bytes; we'll insert three 3-byte chunks → 9 bytes total.
+        let cache = ChunkCache::open(dir.path().to_path_buf(), 1024, None).unwrap();
         let a = b"aaa".to_vec();
         let b = b"bbb".to_vec();
         let c = b"ccc".to_vec();
@@ -383,7 +312,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         cache.put(hc.as_bytes(), &c).unwrap();
 
-        let evicted = cache.prune().unwrap();
+        let evicted = cache.prune_to_target(5, "test").unwrap();
         assert!(evicted >= 1, "expected at least one eviction");
         assert!(cache.total_bytes().unwrap() <= 5);
         // Most recently used (c) must survive.
@@ -409,12 +338,8 @@ mod tests {
             hashes.push(*h.as_bytes());
         }
         let evicted = cache.prune_to_low_water().unwrap();
-        let after = cache.stats().unwrap();
-        assert!(
-            after.total_bytes <= 921,
-            "total {} > low_water 921",
-            after.total_bytes
-        );
+        let after = cache.total_bytes().unwrap();
+        assert!(after <= 921, "total {after} > low_water 921");
         assert!(evicted >= 1, "expected at least 1 eviction, got {evicted}");
         // The first-inserted chunk (oldest last_access) goes first.
         assert!(
@@ -433,31 +358,6 @@ mod tests {
         let evicted = cache.prune_to_low_water().unwrap();
         assert_eq!(evicted, 0);
         assert!(cache.get(h.as_bytes()).unwrap().is_some());
-    }
-
-    #[test]
-    fn prune_dry_run_does_not_modify_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::open(dir.path().to_path_buf(), 1024, None).unwrap();
-        let payloads = ["x", "y", "z"].map(|s| s.repeat(400).into_bytes());
-        for p in &payloads {
-            let h = blake3::hash(p);
-            cache.put(h.as_bytes(), p).unwrap();
-        }
-        let before = cache.stats().unwrap();
-        let plan = cache.prune_dry_run().unwrap();
-        let after = cache.stats().unwrap();
-        assert_eq!(before.count, after.count, "dry-run mutated row count");
-        assert_eq!(
-            before.total_bytes, after.total_bytes,
-            "dry-run mutated bytes"
-        );
-        assert!(
-            !plan.would_evict.is_empty(),
-            "dry-run reported no evictions for over-quota cache"
-        );
-        let total_planned: u64 = plan.would_evict.iter().map(|(_, n)| *n).sum();
-        assert_eq!(total_planned, plan.bytes_freed);
     }
 
     #[test]

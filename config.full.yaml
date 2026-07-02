@@ -1,8 +1,7 @@
 mountpoint: /tmp/orlop
 audit_log: ./audit.log
 cache:
-  max_entries: 128
-  ttl_seconds: 300
+  write_buffer_bytes: 67108864
 policy:
   readonly: true
   deny:

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::anyhow;
 
 use crate::backend::dataplane::messages::RecoveryHint;
-use crate::config::{MountConfig, MountKind};
+use crate::config::MountConfig;
 use crate::policy::Policy;
 
 #[path = "backend/tls.rs"]
@@ -45,7 +45,6 @@ pub struct Entry {
 }
 
 pub struct MountedStore {
-    pub name: String,
     pub mount_name: String,
     pub policy: Policy,
     pub store: Arc<dyn crate::store::Store>,
@@ -80,40 +79,35 @@ pub fn build_stores(
                 format!("/{}", mount_name)
             };
 
-            let (store, leases) = match cfg.kind {
-                MountKind::Remote => {
-                    let addr = cfg
-                        .addr
-                        .clone()
-                        .ok_or_else(|| anyhow!("remote mount {} requires addr", cfg.name))?;
-                    let server_name = cfg
-                        .server_name
-                        .clone()
-                        .or_else(|| host_part(&addr).map(str::to_string))
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "remote mount {}: cannot derive server_name from addr {}",
-                                cfg.name,
-                                addr
-                            )
-                        })?;
-                    let tls_id = tls.cloned().ok_or_else(|| {
-                        anyhow!("remote mount {} requires a TLS identity", cfg.name)
-                    })?;
-                    let dp_cfg = dataplane::DataClientConfig::new(addr, server_name, tls_id);
-                    let client = Arc::new(dataplane::DataClient::new(dp_cfg)?);
-                    let leases = Some(crate::lease::LeaseManager::new(Arc::clone(&client)));
-                    let store: Arc<dyn crate::store::Store> = Arc::new(dataplane::DataStore::new(
-                        client,
-                        server_prefix.clone(),
-                        Arc::clone(&chunk_cache),
-                    ));
-                    (store, leases)
-                }
-            };
+            // Every mount is remote — the data plane is the only backend.
+            let addr = cfg
+                .addr
+                .clone()
+                .ok_or_else(|| anyhow!("remote mount {} requires addr", cfg.name))?;
+            let server_name = cfg
+                .server_name
+                .clone()
+                .or_else(|| host_part(&addr).map(str::to_string))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "remote mount {}: cannot derive server_name from addr {}",
+                        cfg.name,
+                        addr
+                    )
+                })?;
+            let tls_id = tls
+                .cloned()
+                .ok_or_else(|| anyhow!("remote mount {} requires a TLS identity", cfg.name))?;
+            let dp_cfg = dataplane::DataClientConfig::new(addr, server_name, tls_id)?;
+            let client = Arc::new(dataplane::DataClient::new(dp_cfg)?);
+            let leases = Some(crate::lease::LeaseManager::new(Arc::clone(&client)));
+            let store: Arc<dyn crate::store::Store> = Arc::new(dataplane::DataStore::new(
+                client,
+                server_prefix,
+                Arc::clone(&chunk_cache),
+            ));
 
             Ok(MountedStore {
-                name: cfg.name.clone(),
                 mount_name,
                 policy: Policy::with_readonly(&cfg.allow, &cfg.deny, cfg.readonly)?,
                 store,

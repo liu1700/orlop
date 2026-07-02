@@ -1,5 +1,4 @@
-#[path = "fs/assemble.rs"]
-pub(crate) mod assemble;
+use crate::assemble;
 
 use crate::write_handle;
 
@@ -776,7 +775,7 @@ impl Filesystem for GatewayFs {
                 );
                 self.record(
                     req,
-                    "lookup",
+                    event::LOOKUP,
                     &format!("/{}", mount.mount_name),
                     None,
                     None,
@@ -1621,7 +1620,7 @@ impl Filesystem for GatewayFs {
                 for wh_arc in handles {
                     let mut wh = wh_arc.lock();
                     if wh.dirty {
-                        let _ = wh.flush_now(store);
+                        let _ = wh.flush(store);
                     }
                     wh.lease = None;
                     wh.cached = false;
@@ -1932,7 +1931,7 @@ impl Filesystem for GatewayFs {
             }
         };
         let rel = join_rel(&parent_node.rel_path, name);
-        let full = join_rel(&parent_node.full_path, name);
+        let full = join_full(&parent_node.full_path, name);
 
         if !self.mounts[mount_idx].policy.permits_write(&rel) {
             self.audit

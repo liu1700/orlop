@@ -145,9 +145,9 @@ func (s *Service) IssueAdminSession(ctx context.Context, userID pgtype.UUID, ten
 // AuthenticateEnrollBearer validates a bearer for the /agent/enroll route. It
 // accepts a per-pod agent-scoped enroll token (PurposeAgentEnroll) minted by
 // IssueAgentEnrollToken. The orthogonal `orlop_` API-token branch is handled in
-// requireBearer.
+// RequireEnrollBearer.
 func (s *Service) AuthenticateEnrollBearer(ctx context.Context, header string) (Identity, error) {
-	raw := bearerToken(header)
+	raw := BearerToken(header)
 	return s.authenticateRaw(ctx, raw, PurposeAgentEnroll)
 }
 
@@ -193,7 +193,7 @@ func (s *Service) IssueAgentEnrollToken(ctx context.Context, userID pgtype.UUID,
 //
 // The underlying UPDATE matches only purpose='agent_enroll' rows.
 func (s *Service) ConsumeAgentEnrollToken(ctx context.Context, header string) (bool, error) {
-	raw := bearerToken(header)
+	raw := BearerToken(header)
 	if raw == "" {
 		return false, ErrBearerMissing
 	}
@@ -201,9 +201,8 @@ func (s *Service) ConsumeAgentEnrollToken(ctx context.Context, header string) (b
 }
 
 // authenticateRaw resolves an Identity from an opaque token, requiring the
-// stored purpose to match one of acceptedPurposes. Passing a single purpose
-// preserves exact-equality semantics; passing more than one accepts any of them.
-func (s *Service) authenticateRaw(ctx context.Context, raw string, acceptedPurposes ...string) (Identity, error) {
+// stored purpose to equal purpose.
+func (s *Service) authenticateRaw(ctx context.Context, raw, purpose string) (Identity, error) {
 	if raw == "" {
 		return Identity{}, ErrBearerMissing
 	}
@@ -214,14 +213,7 @@ func (s *Service) authenticateRaw(ctx context.Context, raw string, acceptedPurpo
 	if err != nil {
 		return Identity{}, err
 	}
-	purposeOK := false
-	for _, p := range acceptedPurposes {
-		if row.Purpose == p {
-			purposeOK = true
-			break
-		}
-	}
-	if !purposeOK {
+	if row.Purpose != purpose {
 		return Identity{}, ErrTokenWrongPurpose
 	}
 	if row.Revoked {
@@ -266,7 +258,10 @@ func hashCode(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func bearerToken(header string) string {
+// BearerToken extracts the raw token from an "Authorization: Bearer <token>"
+// header value ("" when absent or malformed). "Bearer" is matched
+// case-insensitively and trailing whitespace is tolerated.
+func BearerToken(header string) string {
 	const prefix = "Bearer "
 	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
 		return ""

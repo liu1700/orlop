@@ -246,10 +246,7 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 	}
 
 	// 5. Upsert manifest row (CAS-guarded as before).
-	blob, err := packChunks(mf.Chunks)
-	if err != nil {
-		return 0, err
-	}
+	blob := packChunks(mf.Chunks)
 	if expectedVersion == 0 {
 		// Insert; conflict if path already exists. New file: take owner from the
 		// supplied manifest (default 0/0); seed atime from the manifest's atime
@@ -318,14 +315,9 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 	return newVersion, nil
 }
 
-// Delete removes the manifest for p using CAS semantics on expectedVersion.
-// Returns ErrManifestNotFound if the path does not exist, ErrVersionConflict
-// if expectedVersion does not match the stored version. On success chunk
-// refcounts are decremented atomically.
-//
-// When sessionID is non-empty the prior manifest is captured in the journal
-// so a later revert can restore it. agentID names the writer on the journal
-// row (see Put for context).
+// deleteSymlink removes the symlinks row (and its dir_entry) for p. Returns
+// ErrManifestNotFound when no symlink exists at p, so Delete can fall through
+// to the manifest path.
 func (m *ManifestStore) deleteSymlink(p string) error {
 	tx, err := m.db.Begin()
 	if err != nil {
@@ -348,6 +340,14 @@ func (m *ManifestStore) deleteSymlink(p string) error {
 	return tx.Commit()
 }
 
+// Delete removes the manifest for p using CAS semantics on expectedVersion.
+// Returns ErrManifestNotFound if the path does not exist, ErrVersionConflict
+// if expectedVersion does not match the stored version. On success chunk
+// refcounts are decremented atomically.
+//
+// When sessionID is non-empty the prior manifest is captured in the journal
+// so a later revert can restore it. agentID names the writer on the journal
+// row (see Put for context).
 func (m *ManifestStore) Delete(p string, expectedVersion uint64, sessionID, allocationID, agentID string) error {
 	if sessionID != "" && allocationID == "" {
 		return fmt.Errorf("manifest_delete: empty allocation_id required")
@@ -1428,7 +1428,7 @@ func splitParentName(p string) (string, string) {
 	return parent, name
 }
 
-func packChunks(chunks []ChunkRef) ([]byte, error) {
+func packChunks(chunks []ChunkRef) []byte {
 	out := make([]byte, len(chunks)*chunkRefSize)
 	for i, c := range chunks {
 		off := i * chunkRefSize
@@ -1436,7 +1436,7 @@ func packChunks(chunks []ChunkRef) ([]byte, error) {
 		binary.BigEndian.PutUint64(out[off+HashLen:off+HashLen+8], c.Offset)
 		binary.BigEndian.PutUint32(out[off+HashLen+8:off+HashLen+8+4], c.Len)
 	}
-	return out, nil
+	return out
 }
 
 // PutWithLeaseCheck wraps Put with session_id authenticity validation.

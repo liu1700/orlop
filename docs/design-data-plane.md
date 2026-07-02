@@ -302,7 +302,8 @@ never travel as a single frame; they are chunk fetches, capped by
 **Transport carrier.** The server always listens on both TCP and QUIC on the
 same bind (`runV2TCPListener` + `runV2QUICListener`). The client's
 `TransportMode` defaults to **`Tcp`**; `Quic` and `Auto` (try QUIC, fall back
-to TCP, remember the choice) are opt-in. So: **TCP+TLS is the default; QUIC is
+to TCP, remember the choice) are opt-in via `ORLOP_TRANSPORT=quic|auto` on the
+mount client. So: **TCP+TLS is the default; QUIC is
 implemented but opt-in.** The carrier is just a pipe: the orlop binary frame
 format above is identical over either, so QUIC is not an HTTP/3 protocol, only
 a different socket. QUIC stays in the tree because it offers stream

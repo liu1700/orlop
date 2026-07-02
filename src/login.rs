@@ -9,8 +9,8 @@
 //! exchange) and dropped here for the mount engine to consume.
 
 use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -136,32 +136,7 @@ pub fn save(path: &Path, creds: &Credentials) -> anyhow::Result<()> {
         tighten_parent_perms(parent)?;
     }
     let body = serde_json::to_vec_pretty(creds).context("serialize credentials")?;
-    let tmp = tmp_path(path);
-    {
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("open {}", tmp.display()))?;
-        f.write_all(&body)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("credentials.json"));
-    name.push(".tmp");
-    path.with_file_name(name)
+    util::write_secret_atomic(path, &body)
 }
 
 #[derive(Deserialize)]
@@ -318,7 +293,7 @@ impl TokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicU64, Ordering};

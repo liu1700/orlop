@@ -47,10 +47,6 @@ func (f *fakeServerAdmin) callCount() int {
 	return len(f.calls)
 }
 
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
 // seedReservePool creates a tenant row and a server_pool row, returns the pool row.
 // Tests pass a single host name; data_addr and ops_addr are derived as
 // "data-<host>" and "ops-<host>" so assertions can distinguish them.

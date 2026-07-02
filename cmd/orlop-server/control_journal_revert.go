@@ -33,7 +33,7 @@ type controlJournalRevertRequest struct {
 // controlJournalRevertResponse mirrors the wire shape of the public
 // /api/v1/journal/revert endpoint orlop-control fronts (spec §3.1).
 type controlJournalRevertResponse struct {
-	Ok       bool                  `json:"ok"`
+	Ok       bool                   `json:"ok"`
 	Conflict *controlRevertConflict `json:"conflict,omitempty"`
 }
 

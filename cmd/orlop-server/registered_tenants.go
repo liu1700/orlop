@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 // registeredTenant is one entry in registered_tenants.json.
@@ -40,15 +41,18 @@ func loadRegisteredTenants(path string) ([]registeredTenant, error) {
 }
 
 // mutateRegisteredTenants is the shared load → mutate → atomic-rename core.
-// Returns mutator's `next` slice; if it returns the same slice (by length AND
-// content equality at the ID level) the file is not rewritten.
+// If mutate leaves the entries unchanged (full-struct equality), the file is
+// not rewritten.
 func mutateRegisteredTenants(path string, mutate func([]registeredTenant) []registeredTenant) error {
 	existing, err := loadRegisteredTenants(path)
 	if err != nil {
 		return err
 	}
+	// Snapshot before mutating: mutators edit the slice in place, so comparing
+	// against the live slice would always report "unchanged".
+	before := slices.Clone(existing)
 	next := mutate(existing)
-	if registeredTenantsEqual(existing, next) {
+	if slices.Equal(before, next) {
 		return nil
 	}
 
@@ -68,18 +72,6 @@ func mutateRegisteredTenants(path string, mutate func([]registeredTenant) []regi
 		return fmt.Errorf("rename: %w", err)
 	}
 	return nil
-}
-
-func registeredTenantsEqual(a, b []registeredTenant) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].ID != b[i].ID {
-			return false
-		}
-	}
-	return true
 }
 
 // appendRegisteredTenant inserts rt or, if an entry with the same ID exists,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -14,24 +15,9 @@ import (
 )
 
 // journalQuerier is the subset of the orlop-server journal API this handler
-// needs. Defined as an interface so tests can inject a fake without standing
-// up an mTLS server.
-//
-// QueryJournal returns entries (newest-first), the opaque next-page cursor
-// ("" if no more pages), and an error. Pass "" as cursor for the first page.
-// allocationID may be empty to return the merged feed across all of the
-// caller's tenant's allocations. limit is already clamped by the caller.
-//
-// QueryJournalAfterSeq is the reconnect/backfill counterpart: ascending-seq
-// rows with seq > afterSeq. allocationID is required.
-//
-// StreamJournal opens an SSE pipe to orlop-server. The returned channel
-// delivers JournalEntryJSON until ctx is cancelled or the underlying body
-// closes; the close-on-exit contract is the WS handler's signal to
-// terminate.
-//
-// RevertPath issues a single (path, seq) revert. Ok=true on success;
-// Ok=false carries a machine-readable conflict reason (see spec §3.4).
+// needs — an interface so tests can inject a fake without an mTLS server.
+// StreamJournal's channel closing (ctx cancel or upstream EOF) is the WS
+// handler's signal to terminate.
 type journalQuerier interface {
 	QueryJournal(ctx context.Context, tenantID, allocationID string, limit uint32, cursor string) ([]journalEntryJSON, string, error)
 	QueryJournalAfterSeq(ctx context.Context, tenantID, allocationID string, limit uint32, afterSeq uint64) ([]journalEntryJSON, error)
@@ -96,17 +82,17 @@ func newJournalHandlers(svc *devauth.Service, alloc *allocations.Service, q jour
 // mountJournal registers routes on both bare and /api-prefixed paths,
 // matching the convention used by mountDashboard and mountAPITokens.
 func mountJournal(r chi.Router, h *journalHandlers) {
-	for _, prefix := range []string{"", "/api"} {
+	mountBoth(func(prefix string) {
 		r.Get(prefix+"/v1/journal", h.handleJournal)
 		r.Post(prefix+"/v1/journal/revert", h.handleJournalRevert)
 		r.Get(prefix+"/v1/journal/stream", h.handleJournalStream)
-	}
+	})
 }
 
 func (h *journalHandlers) handleJournal(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
-	ident, err := adminOrBearerIdentity(r, h.devAuth)
+	ident, err := adminIdentity(r, h.devAuth)
 	if err != nil {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 		return
@@ -135,7 +121,7 @@ func (h *journalHandlers) handleJournal(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if _, err := h.alloc.GetForUser(r.Context(), allocUUID, ident.UserID); err != nil {
-			writeAllocOwnershipError(w, err)
+			writeAllocOwnershipError(w, err, nil, "")
 			return
 		}
 	}
@@ -228,7 +214,7 @@ func (h *journalHandlers) handleJournalRevert(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	ident, err := adminOrBearerIdentity(r, h.devAuth)
+	ident, err := adminIdentity(r, h.devAuth)
 	if err != nil {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "")
 		return
@@ -240,7 +226,7 @@ func (h *journalHandlers) handleJournalRevert(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if _, err := h.alloc.GetForUser(r.Context(), allocUUID, ident.UserID); err != nil {
-		writeAllocOwnershipError(w, err)
+		writeAllocOwnershipError(w, err, nil, "")
 		return
 	}
 
@@ -265,17 +251,22 @@ func revertResultJSON(r revertResult) journalRevertResponseJSON {
 }
 
 // writeAllocOwnershipError maps an allocations.Service lookup error into the
-// canonical OAuth-shaped response. Collapses the three "user can't see this
+// canonical OAuth-shaped response. Collapses the "user can't see this
 // allocation" paths to 404 (don't leak that another user owns it) and
-// 410 Gone for revoked-but-known allocations. Used by every journal
-// handler that calls alloc.GetForUser.
-func writeAllocOwnershipError(w http.ResponseWriter, err error) {
+// 410 Gone for revoked-but-known allocations. Used by every handler that
+// calls alloc.GetForUser (and the revoke/unmount ops with the same error
+// surface). Unexpected errors are 500s, logged under msg with the given
+// fields when logger is non-nil.
+func writeAllocOwnershipError(w http.ResponseWriter, err error, logger *slog.Logger, msg string, fields ...any) {
 	switch {
 	case errors.Is(err, allocations.ErrNotFound), errors.Is(err, allocations.ErrWrongUser):
 		writeOAuthError(w, http.StatusNotFound, "not_found", "")
 	case errors.Is(err, allocations.ErrRevoked):
 		writeOAuthError(w, http.StatusGone, "revoked", "")
 	default:
+		if logger != nil {
+			logger.Error(msg, append([]any{"error", err}, fields...)...)
+		}
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 	}
 }

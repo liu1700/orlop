@@ -102,6 +102,18 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	initialGrantBytes, err := parseInt64Env("ORLOP_INITIAL_GRANT_BYTES", agentDiskInitialGrantBytes)
+	if err != nil {
+		return config{}, err
+	}
+	serverCertTTL, err := parseDurationEnv("ORLOP_DATAGW_SERVER_CERT_TTL", defaultServerCertTTL)
+	if err != nil {
+		return config{}, err
+	}
+	apiTokenTTL, err := parseDurationEnv("ORLOP_API_TOKEN_TTL", 0)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
 		Addr:                  ":" + port,
 		DatabaseURL:           os.Getenv("DATABASE_URL"),
@@ -113,10 +125,10 @@ func loadConfig() (config, error) {
 		OrgName:               getenv("ORLOP_ORG_NAME", "ORL"),
 		CookieDomain:          os.Getenv("ORLOP_COOKIE_DOMAIN"),
 		ControlPlaneToken:     os.Getenv("ORLOP_CONTROL_PLANE_TOKEN"),
-		InitialGrantBytes:     atoi64Or(os.Getenv("ORLOP_INITIAL_GRANT_BYTES"), agentDiskInitialGrantBytes),
+		InitialGrantBytes:     initialGrantBytes,
 		ServerCertFQDN:        getenv("ORLOP_DATAGW_SERVER_FQDN", defaultServerCertFQDN),
-		ServerCertTTL:         parseDurationOr(os.Getenv("ORLOP_DATAGW_SERVER_CERT_TTL"), defaultServerCertTTL),
-		APITokenTTL:           parseDurationOr(os.Getenv("ORLOP_API_TOKEN_TTL"), 0),
+		ServerCertTTL:         serverCertTTL,
+		APITokenTTL:           apiTokenTTL,
 
 		IdentityIssuer:          os.Getenv("ORLOP_IDENTITY_ISSUER"),
 		IdentityAudience:        os.Getenv("ORLOP_IDENTITY_AUDIENCE"),
@@ -195,39 +207,33 @@ func checkCASecretsAtRest(cfg config, logger *slog.Logger) error {
 	return nil
 }
 
-func parseDurationOr(s string, fallback time.Duration) time.Duration {
+// parseDurationEnv parses a duration env var. An unset/blank value yields
+// fallback; a set-but-malformed (or non-positive) value is an ERROR rather
+// than a silent fallback, matching parseBoolEnv's philosophy.
+func parseDurationEnv(key string, fallback time.Duration) (time.Duration, error) {
+	s := strings.TrimSpace(os.Getenv(key))
 	if s == "" {
-		return fallback
+		return fallback, nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil || d <= 0 {
-		return fallback
+		return 0, fmt.Errorf("%s: invalid duration %q (use a positive Go duration like \"2160h\")", key, s)
 	}
-	return d
+	return d, nil
 }
 
-func atoi64Or(s string, fallback int64) int64 {
+// parseInt64Env parses an integer env var, with the same unset-vs-malformed
+// contract as parseDurationEnv.
+func parseInt64Env(key string, fallback int64) (int64, error) {
+	s := strings.TrimSpace(os.Getenv(key))
 	if s == "" {
-		return fallback
+		return fallback, nil
 	}
 	v, err := strconv.ParseInt(s, 10, 64)
 	if err != nil || v <= 0 {
-		return fallback
+		return 0, fmt.Errorf("%s: invalid value %q (use a positive integer)", key, s)
 	}
-	return v
-}
-
-// parseFloatFractionOr parses a ratio in (0,1]; anything malformed or out of
-// range falls back (a 0 or >1 autoscale threshold would be nonsensical).
-func parseFloatFractionOr(s string, fallback float64) float64 {
-	if s == "" {
-		return fallback
-	}
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil || v <= 0 || v > 1 {
-		return fallback
-	}
-	return v
+	return v, nil
 }
 
 func getenv(key, fallback string) string {
@@ -482,10 +488,6 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		go deps.certRevReconcile.Run(ctx)
 	}
 
-	// (Storage auto-grow removed: an account's disk is a fixed budget — included +
-	// purchased — enforced as one shared JuiceFS quota on the owner tenant dir, set at
-	// placement and on the buy path. No usage-watermark growth.)
-
 	errs := make(chan error, 1)
 	go func() {
 		logger.Info("starting orlop-control",
@@ -576,6 +578,18 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	}
 
 	return router
+}
+
+// mountBoth invokes register once per path root: bare ("") and "/api". Direct
+// callers (CLI, tests, healthchecks) hit the bare path — the Next.js web app's
+// /api/[...path] proxy strips the /api/ prefix before forwarding, so the bare
+// mount is the one the proxy actually reaches. The /api-prefixed mount lets a
+// browser hit the control plane directly without going through the proxy
+// (integration tests, the hosted-staging admin runbook).
+func mountBoth(register func(prefix string)) {
+	for _, prefix := range []string{"", "/api"} {
+		register(prefix)
+	}
 }
 
 // buildHostIdentityVerifier constructs the Mode B JWT verifier from config.

@@ -11,7 +11,6 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPO_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
 IMAGE="${PJDFS_IMAGE:-orlop-pjdfstest-rig:latest}"
 RESULTS_HOST_DIR="${RESULTS_HOST_DIR:-$ROOT_DIR/pjdfstest-results}"
 
@@ -25,7 +24,7 @@ docker run --rm \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
   --security-opt apparmor=unconfined \
-  -v "$REPO_ROOT:/src" \
+  -v "$ROOT_DIR:/src" \
   -v orlop-pjdfs-cargo-registry:/usr/local/cargo/registry \
   -v orlop-pjdfs-cargo-target:/build/target \
   -v orlop-pjdfs-gocache:/root/.cache/go-build \

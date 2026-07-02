@@ -151,6 +151,7 @@ A `client.Fake` in-memory implementation is provided for consumer tests.
 | Doc | What's inside |
 |---|---|
 | [`standalone-quickstart.md`](docs/standalone-quickstart.md) | Run the whole thing on one host with `orlop dev up` |
+| [`advanced-usage.md`](docs/advanced-usage.md) | Beyond the quickstart: install options, overrides, headless use |
 | [`manual-bring-up.md`](docs/manual-bring-up.md) | The same single-node stack, brought up by hand |
 | [`database-backends.md`](docs/database-backends.md) | Postgres vs embedded SQLite: which to use and how |
 | [`container-images.md`](docs/container-images.md) | Published GHCR images (control, server, mount) and their runtime contracts |

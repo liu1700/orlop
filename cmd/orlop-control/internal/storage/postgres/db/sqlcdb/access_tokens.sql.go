@@ -127,12 +127,3 @@ func (q *Queries) GetAccessTokenByHash(ctx context.Context, tokenHash string) (G
 	)
 	return i, err
 }
-
-const revokeAccessToken = `-- name: RevokeAccessToken :exec
-UPDATE access_tokens SET revoked_at = now() WHERE token_hash = $1
-`
-
-func (q *Queries) RevokeAccessToken(ctx context.Context, tokenHash string) error {
-	_, err := q.db.Exec(ctx, revokeAccessToken, tokenHash)
-	return err
-}

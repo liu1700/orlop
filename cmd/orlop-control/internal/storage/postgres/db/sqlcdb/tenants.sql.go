@@ -67,35 +67,6 @@ func (q *Queries) GetTenant(ctx context.Context, id string) (Tenant, error) {
 	return i, err
 }
 
-const listTenants = `-- name: ListTenants :many
-SELECT id, name, suspended_at, created_at FROM tenants ORDER BY created_at
-`
-
-func (q *Queries) ListTenants(ctx context.Context) ([]Tenant, error) {
-	rows, err := q.db.Query(ctx, listTenants)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []Tenant{}
-	for rows.Next() {
-		var i Tenant
-		if err := rows.Scan(
-			&i.ID,
-			&i.Name,
-			&i.SuspendedAt,
-			&i.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const suspendTenant = `-- name: SuspendTenant :exec
 UPDATE tenants SET suspended_at = now() WHERE id = $1
 `

@@ -301,7 +301,7 @@ func TestManifestPutPopulatesDirEntries(t *testing.T) {
 
 func TestPackUnpackRoundTrip(t *testing.T) {
 	chunks := sampleChunks()
-	blob, _ := packChunks(chunks)
+	blob := packChunks(chunks)
 	if len(blob) != len(chunks)*chunkRefSize {
 		t.Fatalf("packed size %d, want %d", len(blob), len(chunks)*chunkRefSize)
 	}

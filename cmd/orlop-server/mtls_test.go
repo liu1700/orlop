@@ -38,8 +38,6 @@ tls:
   cert_file: ./server.crt
   key_file: ./server.key
   client_ca_file: ./client-ca.crt
-policy:
-  readonly: true
 `)
 
 	cfg, err := LoadConfig(path)

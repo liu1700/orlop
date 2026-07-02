@@ -33,8 +33,6 @@ tenant:
   routes:
     type: sqlite
     path: `+dir+`/routes.db
-policy:
-  readonly: true
 server:
   ops_bind: 127.0.0.1:0
 tls:
@@ -70,8 +68,6 @@ store:
 routes:
   type: sqlite
   path: `+dir+`/routes.db
-policy:
-  readonly: true
 server:
   ops_bind: 127.0.0.1:0
 tls:
@@ -155,6 +151,40 @@ func TestGCConfigDisabled(t *testing.T) {
 	}
 }
 
+// A malformed or out-of-range gc duration must fail LoadConfig instead of
+// silently falling back to the default.
+func TestGCConfigInvalidRejectedAtLoad(t *testing.T) {
+	base := "tenant: { id: t1, name: t1, store: { type: local, root: /tmp/t1 }, routes: { type: sqlite, path: /tmp/t1/routes.db } }\n"
+	load := func(body string) error {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadConfig(p)
+		return err
+	}
+
+	for name, gc := range map[string]string{
+		"bad interval":       "gc:\n  interval: banana\n",
+		"bad retention":      "gc:\n  retention_window: soon\n",
+		"sub-1h retention":   "gc:\n  retention_window: 30m\n",
+		"bad tenant budget":  "gc:\n  tenant_budget: fast\n",
+		"zero tenant budget": "gc:\n  tenant_budget: 0s\n",
+	} {
+		if err := load(base + gc); err == nil {
+			t.Errorf("%s: LoadConfig succeeded, want error", name)
+		}
+	}
+	// Unset fields and the explicit "0" disable switch stay valid.
+	if err := load(base + "gc:\n  interval: \"0\"\n"); err != nil {
+		t.Errorf("interval=0: LoadConfig failed: %v", err)
+	}
+	if err := load(base); err != nil {
+		t.Errorf("unset gc: LoadConfig failed: %v", err)
+	}
+}
+
 // When both nested and top-level are set, nested wins.
 func TestQuotaBurstMarginConfig(t *testing.T) {
 	base := "tenant: { id: t1, name: t1, store: { type: local, root: /tmp/t1 }, routes: { type: sqlite, path: /tmp/t1/routes.db } }\n"
@@ -199,8 +229,6 @@ store:
 routes:
   type: sqlite
   path: `+dir+`/fallback.db
-policy:
-  readonly: true
 server:
   ops_bind: 127.0.0.1:0
 tls:
