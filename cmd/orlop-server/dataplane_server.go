@@ -870,8 +870,18 @@ func handleChunkPut(s *serverState, tenant *tenantState, ident Identity, w *fram
 			dataplane.ErrEINVAL("chunk exceeds maximum size"))
 		return
 	}
-	stored, err := tenant.chunks.Put(req.Hash, req.Bytes)
+	// putChunk (not chunks.Put) so a chunk arriving on a still-open connection
+	// after the tenant was unregistered is refused instead of MkdirAll'ing the
+	// deleted tenant dir back into existence (#103).
+	stored, err := tenant.putChunk(req.Hash, req.Bytes)
 	if err != nil {
+		if errors.Is(err, errTenantGone) {
+			// The tenant was unregistered out from under this still-open
+			// connection — the mount is stale. ESTALE tells the FUSE client the
+			// handle is gone, rather than EINVAL implying a malformed request.
+			writeFrameError(w, frame.Op, frame.RID, dataplane.ErrESTALE(err.Error()))
+			return
+		}
 		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEINVAL(err.Error()))
 		return
 	}
