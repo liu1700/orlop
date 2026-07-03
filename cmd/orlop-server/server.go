@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -77,6 +78,50 @@ type tenantState struct {
 	manifests *ManifestStore
 	journal   *SessionJournal
 	leases    *leaseManager
+
+	// liveMu guards closed. A data-plane store mutation (chunk Put) takes it for
+	// reading across the whole write; unregisterTenant takes it for writing to set
+	// closed=true immediately before os.RemoveAll. That ordering fences the
+	// "dying pod recreates an orphan tenant dir after unregister" race (#103): a
+	// write from a still-open connection whose pod is being torn down either
+	// completes before RemoveAll (and is removed with the dir) or observes closed
+	// and refuses without touching disk — it can never os.MkdirAll the tenant dir
+	// back after RemoveAll has run.
+	liveMu sync.RWMutex
+	closed bool
+}
+
+// errTenantGone is returned by tenant store mutations attempted after the tenant
+// has been unregistered. The caller — a data-plane handler on a still-open but
+// doomed connection — surfaces it as an error rather than silently resurrecting
+// the tenant's on-disk directory (#103).
+var errTenantGone = errors.New("tenant unregistered")
+
+// putChunk stores a chunk through the tenant's content-addressed store unless the
+// tenant has been torn down. It holds liveMu for reading across the entire store
+// write so it cannot interleave with unregisterTenant's RemoveAll: the write
+// either completes before markClosed returns (and is then removed together with
+// the directory) or observes closed and refuses without any filesystem write.
+// Chunk Put is the only data-plane write that MkdirAll's the tenant directory —
+// a manifest write instead hits the already-closed routes.db and fails — so
+// gating it here closes the orphan-dir race (#103).
+func (t *tenantState) putChunk(hash, data []byte) (bool, error) {
+	t.liveMu.RLock()
+	defer t.liveMu.RUnlock()
+	if t.closed {
+		return false, errTenantGone
+	}
+	return t.chunks.Put(hash, data)
+}
+
+// markClosed flips the tenant's write gate so no later store mutation can
+// recreate its on-disk state, and blocks until in-flight writes drain (the write
+// lock waits out every reader). unregisterTenant calls it immediately before
+// os.RemoveAll.
+func (t *tenantState) markClosed() {
+	t.liveMu.Lock()
+	t.closed = true
+	t.liveMu.Unlock()
 }
 
 func newServerState(cfg Config, identifier Identifier, logger *slog.Logger) (*serverState, error) {

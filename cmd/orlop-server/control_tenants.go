@@ -305,6 +305,21 @@ func (s *serverState) unregisterTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(s.tenants, tenantID)
 
+	// Gate the tenant's store writes and drain any in-flight chunk Put BEFORE we
+	// remove the directory. Without this, a chunk arriving on a data-plane
+	// connection whose pod is still terminating would MkdirAll the tenant dir back
+	// into existence right after os.RemoveAll, leaving an orphan (#103). markClosed
+	// blocks until in-flight writes finish, so RemoveAll is the last write to the dir.
+	//
+	// The drain, db.Close, and RemoveAll all run under s.mu, which is required:
+	// s.mu serializes this teardown against a concurrent same-id registerTenant so
+	// a re-register cannot MkdirAll a fresh dir that RemoveAll then deletes. The
+	// drain is bounded (each in-flight put is a size-capped, already-buffered write
+	// plus one fsync; no client-controlled blocking), and os.RemoveAll — the
+	// dominant on-disk cost — already ran under s.mu before this change, so the
+	// gate does not introduce a new class of I/O-under-lock.
+	ts.markClosed()
+
 	if err := ts.db.Close(); err != nil {
 		s.logger.Error("unregister tenant db close failed", "tenant_id", tenantID, "error", err)
 	}
