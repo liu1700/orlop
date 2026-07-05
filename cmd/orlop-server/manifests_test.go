@@ -454,12 +454,35 @@ func TestDeleteDecrementsChunkRefs(t *testing.T) {
 func TestDeleteCASMismatch(t *testing.T) {
 	db := openTestDB(t)
 	store := NewManifestStore(db, nil)
-	if _, err := store.Put("/a.txt", 0, Manifest{Path: "/a.txt"}, "", "", ""); err != nil {
+	v1, err := store.Put("/a.txt", 0, Manifest{Path: "/a.txt"}, "", "", "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	err := store.Delete("/a.txt", 999, "", "", "")
+	err = store.Delete("/a.txt", 999, "", "", "")
 	if !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("want ErrVersionConflict, got %v", err)
+	}
+	// The conflict must carry the server's actual version (parity with Put) so the wire layer can
+	// hand the client a real current version to retry on, instead of a bare ESTALE.
+	var conflict *VersionConflictError
+	if !errors.As(err, &conflict) || conflict.Existing != v1 {
+		t.Fatalf("Delete conflict = %#v, want *VersionConflictError{Existing: %d}", err, v1)
+	}
+}
+
+// A Rename that loses the source CAS must, like Put/Delete, return the server's current source
+// version so the wire ESTALE carries a real current version rather than 0.
+func TestRenameSourceConflictReturnsExistingVersion(t *testing.T) {
+	db := openTestDB(t)
+	store := NewManifestStore(db, nil)
+	v1, err := store.Put("/a.txt", 0, Manifest{Path: "/a.txt"}, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Rename("/a.txt", "/b.txt", 999, 0, "", "", "") // stale expectedFrom
+	var conflict *VersionConflictError
+	if !errors.As(err, &conflict) || conflict.Existing != v1 {
+		t.Fatalf("Rename source conflict = %#v, want *VersionConflictError{Existing: %d}", err, v1)
 	}
 }
 

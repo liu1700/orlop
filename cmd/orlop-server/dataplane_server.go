@@ -560,6 +560,21 @@ func handleManifestPut(s *serverState, tenant *tenantState, ident Identity, w *f
 	s.recordManifestAudit(ident, "manifest_put", req.Path, req.Size, newVersion, true, req.SessionID)
 }
 
+// manifestConflictToWire maps a ManifestStore error to a wire payload, attaching a CAS recovery hint
+// (carrying the server's current version, pulled from *VersionConflictError) when it is a version
+// conflict — so manifest_delete/manifest_rename ESTALE responses carry CurrentVersion like
+// manifest_put does, instead of leaving the client to guess or re-Stat. yourVersion is the version
+// the caller CAS'd on (delete: ExpectedVersion; rename: ExpectedVersionFrom).
+func manifestConflictToWire(tenant *tenantState, err error, path string, yourVersion uint64) dataplane.ErrorPayload {
+	if errors.Is(err, ErrVersionConflict) {
+		// last_writer is best-effort metadata for the hint; swallow lookup errors (mirrors handleManifestPut).
+		lastWriter, _ := tenant.journal.LookupLastWriter(path)
+		return dataplane.ErrESTALE("manifest version conflict").
+			WithRecovery(buildCasConflictHint(yourVersion, err, lastWriter))
+	}
+	return manifestErrToWire(err)
+}
+
 // manifestErrToWire maps known ManifestStore sentinel errors to wire error
 // payloads. Unrecognised errors map to ErrEIO.
 func manifestErrToWire(err error) dataplane.ErrorPayload {
@@ -596,7 +611,7 @@ func handleManifestDelete(s *serverState, tenant *tenantState, ident Identity, w
 		return
 	}
 	if err := tenant.manifests.DeleteWithLeaseCheck(req.Path, req.ExpectedVersion, delSessionID, delAllocationID, ident.AgentID, delActiveLeaseHex); err != nil {
-		writeFrameError(w, frame.Op, frame.RID, manifestErrToWire(err))
+		writeFrameError(w, frame.Op, frame.RID, manifestConflictToWire(tenant, err, req.Path, req.ExpectedVersion))
 		return
 	}
 	sendResp(w, frame, dataplane.ManifestDeleteResponse{})
@@ -626,7 +641,7 @@ func handleManifestRename(s *serverState, tenant *tenantState, ident Identity, w
 	}
 	newV, err := tenant.manifests.RenameWithLeaseCheck(req.From, req.To, req.ExpectedVersionFrom, req.ExpectedVersionTo, renSessionID, renAllocationID, ident.AgentID, renActiveLeaseHex)
 	if err != nil {
-		writeFrameError(w, frame.Op, frame.RID, manifestErrToWire(err))
+		writeFrameError(w, frame.Op, frame.RID, manifestConflictToWire(tenant, err, req.From, req.ExpectedVersionFrom))
 		return
 	}
 	sendResp(w, frame, dataplane.ManifestRenameResponse{NewVersionAtTo: newV})
