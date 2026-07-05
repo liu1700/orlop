@@ -395,7 +395,7 @@ func (m *ManifestStore) Delete(p string, expectedVersion uint64, sessionID, allo
 		return fmt.Errorf("read manifest %s: %w", p, err)
 	}
 	if version != expectedVersion {
-		return ErrVersionConflict
+		return &VersionConflictError{Existing: version}
 	}
 
 	oldChunks, err := unpackChunks(blob)
@@ -695,7 +695,7 @@ func (m *ManifestStore) Rename(from, to string, expectedFrom, expectedTo uint64,
 			}
 			// CAS-guard a regular-file dest the caller resolved a version for.
 			if expectedTo != 0 && dstVersion != expectedTo {
-				return 0, ErrVersionConflict
+				return 0, &VersionConflictError{Existing: dstVersion}
 			}
 		}
 	}
@@ -724,7 +724,7 @@ func (m *ManifestStore) Rename(from, to string, expectedFrom, expectedTo uint64,
 			return 0, fmt.Errorf("read source manifest %s: %w", from, qErr)
 		}
 		if srcVersion != expectedFrom {
-			return 0, ErrVersionConflict
+			return 0, &VersionConflictError{Existing: srcVersion}
 		}
 	}
 
