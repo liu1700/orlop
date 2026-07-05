@@ -387,6 +387,7 @@ impl DataClient {
                 to: to.into(),
                 expected_version_from,
                 expected_version_to,
+                no_replace: false, // the mount client always overwrites (POSIX rename semantics)
                 session_id,
                 allocation_id,
             },

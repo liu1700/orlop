@@ -281,12 +281,22 @@ pub struct ManifestDeleteRequest {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestDeleteResponse {}
 
+/// Skip helper for `bool` fields that default to `false`, so the wire encoding
+/// omits them (mirroring the Go side's `,omitempty`).
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestRenameRequest {
     pub from: String,
     pub to: String,
     pub expected_version_from: u64,
     pub expected_version_to: u64,
+    /// true = create-only: fail with EEXIST if the destination exists
+    /// (RENAME_NOREPLACE), never overwrite. The mount client always overwrites.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_replace: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -583,12 +593,42 @@ mod tests {
             to: "/b".into(),
             expected_version_from: 1,
             expected_version_to: 0,
+            no_replace: false,
             session_id: None,
             allocation_id: None,
         };
         let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let got: ManifestRenameRequest = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(req, got);
+    }
+
+    #[test]
+    fn manifest_rename_no_replace_wire() {
+        // no_replace=false is omitted from the wire (mirrors Go `,omitempty`), so old servers see
+        // the historical shape; no_replace=true is carried and round-trips.
+        let overwrite = ManifestRenameRequest {
+            from: "/a".into(),
+            to: "/b".into(),
+            expected_version_from: 1,
+            expected_version_to: 0,
+            no_replace: false,
+            session_id: None,
+            allocation_id: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&overwrite).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("no_replace"),
+            "no_replace=false must be omitted from the wire"
+        );
+
+        let create_only = ManifestRenameRequest {
+            no_replace: true,
+            ..overwrite
+        };
+        let bytes = rmp_serde::to_vec_named(&create_only).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("no_replace"));
+        let got: ManifestRenameRequest = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(create_only, got);
     }
 
     #[test]

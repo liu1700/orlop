@@ -95,7 +95,7 @@ func TestManifestRenameRejectsForgedSessionID(t *testing.T) {
 	}
 
 	forged := "mount:" + hex.EncodeToString([]byte("bbbbbbbbbbbbbbbb"))
-	_, err := store.RenameWithLeaseCheck("/from", "/to", 1, 0, forged, "alloc_test", "agent_test", leaseHex)
+	_, err := store.RenameWithLeaseCheck("/from", "/to", 1, 0, false, forged, "alloc_test", "agent_test", leaseHex)
 	if err == nil {
 		t.Fatal("expected EACCES on forged session_id during Rename, got nil")
 	}

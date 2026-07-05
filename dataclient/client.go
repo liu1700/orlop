@@ -447,18 +447,32 @@ func (c *Client) Delete(ctx context.Context, filePath string, expectedVersion ui
 }
 
 // Rename moves a file from -> to. expectedVersionFrom must be the source's
-// current Version (a *StaleError otherwise). NOTE: the server overwrites an
+// current Version (a *StaleError otherwise). NOTE: the server OVERWRITES an
 // existing destination regular file (it does not enforce create-only), so
 // callers that need collision safety — e.g. moving into a trash namespace —
-// must pick a unique destination path. Returns the new version at the
-// destination.
+// must either pick a unique destination path or use RenameNoReplace. Returns
+// the new version at the destination.
 func (c *Client) Rename(ctx context.Context, from, to string, expectedVersionFrom uint64) (uint64, error) {
+	return c.rename(ctx, from, to, expectedVersionFrom, false)
+}
+
+// RenameNoReplace is Rename with create-only semantics: if the destination
+// already exists it fails with ErrExists instead of overwriting it (POSIX
+// RENAME_NOREPLACE). Requires an orlop-server that honors no_replace; an older
+// server silently ignores the flag and overwrites, so a caller that must not
+// clobber against an unknown server version should keep a stat-based guard.
+func (c *Client) RenameNoReplace(ctx context.Context, from, to string, expectedVersionFrom uint64) (uint64, error) {
+	return c.rename(ctx, from, to, expectedVersionFrom, true)
+}
+
+func (c *Client) rename(ctx context.Context, from, to string, expectedVersionFrom uint64, noReplace bool) (uint64, error) {
 	var resp wire.ManifestRenameResponse
 	err := c.call(ctx, wire.OpManifestRename, wire.ManifestRenameRequest{
 		From:                c.scope(from),
 		To:                  c.scope(to),
 		ExpectedVersionFrom: expectedVersionFrom,
 		ExpectedVersionTo:   0,
+		NoReplace:           noReplace,
 		SessionID:           c.sess(),
 		AllocationID:        c.alloc(),
 	}, &resp)
