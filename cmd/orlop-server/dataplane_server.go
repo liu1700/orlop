@@ -639,7 +639,7 @@ func handleManifestRename(s *serverState, tenant *tenantState, ident Identity, w
 	if !ok {
 		return
 	}
-	newV, err := tenant.manifests.RenameWithLeaseCheck(req.From, req.To, req.ExpectedVersionFrom, req.ExpectedVersionTo, renSessionID, renAllocationID, ident.AgentID, renActiveLeaseHex)
+	newV, err := tenant.manifests.RenameWithLeaseCheck(req.From, req.To, req.ExpectedVersionFrom, req.ExpectedVersionTo, req.NoReplace, renSessionID, renAllocationID, ident.AgentID, renActiveLeaseHex)
 	if err != nil {
 		writeFrameError(w, frame.Op, frame.RID, manifestConflictToWire(tenant, err, req.From, req.ExpectedVersionFrom))
 		return

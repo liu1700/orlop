@@ -610,7 +610,13 @@ func reparentDescendantsTx(tx *sql.Tx, from, to string) error {
 	return nil
 }
 
-// Rename implements POSIX rename(from, to) across every node kind in one
+// Rename moves a regular file, OVERWRITING a compatible destination (the
+// historical default). It is renameOpt with noReplace=false.
+func (m *ManifestStore) Rename(from, to string, expectedFrom, expectedTo uint64, sessionID, allocationID, agentID string) (uint64, error) {
+	return m.renameOpt(from, to, expectedFrom, expectedTo, false, sessionID, allocationID, agentID)
+}
+
+// renameOpt implements POSIX rename(from, to) across every node kind in one
 // transaction. `from` must exist (ErrManifestNotFound/ENOENT otherwise). When
 // `to` already exists the destination is OVERWRITTEN if the source and dest
 // types are compatible; the type-combo rules are:
@@ -626,10 +632,14 @@ func reparentDescendantsTx(tx *sql.Tx, from, to string) error {
 // client resolves both live before the call, so this still guards races).
 // Manifest-less nodes (symlink/special/dir) carry no version and return 1.
 //
+// When noReplace is true, an existing destination of ANY kind makes the call
+// fail with ErrAlreadyExists (POSIX RENAME_NOREPLACE) instead of being
+// overwritten — a create-only move for callers that must not clobber.
+//
 // Only the regular-file source path is journaled (matching the prior behavior
 // and the revert engine, which only renames regular files); symlink/special/dir
 // renames are not journaled, as they are not journaled anywhere else either.
-func (m *ManifestStore) Rename(from, to string, expectedFrom, expectedTo uint64, sessionID, allocationID, agentID string) (uint64, error) {
+func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint64, noReplace bool, sessionID, allocationID, agentID string) (uint64, error) {
 	if sessionID != "" && allocationID == "" {
 		return 0, fmt.Errorf("manifest_rename: empty allocation_id required")
 	}
@@ -665,6 +675,11 @@ func (m *ManifestStore) Rename(from, to string, expectedFrom, expectedTo uint64,
 	dstKind, err := resolveKindTx(tx, to)
 	if err != nil {
 		return 0, fmt.Errorf("resolve dest %s: %w", to, err)
+	}
+
+	// Create-only rename (RENAME_NOREPLACE): refuse rather than overwrite an existing destination.
+	if noReplace && dstKind != nodeAbsent {
+		return 0, ErrAlreadyExists
 	}
 
 	// 4. Type-combo matrix when the dest exists. `dstVersion` is the dest's
@@ -1486,15 +1501,15 @@ func (m *ManifestStore) DeleteWithLeaseCheck(
 	return m.Delete(p, expectedVersion, sessionID, allocationID, agentID)
 }
 
-// RenameWithLeaseCheck wraps Rename with session_id authenticity validation.
+// RenameWithLeaseCheck wraps renameOpt with session_id authenticity validation.
 func (m *ManifestStore) RenameWithLeaseCheck(
-	from, to string, expectedFrom, expectedTo uint64,
+	from, to string, expectedFrom, expectedTo uint64, noReplace bool,
 	sessionID, allocationID, agentID, activeLeaseHex string,
 ) (uint64, error) {
 	if err := validateSessionIDForLease(sessionID, activeLeaseHex); err != nil {
 		return 0, err
 	}
-	return m.Rename(from, to, expectedFrom, expectedTo, sessionID, allocationID, agentID)
+	return m.renameOpt(from, to, expectedFrom, expectedTo, noReplace, sessionID, allocationID, agentID)
 }
 
 // sessionMountPrefix is the canonical prefix for implicit-mount session IDs:

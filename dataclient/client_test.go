@@ -184,8 +184,12 @@ func (fs *fakeServer) dispatch(conn net.Conn, fr wire.Frame) {
 			fs.fail(conn, fr, staleHint(src.version))
 			return
 		}
-		// Mirror the real server: expectedTo==0 does NOT enforce must-not-exist;
-		// an existing destination regular file is overwritten.
+		// Mirror the real server: no_replace fails with EEXIST if the destination
+		// exists; otherwise expectedTo==0 overwrites an existing destination.
+		if _, exists := fs.manifests[req.To]; exists && req.NoReplace {
+			fs.fail(conn, fr, wire.ErrEEXIST("destination exists"))
+			return
+		}
 		delete(fs.manifests, req.From)
 		moved := *src
 		moved.version = 1
@@ -446,6 +450,26 @@ func TestAgentIDFromCertDER(t *testing.T) {
 	}
 	if got := agentIDFromCertDER([][]byte{[]byte("not-a-cert")}); got != "" {
 		t.Fatalf("agentIDFromCertDER(garbage) = %q, want empty", got)
+	}
+}
+
+// RenameNoReplace must fail with ErrExists when the destination exists (create-only), and succeed
+// onto a vacant path — the collision-safe alternative to the overwrite default.
+func TestRenameNoReplace(t *testing.T) {
+	c, _ := pipeClient(t, 1<<20, "a1")
+	ctx := context.Background()
+	vSrc, err := c.WriteFile(ctx, "/src", []byte("s"), 0, WriteOpts{})
+	if err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	if _, err := c.WriteFile(ctx, "/dst", []byte("d"), 0, WriteOpts{}); err != nil {
+		t.Fatalf("write dst: %v", err)
+	}
+	if _, err := c.RenameNoReplace(ctx, "/src", "/dst", vSrc); !errors.Is(err, ErrExists) {
+		t.Fatalf("RenameNoReplace over existing dest = %v, want ErrExists", err)
+	}
+	if _, err := c.RenameNoReplace(ctx, "/src", "/fresh", vSrc); err != nil {
+		t.Fatalf("RenameNoReplace onto vacant dest: %v", err)
 	}
 }
 

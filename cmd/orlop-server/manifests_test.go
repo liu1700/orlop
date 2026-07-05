@@ -662,6 +662,34 @@ func TestDirRemoveNotEmpty(t *testing.T) {
 
 // --- POSIX rename(2) full-matrix coverage -------------------------------
 
+// renameOpt with noReplace=true is create-only: an existing destination fails with ErrAlreadyExists
+// and the source is left untouched; a vacant destination moves as usual.
+func TestRenameNoReplace(t *testing.T) {
+	db := openTestDB(t)
+	store := NewManifestStore(db, nil)
+	if _, err := store.Put("/a.txt", 0, Manifest{Path: "/a.txt"}, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("/dst.txt", 0, Manifest{Path: "/dst.txt"}, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Onto an existing dest → EEXIST, source preserved.
+	_, err := store.renameOpt("/a.txt", "/dst.txt", 1, 0, true, "", "", "")
+	if !errors.Is(err, ErrAlreadyExists) {
+		t.Fatalf("noReplace over existing = %v, want ErrAlreadyExists", err)
+	}
+	if _, err := store.Get("/a.txt"); err != nil {
+		t.Fatalf("source removed after a refused noReplace rename: %v", err)
+	}
+	// Onto a vacant dest → succeeds.
+	if _, err := store.renameOpt("/a.txt", "/fresh.txt", 1, 0, true, "", "", ""); err != nil {
+		t.Fatalf("noReplace onto vacant dest: %v", err)
+	}
+	if _, err := store.Get("/fresh.txt"); err != nil {
+		t.Fatalf("dest missing after noReplace move: %v", err)
+	}
+}
+
 func TestRenameSourceMissingENOENT(t *testing.T) {
 	db := openTestDB(t)
 	store := NewManifestStore(db, nil)
