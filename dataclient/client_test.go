@@ -517,6 +517,70 @@ func TestDialMTLS(t *testing.T) {
 	}
 }
 
+// TestDialPresentsIntermediate is the regression test for the real-orlop bug:
+// the server's client-CA pool is the ROOT ALONE, and the agent leaf is signed by
+// a tenant INTERMEDIATE. Dial must present leaf+intermediate or the TLS 1.3
+// handshake "succeeds" client-side but the server closes the connection, so the
+// first op sees a closed conn. Here ClientCAs is the root only; a leaf-only
+// presentation would fail — this passes only because Dial appends the
+// intermediate from ca_chain_pem.
+func TestDialPresentsIntermediate(t *testing.T) {
+	root, rootKey := makeCA(t)
+	interCert, interKey := intermediateCA(t, root, rootKey, "tenant-intermediate")
+	clientPEM, clientKeyPEM := leafCert(t, interCert, interKey, "agent-x", true) // signed by the intermediate
+	serverPEM, serverKeyPEM := leafCert(t, root, rootKey, "localhost", false)    // signed by the root
+
+	serverCert, err := tls.X509KeyPair(serverPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootOnly := x509.NewCertPool()
+	rootOnly.AddCert(root) // deliberately NOT the intermediate — mirrors orlop-server
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    rootOnly,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	fs := newFakeServer()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go fs.serve(conn)
+		}
+	}()
+
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	creds := &AgentCredentials{
+		ClientCertPEM: clientPEM,
+		ClientKeyPEM:  clientKeyPEM,
+		// ca_chain_pem carries the intermediate AND the root, as enroll returns.
+		CACertPEM:  append(append([]byte{}, certPEM(interCert)...), certPEM(root)...),
+		ServerAddr: "localhost:" + port,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, creds)
+	if err != nil {
+		t.Fatalf("Dial (root-only verifier, intermediate-signed leaf): %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	// The op only completes if the server verified our client cert — i.e. we
+	// presented the intermediate.
+	if _, err := c.ListDir(ctx, "/"); err != nil {
+		t.Fatalf("ListDir after intermediate-chain dial: %v", err)
+	}
+}
+
 // ---- cert helpers ----------------------------------------------------------
 
 func makeCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
@@ -532,6 +596,28 @@ func makeCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
 		BasicConstraintsValid: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, _ := x509.ParseCertificate(der)
+	return cert, key
+}
+
+// intermediateCA mints a CA cert signed by parent (a sub-CA), so a leaf signed
+// by it chains parent → intermediate → leaf.
+func intermediateCA(t *testing.T, parent *x509.Certificate, parentKey *ecdsa.PrivateKey, name string) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: name},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
 	if err != nil {
 		t.Fatal(err)
 	}

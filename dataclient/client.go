@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -117,6 +118,13 @@ func Dial(ctx context.Context, creds *AgentCredentials, opts ...DialOption) (*Cl
 	if err != nil {
 		return nil, fmt.Errorf("orlop dataclient: client keypair: %w", err)
 	}
+	// Present the signing intermediate(s) alongside the leaf. orlop-server's
+	// client-CA pool is the org ROOT alone, so a TLS 1.3 verify of a leaf signed
+	// by a tenant intermediate only succeeds if we send that intermediate too —
+	// it arrives in ca_chain_pem next to the root. Without this the handshake
+	// "succeeds" client-side but the server closes the connection right after,
+	// surfacing as a closed conn on the first op.
+	cert.Certificate = append(cert.Certificate, intermediateDERs(creds.CACertPEM)...)
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM(creds.CACertPEM) {
 		return nil, fmt.Errorf("orlop dataclient: no CA certs in ca_chain_pem")
@@ -490,6 +498,31 @@ func optStr(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// intermediateDERs returns the DER of the non-self-signed (intermediate) certs
+// in a PEM chain — the certs a client must present alongside its leaf so a
+// root-only verifier can build leaf → intermediate → root. Self-signed roots
+// are skipped (they belong in the verifier's pool, not the presented chain).
+func intermediateDERs(pemChain []byte) [][]byte {
+	var out [][]byte
+	rest := pemChain
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil || bytes.Equal(c.RawSubject, c.RawIssuer) {
+			continue // parse error or a self-signed root
+		}
+		out = append(out, block.Bytes)
+	}
+	return out
 }
 
 // agentIDFromCertDER extracts the agent id from the leaf certificate's SPIFFE
