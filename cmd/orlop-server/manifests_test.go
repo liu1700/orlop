@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"path/filepath"
@@ -108,6 +109,60 @@ func openTestDB(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	return db
+}
+
+// NoteChunkStored makes an uploaded-but-uncommitted chunk (a failed/CAS-conflicted WriteFile) visible
+// to the refcount GC so it doesn't leak, and must never disturb a chunk that a manifest references.
+func TestNoteChunkStoredEnablesOrphanGC(t *testing.T) {
+	db := openTestDB(t)
+	ms := NewManifestStore(db, nil)
+	var h [HashLen]byte
+	for i := range h {
+		h[i] = byte(i + 1)
+	}
+	const addedAt = int64(1000)
+
+	// A chunk uploaded but never referenced by a manifest is tracked with refcount 0...
+	if err := ms.NoteChunkStored(h[:], 4096, addedAt); err != nil {
+		t.Fatalf("NoteChunkStored: %v", err)
+	}
+	assertRefcount(t, db, h, 0)
+
+	// ...so the GC sees it as a candidate once past the retention cutoff, with its real size.
+	cands, err := selectGCCandidates(db, addedAt+1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 1 || !bytes.Equal(cands[0].hash, h[:]) || cands[0].size != 4096 {
+		t.Fatalf("GC candidates = %+v, want a single orphan of size 4096", cands)
+	}
+
+	// Once a manifest references it (refcount>0), re-noting must leave the refcount AND the retention
+	// clock untouched, and the GC must no longer see it.
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyChunkRefDelta(tx, map[[HashLen]byte]int{h: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.NoteChunkStored(h[:], 4096, addedAt+9999); err != nil { // a later ts must NOT reset the clock
+		t.Fatalf("NoteChunkStored (idempotent): %v", err)
+	}
+	assertRefcount(t, db, h, 1)
+	var gotAddedAt int64
+	if err := db.QueryRow(`select added_at from chunks where hash = ?`, h[:]).Scan(&gotAddedAt); err != nil {
+		t.Fatal(err)
+	}
+	if gotAddedAt != addedAt {
+		t.Fatalf("added_at = %d, want unchanged %d", gotAddedAt, addedAt)
+	}
+	if cands, _ := selectGCCandidates(db, addedAt+1, 10); len(cands) != 0 {
+		t.Fatalf("referenced chunk is still a GC candidate: %+v", cands)
+	}
 }
 
 func sampleChunks() []ChunkRef {

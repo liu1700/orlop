@@ -885,6 +885,16 @@ func handleChunkPut(s *serverState, tenant *tenantState, ident Identity, w *fram
 		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEINVAL(err.Error()))
 		return
 	}
+	// Track the chunk with refcount 0 so one that is uploaded here but whose manifest commit never
+	// lands (a CAS-conflicted / cancelled WriteFile) is reclaimed by the GC after the retention window
+	// instead of leaking on disk. Done unconditionally (even when stored==false) so a pre-existing
+	// on-disk orphan gets its missing row on any re-upload. Best-effort: the chunk is already durably
+	// stored, so a bookkeeping failure only risks a re-derivable orphan (the pre-fix behavior), never
+	// the write. Idempotent — an already-referenced chunk's row is left untouched.
+	if nerr := tenant.manifests.NoteChunkStored(req.Hash, int64(len(req.Bytes)), time.Now().Unix()); nerr != nil {
+		s.logger.Warn("chunk_put: refcount-0 bookkeeping failed (chunk stored; may orphan until re-referenced)",
+			"tenant", tenant.id, "err", nerr)
+	}
 	sendResp(w, frame, dataplane.ChunkPutResponse{Stored: stored})
 	size := uint64(len(req.Bytes))
 	s.metrics.observeOp("chunk_put", "in", size)

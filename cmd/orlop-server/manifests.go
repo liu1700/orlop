@@ -1406,6 +1406,27 @@ func applyChunkRefDelta(tx *sql.Tx, delta map[[HashLen]byte]int) error {
 	return nil
 }
 
+// NoteChunkStored records that a content chunk exists on disk with an initial
+// refcount of 0, so a chunk that is uploaded but whose manifest commit never
+// lands (a CAS-conflicted, quota-rejected, or cancelled WriteFile) is still
+// visible to the refcount GC and reclaimed after the retention window — instead
+// of leaking on disk until the whole tenant is deleted. Idempotent: an existing
+// row (already refcounted by a manifest, or already noted) is left untouched, so
+// this never disturbs a live chunk's refcount or resets its retention clock.
+// addedAt is real wall-clock Unix seconds (the GC measures the window from it)
+// and size lets the GC account freed bytes — both improving on the placeholder
+// 0/0 that applyChunkRefDelta writes when it has to create a row itself.
+func (m *ManifestStore) NoteChunkStored(hash []byte, size, addedAt int64) error {
+	if _, err := m.db.Exec(
+		`insert into chunks(hash, size, refcount, added_at) values(?, ?, 0, ?)
+		 on conflict(hash) do nothing`,
+		hash, size, addedAt,
+	); err != nil {
+		return fmt.Errorf("note chunk stored: %w", err)
+	}
+	return nil
+}
+
 // chunkRefDelta returns the net refcount change for each hash when transitioning
 // from old chunks to new chunks. Positive = gained references, negative = lost.
 func chunkRefDelta(old, new []ChunkRef) map[[HashLen]byte]int {
