@@ -176,7 +176,7 @@ type ManifestRenameRequest struct {
 	From                string  `msgpack:"from"`
 	To                  string  `msgpack:"to"`
 	ExpectedVersionFrom uint64  `msgpack:"expected_version_from"`
-	ExpectedVersionTo   uint64  `msgpack:"expected_version_to"` // 0 = must-not-exist; otherwise CAS replace
+	ExpectedVersionTo   uint64  `msgpack:"expected_version_to"` // 0 = no dest CAS (overwrite if present); >0 = replace only if the dest is at that version
 	SessionID           *string `msgpack:"session_id,omitempty"`
 	AllocationID        *string `msgpack:"allocation_id,omitempty"`
 }
