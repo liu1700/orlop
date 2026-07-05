@@ -60,7 +60,9 @@ func (e *VersionConflictError) Unwrap() error { return ErrVersionConflict }
 // ErrParentNotFound is returned by Put when the parent directory does not exist.
 var ErrParentNotFound = errors.New("parent directory not found")
 
-// ErrAlreadyExists is returned by Rename when expectedTo == 0 but the dest path already exists.
+// ErrAlreadyExists is returned by DirCreate/Symlink/Mknod when the target path
+// already exists. Rename does NOT return it: Rename overwrites a compatible dest
+// (expectedTo==0 skips the dest CAS; expectedTo>0 CAS-checks the dest version).
 var ErrAlreadyExists = errors.New("path already exists")
 
 // ErrNotEmpty is returned by DirRemove when the directory still has children.

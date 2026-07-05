@@ -13,6 +13,7 @@ import (
 	"errors"
 	"math/big"
 	"net"
+	"net/url"
 	"path"
 	"strings"
 	"testing"
@@ -414,6 +415,40 @@ func TestPathScoping(t *testing.T) {
 	}
 }
 
+// agentIDFromCertDER powers the client's automatic path-scoping to /<agentID>: every op the caller
+// issues is confined to the agent's own subtree based on it. TestDialMTLS/TestPathScoping inject the
+// id directly, so the real cert-SAN → id extraction had no hermetic coverage — only the skip-by-
+// default integration test exercised it. Assert it here so a regression in the SPIFFE-SAN parsing
+// (ordering/format drift returning "") is caught in unit CI, not in production as a scoping outage.
+func TestAgentIDFromCertDER(t *testing.T) {
+	ca, caKey := makeCA(t)
+	cases := []struct {
+		name string
+		uris []string
+		want string
+	}{
+		{"agent SAN", []string{"spiffe://example.org/agent/a-7f3"}, "a-7f3"},
+		{"tenant+agent SANs", []string{"spiffe://example.org/tenant/a_a-7f3", "spiffe://example.org/agent/a-7f3"}, "a-7f3"},
+		{"tenant-only (no agent SAN)", []string{"spiffe://example.org/tenant/a_a-7f3"}, ""},
+		{"no URI SANs", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			der := leafCertDERWithURIs(t, ca, caKey, tc.uris...)
+			if got := agentIDFromCertDER([][]byte{der}); got != tc.want {
+				t.Fatalf("agentIDFromCertDER = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	// A missing/unparseable chain must fail closed to "" (never panic).
+	if got := agentIDFromCertDER(nil); got != "" {
+		t.Fatalf("agentIDFromCertDER(nil) = %q, want empty", got)
+	}
+	if got := agentIDFromCertDER([][]byte{[]byte("not-a-cert")}); got != "" {
+		t.Fatalf("agentIDFromCertDER(garbage) = %q, want empty", got)
+	}
+}
+
 func TestTransportErrorPoisonsClient(t *testing.T) {
 	srv, cli := net.Pipe()
 	fs := newFakeServer()
@@ -648,6 +683,35 @@ func leafCert(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey, name 
 	keyDER, _ := x509.MarshalPKCS8PrivateKey(key)
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+}
+
+// leafCertDERWithURIs mints a client leaf carrying the given URI SANs (e.g. a SPIFFE
+// spiffe://td/agent/<id>) and returns its DER, for exercising agentIDFromCertDER without a full dial.
+func leafCertDERWithURIs(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey, uris ...string) []byte {
+	t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	var parsed []*url.URL
+	for _, u := range uris {
+		pu, err := url.Parse(u)
+		if err != nil {
+			t.Fatalf("parse SAN URI %q: %v", u, err)
+		}
+		parsed = append(parsed, pu)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "agent-leaf"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		URIs:         parsed,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der
 }
 
 func certPEM(c *x509.Certificate) []byte {
