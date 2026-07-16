@@ -26,11 +26,11 @@ image:
 # subtly wrong by hand. The chart derives both sides from a single source, so
 # they cannot drift:
 #   - the server Service is NAMED serverFQDN, and both control's
-#     ORLOP_DATAGW_SERVER_FQDN and the server's tls.fqdn use serverFQDN — so the
+#     ORLOP_SERVER_FQDN and the server's tls.fqdn use serverFQDN — so the
 #     cert SAN always matches the name clients connect to (no fqdn_not_allowed).
 #   - trustDomain is set on both sides.
 #   - the shared token lives in one Secret, read by control as
-#     ORLOP_CONTROL_PLANE_TOKEN and by the server as ORLOP_DATAGW_SERVICE_TOKEN.
+#     ORLOP_CONTROL_PLANE_TOKEN and by the server as ORLOP_SERVICE_TOKEN.
 serverFQDN: orlop-server
 trustDomain: orlop.example
 orgName: ORL

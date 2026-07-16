@@ -113,7 +113,7 @@ up, a component crashed while running, or teardown errored).
 
 The persistence demo in the [quickstart](standalone-quickstart.md#3-see-it-persist-optional)
 works because the data isn't in the mount point — it's in the data-plane
-server's store under `./orlop-dev/dg-data`, which teardown leaves intact. Bring
+server's store under `./orlop-dev/orlop-data`, which teardown leaves intact. Bring
 the stack back up against the same `--dir` and the files return. The disk
 survives a full teardown and restart because it lives in the data-plane server,
 not in the mount point.

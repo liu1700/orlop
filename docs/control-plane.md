@@ -256,8 +256,8 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 | `ORLOP_CONTROL_PLANE_TOKEN` | Shared service token gating the `/v1/entities`, `/v1/admin`, `/v1/tenants`, and `/control/sign-server-cert` routes. Empty ⇒ those routes reject every request (fail closed). |
 | `ORLOP_API_TOKEN_TTL` | Expiry for newly minted `orlop_…` API tokens (e.g. `2160h`). `0` (default) ⇒ never expire. |
 | `ORLOP_INITIAL_GRANT_BYTES` | Disk granted at provision when the request specifies no explicit size. Default 1 GiB. |
-| `ORLOP_DATAGW_SERVER_FQDN` | The only name `POST /control/sign-server-cert` will issue a server cert for. Default `orlop-server`. |
-| `ORLOP_DATAGW_SERVER_CERT_TTL` | Validity of a self-provisioned server cert (e.g. `2160h`). Default 90 days. |
+| `ORLOP_SERVER_FQDN` | The only name `POST /control/sign-server-cert` will issue a server cert for. Default `orlop-server`. |
+| `ORLOP_SERVER_CERT_TTL` | Validity of a self-provisioned server cert (e.g. `2160h`). Default 90 days. |
 | `ORLOP_IDENTITY_AUDIENCE` | Enables the host-issued JWT identity verifier and mounts `GET /v1/whoami`; pins the JWT `aud`. The other `ORLOP_IDENTITY_*` knobs apply only when this is set. |
 | `ORLOP_IDENTITY_PUBLIC_KEY_FILE` | PKIX/SPKI PEM public key the host JWT is verified against (RSA, ECDSA P-256, or Ed25519). Required when the audience is set. |
 | `ORLOP_IDENTITY_ISSUER` | Optional; when set, must equal the JWT `iss`. |
@@ -271,6 +271,11 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 fails boot rather than silently falling back: a typo on a security toggle must
 not quietly leave the permissive default in force. Set it to `false` to restrict
 bootstrap to `ORLOP_CA_TENANT_ALLOWLIST` only.
+
+The datagateway-era names `ORLOP_DATAGW_SERVER_FQDN`, `ORLOP_DATAGW_SERVER_CERT_TTL`,
+`ORLOP_DATAGW_SERVICE_TOKEN`, `ORLOP_DATAGW_MAX_SESSIONS`, and
+`ORLOP_DATAGW_MAX_INFLIGHT` remain accepted as fallback aliases of the
+corresponding `ORLOP_*` variables for backward compatibility.
 
 ## CLI
 

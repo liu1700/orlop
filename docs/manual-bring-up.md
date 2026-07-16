@@ -23,12 +23,12 @@ writes its root and tenant keys under `ORLOP_SECRETS_DIR` (created if missing).
 
 ```bash
 export DATABASE_URL="sqlite:./orlop.db"   # schema applied on first open
-export ORLOP_SECRETS_DIR=./dg-secrets     # CA keys live here
+export ORLOP_SECRETS_DIR=./orlop-secrets  # CA keys live here
 
 # the token, trust domain, and FQDN must match the data-plane server (step 3)
 export ORLOP_CONTROL_PLANE_TOKEN=$(openssl rand -hex 16)
 export ORLOP_TRUST_DOMAIN=demo.example
-export ORLOP_DATAGW_SERVER_FQDN=localhost
+export ORLOP_SERVER_FQDN=localhost
 
 PORT=8080 orlop-control &
 # ready when: GET http://localhost:8080/healthz → 200
@@ -59,8 +59,8 @@ Re-running is idempotent on `--data-addr`.
 tenant:
   id: a_demo                 # bootstrap tenant; more register at enroll
   name: demo agent disk
-store:   { type: local,  root: ./dg-data/objects }
-routes:  { type: sqlite, path: ./dg-data/routes.db }
+store:   { type: local,  root: ./orlop-data/objects }
+routes:  { type: sqlite, path: ./orlop-data/routes.db }
 server:
   ops_bind:  ":7878"         # bare :port — see the note below
   data_bind: ":8443"
@@ -69,7 +69,7 @@ tls:
   control_url: http://localhost:8080
   fqdn: localhost
   trust_domain: demo.example
-tenants_root: ./dg-data/tenants
+tenants_root: ./orlop-data/tenants
 quota: { enforce: false }
 ```
 
@@ -78,10 +78,10 @@ which can resolve to IPv6 `::1`; a `127.0.0.1`-only listener refuses that. The
 bare `:port` form listens on both stacks while the cert SAN stays `localhost`.
 
 ```bash
-mkdir -p dg-data/objects dg-data/tenants
+mkdir -p orlop-data/objects orlop-data/tenants
 # the service token must equal ORLOP_CONTROL_PLANE_TOKEN — it authenticates
 # the cert self-provisioning request to the control plane
-ORLOP_DATAGW_SERVICE_TOKEN="$ORLOP_CONTROL_PLANE_TOKEN" \
+ORLOP_SERVICE_TOKEN="$ORLOP_CONTROL_PLANE_TOKEN" \
   orlop-server -config server.yaml &
 # ready when: "orlop-server data-plane TCP listening with mTLS"  bind=":8443"
 ```
@@ -130,7 +130,7 @@ cat ./agent-disk/hello.txt    # → hello from a durable agent disk
 ```
 
 The file survived because it lives in the data-plane server's store
-(`./dg-data/objects`), not in the mount point.
+(`./orlop-data/objects`), not in the mount point.
 
 ## Values that must match
 
@@ -139,8 +139,8 @@ sync:
 
 | control plane | data-plane server | why |
 | --- | --- | --- |
-| `ORLOP_CONTROL_PLANE_TOKEN` | `ORLOP_DATAGW_SERVICE_TOKEN` | authenticates cert self-provisioning |
-| `ORLOP_DATAGW_SERVER_FQDN` | `tls.fqdn` | the server cert SAN agents validate |
+| `ORLOP_CONTROL_PLANE_TOKEN` | `ORLOP_SERVICE_TOKEN` | authenticates cert self-provisioning |
+| `ORLOP_SERVER_FQDN` | `tls.fqdn` | the server cert SAN agents validate |
 | `ORLOP_TRUST_DOMAIN` | `tls.trust_domain` | SPIFFE trust domain on every cert |
 | `server register --data-addr` host | `tls.fqdn` | agents dial the name in the cert |
 
@@ -149,7 +149,7 @@ sync:
 ```bash
 kill %1 %2 %3 2>/dev/null     # orlop mount, orlop-server, orlop-control
 rm -f ./orlop.db*             # SQLite database and its WAL sidecars
-rm -rf ./dg-secrets ./dg-data ./agent-disk
+rm -rf ./orlop-secrets ./orlop-data ./agent-disk
 ```
 
 This is a single-node developer bring-up. For Postgres and multiple

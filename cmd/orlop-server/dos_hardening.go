@@ -116,21 +116,21 @@ func checkContainerLen(n, budget int) error {
 
 // Data-plane resource limits. The defaults are generous enough that a
 // well-behaved fleet never approaches them; they exist to turn "unbounded" into
-// "finite" against a hostile authenticated agent. Override via env on small
-// hosts. (Before these, the data plane had NO connection cap, NO in-flight
-// request cap, and NO per-chunk size cap — one agent could exhaust goroutines,
-// memory, or host disk for every tenant on the server.)
+// "finite" against a hostile authenticated agent — without a connection cap, an
+// in-flight request cap, and a per-chunk size cap, one agent could exhaust
+// goroutines, memory, or host disk for every tenant on the server. Override via
+// env on small hosts.
 var (
 	// maxDataPlaneSessions bounds concurrent framed sessions (a TCP connection
 	// or a single QUIC stream, which both funnel through serveFrames). When the
 	// cap is hit, new sessions are rejected (the connection is closed) rather
 	// than queued, so a flood fails fast instead of growing memory.
-	maxDataPlaneSessions = envInt("ORLOP_DATAGW_MAX_SESSIONS", 1024)
+	maxDataPlaneSessions = envInt(envKeyWithLegacy("ORLOP_MAX_SESSIONS", "ORLOP_DATAGW_MAX_SESSIONS"), 1024)
 	// maxInFlightRequests bounds concurrent request-handler goroutines across the
 	// whole server. Acquired before the goroutine is spawned, so a single
 	// connection can't outrun its handlers — the read loop blocks (backpressure)
 	// instead of spawning unbounded goroutines.
-	maxInFlightRequests = envInt("ORLOP_DATAGW_MAX_INFLIGHT", 256)
+	maxInFlightRequests = envInt(envKeyWithLegacy("ORLOP_MAX_INFLIGHT", "ORLOP_DATAGW_MAX_INFLIGHT"), 256)
 )
 
 // maxChunkBytes caps a single stored chunk. The client's FastCDC chunker never

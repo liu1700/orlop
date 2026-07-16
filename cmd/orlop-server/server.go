@@ -91,20 +91,17 @@ type tenantState struct {
 	closed bool
 }
 
-// errTenantGone is returned by tenant store mutations attempted after the tenant
-// has been unregistered. The caller — a data-plane handler on a still-open but
-// doomed connection — surfaces it as an error rather than silently resurrecting
-// the tenant's on-disk directory (#103).
+// errTenantGone is returned by tenant store mutations attempted after the
+// tenant has been unregistered (see liveMu), instead of silently recreating
+// the tenant's on-disk directory.
 var errTenantGone = errors.New("tenant unregistered")
 
-// putChunk stores a chunk through the tenant's content-addressed store unless the
-// tenant has been torn down. It holds liveMu for reading across the entire store
-// write so it cannot interleave with unregisterTenant's RemoveAll: the write
-// either completes before markClosed returns (and is then removed together with
-// the directory) or observes closed and refuses without any filesystem write.
-// Chunk Put is the only data-plane write that MkdirAll's the tenant directory —
-// a manifest write instead hits the already-closed routes.db and fails — so
-// gating it here closes the orphan-dir race (#103).
+// putChunk stores a chunk through the tenant's content-addressed store unless
+// the tenant has been torn down. It holds liveMu for reading across the entire
+// store write (see liveMu for the ordering invariant). Chunk Put is the only
+// data-plane write that MkdirAll's the tenant directory — a manifest write
+// instead hits the already-closed routes.db and fails — so this is the one
+// mutation that must be gated.
 func (t *tenantState) putChunk(hash, data []byte) (bool, error) {
 	t.liveMu.RLock()
 	defer t.liveMu.RUnlock()

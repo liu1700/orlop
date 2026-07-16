@@ -177,19 +177,35 @@ func TestGoRequestNilSemaphoreStillRuns(t *testing.T) {
 }
 
 func TestEnvInt(t *testing.T) {
-	if got := envInt("ORLOP_DATAGW_NONEXISTENT_ZZZ", 7); got != 7 {
+	if got := envInt("ORLOP_NONEXISTENT_ZZZ", 7); got != 7 {
 		t.Fatalf("missing env: got %d, want 7", got)
 	}
-	t.Setenv("ORLOP_DATAGW_TEST_INT", "42")
-	if got := envInt("ORLOP_DATAGW_TEST_INT", 7); got != 42 {
+	t.Setenv("ORLOP_TEST_INT", "42")
+	if got := envInt("ORLOP_TEST_INT", 7); got != 42 {
 		t.Fatalf("valid env: got %d, want 42", got)
 	}
-	t.Setenv("ORLOP_DATAGW_TEST_INT", "-5")
-	if got := envInt("ORLOP_DATAGW_TEST_INT", 7); got != 7 {
+	t.Setenv("ORLOP_TEST_INT", "-5")
+	if got := envInt("ORLOP_TEST_INT", 7); got != 7 {
 		t.Fatalf("negative env should fall back: got %d, want 7", got)
 	}
-	t.Setenv("ORLOP_DATAGW_TEST_INT", "notanumber")
-	if got := envInt("ORLOP_DATAGW_TEST_INT", 7); got != 7 {
+	t.Setenv("ORLOP_TEST_INT", "notanumber")
+	if got := envInt("ORLOP_TEST_INT", 7); got != 7 {
 		t.Fatalf("invalid env should fall back: got %d, want 7", got)
+	}
+}
+
+func TestEnvKeyWithLegacy(t *testing.T) {
+	const primary = "ORLOP_TEST_ALIAS"
+	const legacy = "ORLOP_DATAGW_TEST_ALIAS"
+	if got := envKeyWithLegacy(primary, legacy); got != primary {
+		t.Fatalf("neither set: got %q, want %q", got, primary)
+	}
+	t.Setenv(legacy, "old")
+	if got := envKeyWithLegacy(primary, legacy); got != legacy {
+		t.Fatalf("legacy only: got %q, want %q", got, legacy)
+	}
+	t.Setenv(primary, "new")
+	if got := envKeyWithLegacy(primary, legacy); got != primary {
+		t.Fatalf("both set, primary wins: got %q, want %q", got, primary)
 	}
 }

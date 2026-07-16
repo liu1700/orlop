@@ -355,7 +355,7 @@ func sendResp[T any](w *frameWriter, frame dataplane.Frame, val T) {
 }
 
 // authorizePath runs the two request-path gates shared by every path-addressed
-// handler, in the same order they were previously inlined: the tenant policy
+// handler, in a fixed order: the tenant policy
 // check (deny → audit row + EACCES frame) followed by the per-agent subtree
 // moat (checkAgentPath, which writes its own audit row + EACCES on deny).
 // event is the audit event name; sessionID tags the deny row for sessioned
@@ -886,8 +886,8 @@ func handleChunkPut(s *serverState, tenant *tenantState, ident Identity, w *fram
 		return
 	}
 	// putChunk (not chunks.Put) so a chunk arriving on a still-open connection
-	// after the tenant was unregistered is refused instead of MkdirAll'ing the
-	// deleted tenant dir back into existence (#103).
+	// after the tenant was unregistered is refused instead of recreating the
+	// deleted tenant dir (see tenantState.liveMu).
 	stored, err := tenant.putChunk(req.Hash, req.Bytes)
 	if err != nil {
 		if errors.Is(err, errTenantGone) {

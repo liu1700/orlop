@@ -11,7 +11,7 @@
 #   Ports : 7878 (ops/HTTPS, server.ops_bind), 8443 (data/mTLS, server.data_bind)
 #   Config: requires a YAML config via `-config`; the default CMD reads
 #           /etc/orlop/server.yaml, so mount your config there (ConfigMap).
-#   Env   : ORLOP_DATAGW_SERVICE_TOKEN (must equal the control plane's
+#   Env   : ORLOP_SERVICE_TOKEN (must equal the control plane's
 #           ORLOP_CONTROL_PLANE_TOKEN), ORLOP_JFS_META_URL (juicefs quota), ORLOP_*
 #   State : object store + routes DB live under the paths named in the config
 #           (store.root, routes.path, tenants_root) — back them with a volume.

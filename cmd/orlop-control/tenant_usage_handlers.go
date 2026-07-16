@@ -110,8 +110,8 @@ func (h *controlTenantUsageHandlers) handleTenantUsage(w http.ResponseWriter, r 
 		return
 	}
 
-	// Each of the owner's agents now has its OWN storage tenant; their used bytes sum
-	// to the owner's total (docs/design/per-agent-tenant.md). A legacy non-agent
+	// Each of the owner's agents has its OWN storage tenant; their used bytes sum
+	// to the owner's total. A legacy non-agent
 	// allocation with no per-agent tenant falls back to the owner's tenant.
 	allocs, err := h.queries.ListAllocationsForUser(r.Context(), toUUID(ownerID))
 	if err != nil {

@@ -11,7 +11,7 @@ import (
 
 // Postgres is a Backend that stores secrets as rows in the dg_ca_secrets table.
 // It exists so a production deploy can keep the CA (root key + tenant
-// intermediates) in the same durable Postgres dg-control already depends on,
+// intermediates) in the same durable Postgres orlop-control already depends on,
 // instead of a block-storage PVC mounted at ORLOP_SECRETS_DIR. Keys are the same
 // slash-separated paths the Filesystem backend uses ("ca/root/cert.pem", etc.);
 // values are opaque bytes. There is no per-secret size limit (unlike a k8s

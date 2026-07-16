@@ -135,16 +135,16 @@ const (
 	tenantPrefixAgent = "a_" // per-agent storage tenant
 )
 
-// tenantIDForOwner derives the deterministic dg-tenant id from a orlop owner
+// tenantIDForOwner derives the deterministic tenant id from an orlop owner
 // (user) UUID. Idempotent ensure keys on this id.
 func tenantIDForOwner(ownerID string) string { return tenantPrefixUser + ownerID }
 
-// tenantForAgent derives the per-agent storage tenant id from a orlop agent id.
+// tenantForAgent derives the per-agent storage tenant id from an orlop agent id.
 // Each agent's disk lives in its own tenant so it can be re-homed to a different
-// billing owner without moving data (docs/design/per-agent-tenant.md).
+// billing owner without moving data (see handleReassign).
 func tenantForAgent(agentID string) string { return tenantPrefixAgent + agentID }
 
-// syntheticUserEmail is the email stored on the reused dg user row. The dg user
+// syntheticUserEmail is the email stored on the reused user row. The user
 // id is the orlop user UUID; the email column is NOT NULL UNIQUE so we mint a
 // deterministic synthetic address per owner.
 func syntheticUserEmail(ownerID string) string {
@@ -227,7 +227,7 @@ func (h *entityHandlers) handleProvision(w http.ResponseWriter, r *http.Request)
 
 	// D3b: ensure the agent's OWN storage tenant. Keying the disk on a per-agent
 	// tenant (not the owner's) is what lets a re-parent be a user_id flip with no
-	// data move (docs/design/per-agent-tenant.md).
+	// data move (see handleReassign).
 	agentTenant := tenantForAgent(req.EntityID)
 	if err := h.queries.EnsureTenant(r.Context(), agentTenant, agentTenant); err != nil {
 		h.logger.Error("entity_ensure_agent_tenant_failed", "error", err, "tenant_id", agentTenant)
@@ -335,7 +335,7 @@ func (h *entityHandlers) handleSetQuota(w http.ResponseWriter, r *http.Request) 
 	}
 	// Route through the end-to-end resize primitive so the new cap propagates to
 	// the data-plane ext4 quota and the server_pool reservation — not just the DB
-	// row. (Before this, the cap upgrade was a cosmetic DB-only change.)
+	// row.
 	resized, err := h.resize.Resize(r.Context(), h.serverAPI, fromUUID(alloc.ID), fromUUID(alloc.UserID), newGrant)
 	if err != nil {
 		switch {
@@ -481,8 +481,8 @@ type reassignEntityRequest struct {
 	OwnerID string `json:"owner_id"`
 }
 
-// handleReassign re-homes an agent's disk to a new billing owner WITHOUT moving data
-// (docs/design/per-agent-tenant.md): the disk stays in its per-agent tenant; only the
+// handleReassign re-homes an agent's disk to a new billing owner WITHOUT moving
+// data: the disk stays in its per-agent tenant; only the
 // allocation's user_id (the billing owner) changes. The control-plane calls this to
 // merge an anon trial's agent into an existing account on login. Idempotent, and with
 // no quota gate — a merge is allowed even if it pushes the new owner over their ceiling.

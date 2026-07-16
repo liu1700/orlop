@@ -66,13 +66,24 @@ func httpStartServer(t *testing.T, pool *pgxpool.Pool) (*httptest.Server, *devau
 
 func httpStartServerWithFencer(t *testing.T, pool *pgxpool.Pool, fencer mountLeaseFencer) (*httptest.Server, *devauth.Service) {
 	t.Helper()
+	return startTestServer(t, pool, func(d *runtimeDeps) { d.mountLeaseFencer = fencer })
+}
+
+// startTestServer builds the shared test router — a devauth service plus the
+// postgres store and allocations service — applies any handler-specific deps
+// via mut, and serves it on an httptest.Server torn down with the test.
+func startTestServer(t *testing.T, pool *pgxpool.Pool, mut func(*runtimeDeps)) (*httptest.Server, *devauth.Service) {
+	t.Helper()
 	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
-		devAuth:          svc,
-		store:            postgres.New(pool),
-		allocations:      allocations.NewService(postgres.New(pool), nil),
-		mountLeaseFencer: fencer,
-	}, config{})
+	deps := runtimeDeps{
+		devAuth:     svc,
+		store:       postgres.New(pool),
+		allocations: allocations.NewService(postgres.New(pool), nil),
+	}
+	if mut != nil {
+		mut(&deps)
+	}
+	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), deps, config{})
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
 	return srv, svc

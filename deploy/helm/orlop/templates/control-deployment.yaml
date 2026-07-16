@@ -68,7 +68,7 @@ spec:
                   key: control-plane-token
             # The only FQDN control will sign a server cert for. Equal to the
             # server Service name by construction (see _helpers.tpl).
-            - name: ORLOP_DATAGW_SERVER_FQDN
+            - name: ORLOP_SERVER_FQDN
               value: {{ include "orlop.server.name" . | quote }}
             - name: ORLOP_TRUST_DOMAIN
               value: {{ .Values.trustDomain | quote }}

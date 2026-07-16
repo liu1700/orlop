@@ -4,16 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres/db/sqlcdb"
 )
 
@@ -135,16 +132,7 @@ func (f *fakeJournal) RevertPath(
 
 func startJournalServer(t *testing.T, pool *pgxpool.Pool, jq journalQuerier) (*httptest.Server, *devauth.Service) {
 	t.Helper()
-	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
-		devAuth:        svc,
-		store:          postgres.New(pool),
-		allocations:    allocations.NewService(postgres.New(pool), nil),
-		journalQuerier: jq,
-	}, config{})
-	srv := httptest.NewServer(router)
-	t.Cleanup(srv.Close)
-	return srv, svc
+	return startTestServer(t, pool, func(d *runtimeDeps) { d.journalQuerier = jq })
 }
 
 // journalGet is a small helper that sends GET /api/v1/journal with optional

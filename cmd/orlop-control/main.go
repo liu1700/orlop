@@ -65,10 +65,10 @@ type config struct {
 	InitialGrantBytes int64
 	// ServerCertFQDN is the only name POST /control/sign-server-cert will issue a
 	// self-provisioned orlop-server cert for (CN + DNS SAN). Defaults to the
-	// in-cluster Service name `orlop-server`. ORLOP_DATAGW_SERVER_FQDN.
+	// in-cluster Service name `orlop-server`. ORLOP_SERVER_FQDN.
 	ServerCertFQDN string
 	// ServerCertTTL is the validity of a self-provisioned server cert; the server
-	// re-signs before it expires. ORLOP_DATAGW_SERVER_CERT_TTL (e.g. "2160h").
+	// re-signs before it expires. ORLOP_SERVER_CERT_TTL (e.g. "2160h").
 	ServerCertTTL time.Duration
 	// APITokenTTL, when > 0, sets an expiry on newly minted orlop_ API tokens.
 	// 0 (default) means tokens never expire. ORLOP_API_TOKEN_TTL (e.g. "2160h").
@@ -106,7 +106,7 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	serverCertTTL, err := parseDurationEnv("ORLOP_DATAGW_SERVER_CERT_TTL", defaultServerCertTTL)
+	serverCertTTL, err := parseDurationEnv(envKeyWithLegacy("ORLOP_SERVER_CERT_TTL", "ORLOP_DATAGW_SERVER_CERT_TTL"), defaultServerCertTTL)
 	if err != nil {
 		return config{}, err
 	}
@@ -126,7 +126,7 @@ func loadConfig() (config, error) {
 		CookieDomain:          os.Getenv("ORLOP_COOKIE_DOMAIN"),
 		ControlPlaneToken:     os.Getenv("ORLOP_CONTROL_PLANE_TOKEN"),
 		InitialGrantBytes:     initialGrantBytes,
-		ServerCertFQDN:        getenv("ORLOP_DATAGW_SERVER_FQDN", defaultServerCertFQDN),
+		ServerCertFQDN:        getenv(envKeyWithLegacy("ORLOP_SERVER_FQDN", "ORLOP_DATAGW_SERVER_FQDN"), defaultServerCertFQDN),
 		ServerCertTTL:         serverCertTTL,
 		APITokenTTL:           apiTokenTTL,
 
@@ -243,6 +243,20 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+// envKeyWithLegacy returns primary when it is set, otherwise legacy when that
+// is set, otherwise primary. Callers pass the result to the usual env parsers,
+// so errors name the variable that was actually set. The ORLOP_DATAGW_* names
+// are the datagateway-era spellings, still accepted for back-compat.
+func envKeyWithLegacy(primary, legacy string) string {
+	if strings.TrimSpace(os.Getenv(primary)) != "" {
+		return primary
+	}
+	if strings.TrimSpace(os.Getenv(legacy)) != "" {
+		return legacy
+	}
+	return primary
+}
+
 // cliAction is the top-level decision derived from the process arguments.
 type cliAction int
 
@@ -269,9 +283,8 @@ var subcommands = map[string]func(context.Context, io.Writer, []string) error{
 // (os.Args[1:]). With no arguments orlop-control starts the control-plane HTTP
 // server — the documented `PORT=8080 orlop-control` form. Any other first
 // argument must be a recognized subcommand or a version/help request; anything
-// else is rejected. This is the guard for the footgun where an unknown flag or
-// typo (e.g. `orlop-control --version`) used to fall through and silently boot
-// a control plane on :8080.
+// else is rejected — an unrecognized flag or typo must error out, never fall
+// through and silently boot a control plane on :8080.
 func classifyArgs(args []string) (cliAction, string) {
 	if len(args) == 0 {
 		return actionRunServer, ""
@@ -388,7 +401,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		defer closeStore()
 		// Fail fast if migrations were never applied or an in-place upgrade left
 		// a schema gap, with an actionable error rather than a later opaque
-		// runtime failure (#39).
+		// runtime failure (see verifyStoreSchema).
 		if err := verifyStoreSchema(ctx, st); err != nil {
 			return err
 		}
@@ -812,7 +825,7 @@ func (a *serverapiMountLeaseFencer) FenceAllocation(ctx context.Context, tenantI
 	if !placed {
 		// No server-pool placement for this tenant (single-node / no populated server_pool):
 		// there is no remote data-plane registry to clear, so fencing is a clean no-op rather
-		// than an error. The local dg-server's stale active-lease slot is instead taken over
+		// than an error. The local orlop-server's stale active-lease slot is instead taken over
 		// by the next mount's Install (mount_lease_registry.go), mirroring the DB-lease
 		// takeover that already happens unconditionally one layer up.
 		return nil

@@ -86,7 +86,7 @@ func newCertProvisioner(logger *slog.Logger, cfg Config) (*certProvisioner, erro
 		return nil, errors.New("tls.control_url is required when tls.self_provision is true")
 	}
 	if cfg.ServiceToken == "" {
-		return nil, errors.New("ORLOP_DATAGW_SERVICE_TOKEN is required when tls.self_provision is true")
+		return nil, errors.New("ORLOP_SERVICE_TOKEN is required when tls.self_provision is true")
 	}
 	fqdn := cfg.ServerFQDN
 	if fqdn == "" {

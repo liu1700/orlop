@@ -11,7 +11,7 @@
 # Runtime contract (see docs/container-images.md):
 #   Port  : 8080 (HTTP control API; override with PORT)
 #   Env   : DATABASE_URL (postgres://… or sqlite:/data/orlop.db),
-#           ORLOP_CONTROL_PLANE_TOKEN, ORLOP_DATAGW_SERVER_FQDN, ORLOP_SECRETS_DIR
+#           ORLOP_CONTROL_PLANE_TOKEN, ORLOP_SERVER_FQDN, ORLOP_SECRETS_DIR
 #           (filesystem CA backend) or ORLOP_SECRETS_BACKEND=postgres, ORLOP_*
 #   State : with Postgres + ORLOP_SECRETS_BACKEND=postgres the container is
 #           stateless; with SQLite or the filesystem CA backend, mount a writable
