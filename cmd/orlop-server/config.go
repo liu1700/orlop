@@ -85,7 +85,7 @@ type rawTLS struct {
 	// SelfProvision makes the server mint its own TLS material at boot: it
 	// generates an ed25519 keypair in memory, sends a CSR to orlop-control
 	// (ControlURL) authenticated by the shared service token (env
-	// ORLOP_DATAGW_SERVICE_TOKEN), and serves the returned cert. The private key
+	// ORLOP_SERVICE_TOKEN), and serves the returned cert. The private key
 	// never touches disk. When true, cert_file/key_file/client_ca_file are
 	// ignored. See the agent-isolation and cert-bootstrap design.
 	SelfProvision bool   `yaml:"self_provision"`
@@ -227,7 +227,7 @@ type Config struct {
 
 	// TLSSelfProvision, ControlURL, ServerFQDN, ServiceToken back the boot-time
 	// cert self-provisioning flow (see rawTLS.SelfProvision). ServiceToken is read
-	// from ORLOP_DATAGW_SERVICE_TOKEN (a secret), not the YAML.
+	// from ORLOP_SERVICE_TOKEN (a secret), not the YAML.
 	TLSSelfProvision bool
 	ControlURL       string
 	ServerFQDN       string
@@ -280,6 +280,20 @@ type Config struct {
 // defaultQuotaBurstMarginBytes is the ext4 hard-limit burst buffer applied above
 // a tenant's accounted grant when quota.burst_margin_bytes is unset.
 const defaultQuotaBurstMarginBytes = 256 << 20 // 256 MiB
+
+// envKeyWithLegacy returns primary when it is set, otherwise legacy when that
+// is set, otherwise primary. Callers pass the result to the usual env readers,
+// so errors name the variable that was actually set. The ORLOP_DATAGW_* names
+// are the datagateway-era spellings, still accepted for back-compat.
+func envKeyWithLegacy(primary, legacy string) string {
+	if strings.TrimSpace(os.Getenv(primary)) != "" {
+		return primary
+	}
+	if strings.TrimSpace(os.Getenv(legacy)) != "" {
+		return legacy
+	}
+	return primary
+}
 
 // envBoolDefault reads a boolean env var, returning def when unset/blank and
 // parsing common truthy/falsy spellings otherwise (unparseable -> def).
@@ -380,7 +394,7 @@ func LoadConfig(path string) (Config, error) {
 		TLSSelfProvision:      raw.TLS.SelfProvision,
 		ControlURL:            raw.TLS.ControlURL,
 		ServerFQDN:            raw.TLS.FQDN,
-		ServiceToken:          os.Getenv("ORLOP_DATAGW_SERVICE_TOKEN"),
+		ServiceToken:          os.Getenv(envKeyWithLegacy("ORLOP_SERVICE_TOKEN", "ORLOP_DATAGW_SERVICE_TOKEN")),
 		TenantsRoot:           absOrSelf(raw.TenantsRoot),
 		MetadataRoot:          absOrSelf(metadataRoot),
 		RegisteredTenantsPath: absOrSelf(registeredTenantsPath),

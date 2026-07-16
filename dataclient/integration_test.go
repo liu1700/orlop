@@ -31,7 +31,7 @@ func TestIntegrationDataplane(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// The control API requires UUID entity/owner ids (as plori uses).
+	// The control API requires UUID entity/owner ids.
 	const agentID = "e2e00000-0000-4000-8000-000000000001"
 	const ownerID = "e2e00000-0000-4000-8000-0000000000ff"
 	ctrl := client.New(controlURL, token)

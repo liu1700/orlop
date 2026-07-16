@@ -21,12 +21,12 @@ data:
       data_bind: ":{{ .Values.server.dataPort }}"
     tls:
       # Self-provision: the server generates a keypair in memory, sends a CSR to
-      # the control plane (authenticated by ORLOP_DATAGW_SERVICE_TOKEN), and
+      # the control plane (authenticated by ORLOP_SERVICE_TOKEN), and
       # serves the returned cert. No out-of-band `ca mint-server-cert`, no TLS
       # secret to manage.
       self_provision: true
       control_url: {{ include "orlop.controlURL" . | quote }}
-      # Must equal control's ORLOP_DATAGW_SERVER_FQDN and the server Service name.
+      # Must equal control's ORLOP_SERVER_FQDN and the server Service name.
       fqdn: {{ include "orlop.server.name" . | quote }}
       trust_domain: {{ .Values.trustDomain | quote }}
     tenants_root: {{ .Values.server.persistence.dataDir }}/tenants

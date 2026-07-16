@@ -36,7 +36,7 @@ The control-plane HTTP API and the operator CLI are the **same binary**, so
 | Port | `8080` (HTTP API; override with `PORT`) |
 | Entrypoint | `orlop-control` — no args starts the server; `migrate`, `server`, `token`, `user`, `ca` are subcommands |
 | Default CMD | none (no args → serve) |
-| Required env | `DATABASE_URL` (`postgres://…` or `sqlite:/data/orlop.db`); `ORLOP_CONTROL_PLANE_TOKEN` (shared service token the data plane presents back); `ORLOP_DATAGW_SERVER_FQDN`; and either `ORLOP_SECRETS_BACKEND=postgres` or `ORLOP_SECRETS_DIR` (filesystem CA backend) |
+| Required env | `DATABASE_URL` (`postgres://…` or `sqlite:/data/orlop.db`); `ORLOP_CONTROL_PLANE_TOKEN` (shared service token the data plane presents back); `ORLOP_SERVER_FQDN`; and either `ORLOP_SECRETS_BACKEND=postgres` or `ORLOP_SECRETS_DIR` (filesystem CA backend) |
 | Volumes | none declared. Stateless with Postgres **and** `ORLOP_SECRETS_BACKEND=postgres`; with SQLite or the filesystem CA backend, give it a writable volume (owned by uid `65532`) for the DB file and `ORLOP_SECRETS_DIR` |
 
 Run `orlop-control migrate up` before serving (e.g. a Kubernetes initContainer);
@@ -57,7 +57,7 @@ docker run --rm \
 | Ports | `7878` (ops/HTTPS, `server.ops_bind`) and `8443` (data/mTLS, `server.data_bind`) |
 | Entrypoint | `orlop-server` |
 | Default CMD | `-config /etc/orlop/server.yaml` — mount your YAML config there (e.g. a ConfigMap) |
-| Required env | `ORLOP_DATAGW_SERVICE_TOKEN` (must equal the control plane's `ORLOP_CONTROL_PLANE_TOKEN`); `ORLOP_JFS_META_URL` (only for the JuiceFS quota backend) |
+| Required env | `ORLOP_SERVICE_TOKEN` (must equal the control plane's `ORLOP_CONTROL_PLANE_TOKEN`); `ORLOP_JFS_META_URL` (only for the JuiceFS quota backend) |
 | TLS | with `tls.self_provision`, the server fetches its leaf cert + client CA from the control plane; `tls.fqdn` must match the cert SAN / Service name or the control plane returns `fqdn_not_allowed` and the server exits |
 | Volumes | none declared. The object store and routes DB live at the config's `store.root` / `routes.path` / `tenants_root` — back those paths with a volume |
 

@@ -321,14 +321,21 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 // ErrManifestNotFound when no symlink exists at p, so Delete can fall through
 // to the manifest path.
 func (m *ManifestStore) deleteSymlink(p string) error {
+	return m.deletePathRow("symlinks", "symlink", p)
+}
+
+// deletePathRow removes the path-keyed row in `table` plus its dir_entry in
+// one transaction. Returns ErrManifestNotFound when no row exists at p. Backs
+// deleteSymlink and deleteSpecialNode; `label` names the node kind in errors.
+func (m *ManifestStore) deletePathRow(table, label, p string) error {
 	tx, err := m.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.Exec(`delete from symlinks where path = ?`, p)
+	res, err := tx.Exec(`delete from `+table+` where path = ?`, p)
 	if err != nil {
-		return fmt.Errorf("delete symlink %s: %w", p, err)
+		return fmt.Errorf("delete %s %s: %w", label, p, err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrManifestNotFound
@@ -336,7 +343,7 @@ func (m *ManifestStore) deleteSymlink(p string) error {
 	parent, name := splitParentName(p)
 	if name != "" {
 		if _, err := tx.Exec(`delete from dir_entries where parent = ? and name = ?`, parent, name); err != nil {
-			return fmt.Errorf("delete symlink dir_entry %s/%s: %w", parent, name, err)
+			return fmt.Errorf("delete %s dir_entry %s/%s: %w", label, parent, name, err)
 		}
 	}
 	return tx.Commit()
@@ -661,58 +668,14 @@ func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint
 
 	// 2. Same path: no-op success. Report the source's version (best-effort).
 	if from == to {
-		v := uint64(1)
-		if srcKind == nodeRegular {
-			var sv uint64
-			if qErr := tx.QueryRow(`select version from manifests where path = ?`, from).Scan(&sv); qErr == nil {
-				v = sv
-			}
-		}
-		return v, nil
+		return samePathVersionTx(tx, from, srcKind), nil
 	}
 
-	// 3. Resolve dest kind (may be absent).
-	dstKind, err := resolveKindTx(tx, to)
+	// 3+4. Resolve the destination and enforce the overwrite rules
+	// (RENAME_NOREPLACE, type-combo matrix, dest CAS).
+	dstKind, dstVersion, err := resolveRenameDestTx(tx, to, srcKind, noReplace, expectedTo)
 	if err != nil {
-		return 0, fmt.Errorf("resolve dest %s: %w", to, err)
-	}
-
-	// Create-only rename (RENAME_NOREPLACE): refuse rather than overwrite an existing destination.
-	if noReplace && dstKind != nodeAbsent {
-		return 0, ErrAlreadyExists
-	}
-
-	// 4. Type-combo matrix when the dest exists. `dstVersion` is the dest's
-	// prior version (0 when absent / non-regular); the new version at `to`
-	// stays `dstVersion + 1`, preserving the historical contract (a move onto
-	// a fresh path resets version to 1; an overwrite bumps the dest's version).
-	var dstVersion uint64
-	if dstKind != nodeAbsent {
-		srcIsDir := srcKind == nodeDir
-		dstIsDir := dstKind == nodeDir
-		switch {
-		case srcIsDir && !dstIsDir:
-			return 0, ErrNotDir
-		case !srcIsDir && dstIsDir:
-			return 0, ErrIsDir
-		case srcIsDir && dstIsDir:
-			empty, eErr := dirIsEmptyTx(tx, to)
-			if eErr != nil {
-				return 0, eErr
-			}
-			if !empty {
-				return 0, ErrNotEmpty
-			}
-		}
-		if dstKind == nodeRegular {
-			if qErr := tx.QueryRow(`select version from manifests where path = ?`, to).Scan(&dstVersion); qErr != nil {
-				return 0, fmt.Errorf("read dest version %s: %w", to, qErr)
-			}
-			// CAS-guard a regular-file dest the caller resolved a version for.
-			if expectedTo != 0 && dstVersion != expectedTo {
-				return 0, &VersionConflictError{Existing: dstVersion}
-			}
-		}
+		return 0, err
 	}
 
 	// 5. Parent of `to` must exist (POSIX-correct).
@@ -722,24 +685,10 @@ func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint
 
 	// 6. Read the regular-file source's row up front (needed for CAS, journal,
 	// and the manifest move).
-	var (
-		srcVersion uint64
-		srcBlob    []byte
-		srcSize    uint64
-		srcMode    uint32
-		srcMtime   int64
-		srcUID     uint32
-		srcGID     uint32
-		srcAtime   int64
-	)
+	var src renameSource
 	if srcKind == nodeRegular {
-		if qErr := tx.QueryRow(
-			`select version, size, mode, mtime, chunks, uid, gid, atime from manifests where path = ?`, from,
-		).Scan(&srcVersion, &srcSize, &srcMode, &srcMtime, &srcBlob, &srcUID, &srcGID, &srcAtime); qErr != nil {
-			return 0, fmt.Errorf("read source manifest %s: %w", from, qErr)
-		}
-		if srcVersion != expectedFrom {
-			return 0, &VersionConflictError{Existing: srcVersion}
+		if src, err = readRenameSourceTx(tx, from, expectedFrom); err != nil {
+			return 0, err
 		}
 	}
 
@@ -750,99 +699,21 @@ func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint
 		}
 	}
 
-	// 8. Journal the rename — only for a regular-file source, matching the
-	// prior behavior and the revert engine (which only renames regular files).
-	// The new version at `to` is dstVersion+1 (the historical contract): a move
-	// onto a vacant path yields version 1, an overwrite bumps the displaced
-	// dest's version. Manifest-less sources carry no version and return 1.
-	newVersion := uint64(1)
-	var journalEntry *SessionJournalEntry
-	if srcKind == nodeRegular {
-		newVersion = dstVersion + 1
-		if sessionID != "" {
-			srcChunks, uErr := unpackChunks(srcBlob)
-			if uErr != nil {
-				return 0, fmt.Errorf("unpack src chunks for %s: %w", from, uErr)
-			}
-			prior := Manifest{
-				Path: from, Size: srcSize, Mode: srcMode, Mtime: srcMtime,
-				Version: srcVersion, Chunks: srcChunks,
-				Uid: srcUID, Gid: srcGID, Atime: srcAtime,
-			}
-			entry, jErr := journalBeforeWrite(tx, sessionID, allocationID, agentID, SessionOpRename, to, &prior, &newVersion, from, m.metrics)
-			if jErr != nil {
-				return 0, jErr
-			}
-			journalEntry = entry
-		}
+	// 8. Version bookkeeping + journal — only for a regular-file source.
+	newVersion, journalEntry, err := m.journalRenameTx(tx, from, to, srcKind, dstVersion, src, sessionID, allocationID, agentID)
+	if err != nil {
+		return 0, err
 	}
 
 	// 9. Move the source's backing row to `to`.
-	switch srcKind {
-	case nodeRegular:
-		if _, err := tx.Exec(
-			`update manifests set path = ?, version = ? where path = ?`,
-			to, newVersion, from,
-		); err != nil {
-			return 0, fmt.Errorf("move manifest %s->%s: %w", from, to, err)
-		}
-	case nodeSymlink:
-		if _, err := tx.Exec(`update symlinks set path = ? where path = ?`, to, from); err != nil {
-			return 0, fmt.Errorf("move symlink %s->%s: %w", from, to, err)
-		}
-	case nodeSpecial:
-		if _, err := tx.Exec(`update special_nodes set path = ? where path = ?`, to, from); err != nil {
-			return 0, fmt.Errorf("move special node %s->%s: %w", from, to, err)
-		}
-	case nodeDir:
-		// Re-parent every descendant path/parent BEFORE moving the dir's own
-		// entry, so the prefix rewrite still matches `from/...`.
-		if err := reparentDescendantsTx(tx, from, to); err != nil {
-			return 0, err
-		}
+	if err := moveRenameSourceTx(tx, from, to, srcKind, newVersion); err != nil {
+		return 0, err
 	}
 
 	// 10. Rewrite the source's own dir_entry: drop (fromParent,fromName), add
-	// (toParent,toName). Carry the directory's stored mode/owner/atime so a
-	// moved directory keeps its metadata.
-	fromParent, fromName := splitParentName(from)
-	toParent, toName := splitParentName(to)
-	if srcKind == nodeDir {
-		var dMode uint32
-		var dUID, dGID uint32
-		var dAtime int64
-		if qErr := tx.QueryRow(
-			`select mode, uid, gid, atime from dir_entries where parent = ? and name = ?`, fromParent, fromName,
-		).Scan(&dMode, &dUID, &dGID, &dAtime); qErr != nil && !errors.Is(qErr, sql.ErrNoRows) {
-			return 0, fmt.Errorf("read dir metadata %s: %w", from, qErr)
-		}
-		if fromName != "" {
-			if _, err := tx.Exec(`delete from dir_entries where parent = ? and name = ?`, fromParent, fromName); err != nil {
-				return 0, fmt.Errorf("delete dir_entry %s/%s: %w", fromParent, fromName, err)
-			}
-		}
-		if toName != "" {
-			if _, err := tx.Exec(
-				`insert into dir_entries(parent, name, mode, uid, gid, atime) values(?, ?, ?, ?, ?, ?)
-				 on conflict(parent, name) do update set mode=excluded.mode, uid=excluded.uid, gid=excluded.gid, atime=excluded.atime`,
-				toParent, toName, dMode, dUID, dGID, dAtime,
-			); err != nil {
-				return 0, fmt.Errorf("insert dir_entry %s/%s: %w", toParent, toName, err)
-			}
-		}
-	} else {
-		if fromName != "" {
-			if _, err := tx.Exec(`delete from dir_entries where parent = ? and name = ?`, fromParent, fromName); err != nil {
-				return 0, fmt.Errorf("delete dir_entry %s/%s: %w", fromParent, fromName, err)
-			}
-		}
-		if toName != "" {
-			if _, err := tx.Exec(
-				`insert or ignore into dir_entries(parent, name) values(?, ?)`, toParent, toName,
-			); err != nil {
-				return 0, fmt.Errorf("insert dir_entry %s/%s: %w", toParent, toName, err)
-			}
-		}
+	// (toParent,toName).
+	if err := rewriteRenameDirEntriesTx(tx, from, to, srcKind); err != nil {
+		return 0, err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -853,6 +724,192 @@ func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint
 		m.journal.Broadcast(journalEntry.AllocationID, *journalEntry)
 	}
 	return newVersion, nil
+}
+
+// samePathVersionTx reports the version a from == to no-op rename returns: the
+// stored manifest version for a regular file (best-effort), 1 otherwise.
+func samePathVersionTx(tx *sql.Tx, p string, kind nodeKind) uint64 {
+	if kind == nodeRegular {
+		var v uint64
+		if err := tx.QueryRow(`select version from manifests where path = ?`, p).Scan(&v); err == nil {
+			return v
+		}
+	}
+	return 1
+}
+
+// resolveRenameDestTx resolves the destination of a rename and enforces the
+// overwrite rules documented on renameOpt: RENAME_NOREPLACE first (an existing
+// destination of ANY kind → ErrAlreadyExists), then the type-combo matrix.
+// dstVersion is the dest's prior version (0 when absent / non-regular); a
+// regular-file dest is CAS-guarded against expectedTo when non-zero.
+func resolveRenameDestTx(tx *sql.Tx, to string, srcKind nodeKind, noReplace bool, expectedTo uint64) (nodeKind, uint64, error) {
+	dstKind, err := resolveKindTx(tx, to)
+	if err != nil {
+		return nodeAbsent, 0, fmt.Errorf("resolve dest %s: %w", to, err)
+	}
+	if dstKind == nodeAbsent {
+		return dstKind, 0, nil
+	}
+	if noReplace {
+		return dstKind, 0, ErrAlreadyExists
+	}
+	srcIsDir := srcKind == nodeDir
+	dstIsDir := dstKind == nodeDir
+	switch {
+	case srcIsDir && !dstIsDir:
+		return dstKind, 0, ErrNotDir
+	case !srcIsDir && dstIsDir:
+		return dstKind, 0, ErrIsDir
+	case srcIsDir && dstIsDir:
+		empty, eErr := dirIsEmptyTx(tx, to)
+		if eErr != nil {
+			return dstKind, 0, eErr
+		}
+		if !empty {
+			return dstKind, 0, ErrNotEmpty
+		}
+	}
+	var dstVersion uint64
+	if dstKind == nodeRegular {
+		if qErr := tx.QueryRow(`select version from manifests where path = ?`, to).Scan(&dstVersion); qErr != nil {
+			return dstKind, 0, fmt.Errorf("read dest version %s: %w", to, qErr)
+		}
+		// CAS-guard a regular-file dest the caller resolved a version for.
+		if expectedTo != 0 && dstVersion != expectedTo {
+			return dstKind, 0, &VersionConflictError{Existing: dstVersion}
+		}
+	}
+	return dstKind, dstVersion, nil
+}
+
+// renameSource is the regular-file source row renameOpt reads up front — the
+// CAS check, the journal entry, and the manifest move all need it.
+type renameSource struct {
+	version uint64
+	blob    []byte
+	size    uint64
+	mode    uint32
+	mtime   int64
+	uid     uint32
+	gid     uint32
+	atime   int64
+}
+
+// readRenameSourceTx reads the regular-file source's manifest row and
+// CAS-checks it against expectedFrom.
+func readRenameSourceTx(tx *sql.Tx, from string, expectedFrom uint64) (renameSource, error) {
+	var src renameSource
+	if qErr := tx.QueryRow(
+		`select version, size, mode, mtime, chunks, uid, gid, atime from manifests where path = ?`, from,
+	).Scan(&src.version, &src.size, &src.mode, &src.mtime, &src.blob, &src.uid, &src.gid, &src.atime); qErr != nil {
+		return renameSource{}, fmt.Errorf("read source manifest %s: %w", from, qErr)
+	}
+	if src.version != expectedFrom {
+		return renameSource{}, &VersionConflictError{Existing: src.version}
+	}
+	return src, nil
+}
+
+// journalRenameTx computes the version the rename lands at `to` and journals
+// the rename — only for a regular-file source, matching the prior behavior and
+// the revert engine (which only renames regular files). The new version at
+// `to` is dstVersion+1 (the historical contract): a move onto a vacant path
+// yields version 1, an overwrite bumps the displaced dest's version.
+// Manifest-less sources carry no version and return 1.
+func (m *ManifestStore) journalRenameTx(tx *sql.Tx, from, to string, srcKind nodeKind, dstVersion uint64, src renameSource, sessionID, allocationID, agentID string) (uint64, *SessionJournalEntry, error) {
+	if srcKind != nodeRegular {
+		return 1, nil, nil
+	}
+	newVersion := dstVersion + 1
+	if sessionID == "" {
+		return newVersion, nil, nil
+	}
+	srcChunks, uErr := unpackChunks(src.blob)
+	if uErr != nil {
+		return 0, nil, fmt.Errorf("unpack src chunks for %s: %w", from, uErr)
+	}
+	prior := Manifest{
+		Path: from, Size: src.size, Mode: src.mode, Mtime: src.mtime,
+		Version: src.version, Chunks: srcChunks,
+		Uid: src.uid, Gid: src.gid, Atime: src.atime,
+	}
+	entry, jErr := journalBeforeWrite(tx, sessionID, allocationID, agentID, SessionOpRename, to, &prior, &newVersion, from, m.metrics)
+	if jErr != nil {
+		return 0, nil, jErr
+	}
+	return newVersion, entry, nil
+}
+
+// moveRenameSourceTx moves the source's backing row to `to`: a path (and, for
+// regular files, version) rewrite on the kind's own table, or a descendant
+// re-parent for directories.
+func moveRenameSourceTx(tx *sql.Tx, from, to string, srcKind nodeKind, newVersion uint64) error {
+	switch srcKind {
+	case nodeRegular:
+		if _, err := tx.Exec(
+			`update manifests set path = ?, version = ? where path = ?`,
+			to, newVersion, from,
+		); err != nil {
+			return fmt.Errorf("move manifest %s->%s: %w", from, to, err)
+		}
+	case nodeSymlink:
+		if _, err := tx.Exec(`update symlinks set path = ? where path = ?`, to, from); err != nil {
+			return fmt.Errorf("move symlink %s->%s: %w", from, to, err)
+		}
+	case nodeSpecial:
+		if _, err := tx.Exec(`update special_nodes set path = ? where path = ?`, to, from); err != nil {
+			return fmt.Errorf("move special node %s->%s: %w", from, to, err)
+		}
+	case nodeDir:
+		// Re-parent every descendant path/parent BEFORE moving the dir's own
+		// entry, so the prefix rewrite still matches `from/...`.
+		if err := reparentDescendantsTx(tx, from, to); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rewriteRenameDirEntriesTx rewrites the source's own dir_entry: drop
+// (fromParent,fromName), add (toParent,toName). A directory carries its stored
+// mode/owner/atime so a moved directory keeps its metadata.
+func rewriteRenameDirEntriesTx(tx *sql.Tx, from, to string, srcKind nodeKind) error {
+	fromParent, fromName := splitParentName(from)
+	toParent, toName := splitParentName(to)
+
+	var dMode, dUID, dGID uint32
+	var dAtime int64
+	if srcKind == nodeDir {
+		if qErr := tx.QueryRow(
+			`select mode, uid, gid, atime from dir_entries where parent = ? and name = ?`, fromParent, fromName,
+		).Scan(&dMode, &dUID, &dGID, &dAtime); qErr != nil && !errors.Is(qErr, sql.ErrNoRows) {
+			return fmt.Errorf("read dir metadata %s: %w", from, qErr)
+		}
+	}
+	if fromName != "" {
+		if _, err := tx.Exec(`delete from dir_entries where parent = ? and name = ?`, fromParent, fromName); err != nil {
+			return fmt.Errorf("delete dir_entry %s/%s: %w", fromParent, fromName, err)
+		}
+	}
+	if toName != "" {
+		if srcKind == nodeDir {
+			if _, err := tx.Exec(
+				`insert into dir_entries(parent, name, mode, uid, gid, atime) values(?, ?, ?, ?, ?, ?)
+				 on conflict(parent, name) do update set mode=excluded.mode, uid=excluded.uid, gid=excluded.gid, atime=excluded.atime`,
+				toParent, toName, dMode, dUID, dGID, dAtime,
+			); err != nil {
+				return fmt.Errorf("insert dir_entry %s/%s: %w", toParent, toName, err)
+			}
+		} else {
+			if _, err := tx.Exec(
+				`insert or ignore into dir_entries(parent, name) values(?, ?)`, toParent, toName,
+			); err != nil {
+				return fmt.Errorf("insert dir_entry %s/%s: %w", toParent, toName, err)
+			}
+		}
+	}
+	return nil
 }
 
 // RegisterDir ensures (parent, name) exists in dir_entries. Used by migration
@@ -1160,25 +1217,7 @@ func (m *ManifestStore) SpecialNodeInfo(p string) (mode uint32, rdev uint64, uid
 // deleteSpecialNode removes the special node row + its dir_entry. Returns
 // ErrManifestNotFound if p is not a special node. Mirrors deleteSymlink.
 func (m *ManifestStore) deleteSpecialNode(p string) error {
-	tx, err := m.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	res, err := tx.Exec(`delete from special_nodes where path = ?`, p)
-	if err != nil {
-		return fmt.Errorf("delete special node %s: %w", p, err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrManifestNotFound
-	}
-	parent, name := splitParentName(p)
-	if name != "" {
-		if _, err := tx.Exec(`delete from dir_entries where parent = ? and name = ?`, parent, name); err != nil {
-			return fmt.Errorf("delete special node dir_entry %s/%s: %w", parent, name, err)
-		}
-	}
-	return tx.Commit()
+	return m.deletePathRow("special_nodes", "special node", p)
 }
 
 // SetMode changes the permission bits of the file, directory, or symlink at p.

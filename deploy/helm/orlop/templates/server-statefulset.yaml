@@ -41,7 +41,7 @@ spec:
               containerPort: {{ .Values.server.dataPort }}
           env:
             # Must equal control's ORLOP_CONTROL_PLANE_TOKEN — same Secret key.
-            - name: ORLOP_DATAGW_SERVICE_TOKEN
+            - name: ORLOP_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "orlop.secretName" . }}

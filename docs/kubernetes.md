@@ -84,8 +84,8 @@ derives each from a single source, so they cannot drift:
 
 | Invariant | How the chart guarantees it |
 |---|---|
-| control's `ORLOP_CONTROL_PLANE_TOKEN` **==** server's `ORLOP_DATAGW_SERVICE_TOKEN` | both read the same Secret key `control-plane-token` |
-| `ORLOP_DATAGW_SERVER_FQDN` (control) **==** server `tls.fqdn` **==** the server Service name | the server Service is **named** `serverFQDN`, and both sides interpolate `serverFQDN` — so the cert SAN always matches the name clients connect to. This is why you never see `fqdn_not_allowed`. |
+| control's `ORLOP_CONTROL_PLANE_TOKEN` **==** server's `ORLOP_SERVICE_TOKEN` | both read the same Secret key `control-plane-token` |
+| `ORLOP_SERVER_FQDN` (control) **==** server `tls.fqdn` **==** the server Service name | the server Service is **named** `serverFQDN`, and both sides interpolate `serverFQDN` — so the cert SAN always matches the name clients connect to. This is why you never see `fqdn_not_allowed`. |
 | trust domain matches on both sides | `trustDomain` is set on control (`ORLOP_TRUST_DOMAIN`) and in the server config (`tls.trust_domain`) |
 
 ## Per-component reference
@@ -99,7 +99,7 @@ derives each from a single source, so they cannot drift:
 | `ORLOP_SECRETS_BACKEND` | `postgres` |
 | `ORLOP_SECRETS_ENC_KEY` | Secret `secrets-enc-key` (the chart requires it for the in-Postgres CA backend) |
 | `ORLOP_CONTROL_PLANE_TOKEN` | Secret `control-plane-token` |
-| `ORLOP_DATAGW_SERVER_FQDN` | `serverFQDN` |
+| `ORLOP_SERVER_FQDN` | `serverFQDN` |
 | `ORLOP_TRUST_DOMAIN` | `trustDomain` |
 | `ORLOP_ORG_NAME` | `orgName` |
 
@@ -117,7 +117,7 @@ shared token:
 
 | Env | Value / source |
 |---|---|
-| `ORLOP_DATAGW_SERVICE_TOKEN` | Secret `control-plane-token` |
+| `ORLOP_SERVICE_TOKEN` | Secret `control-plane-token` |
 
 The config keys (`tls.self_provision`, `tls.control_url`, `tls.fqdn`,
 `tls.trust_domain`, `store`, `routes`, `tenants_root`, `tenant`, `quota`) are

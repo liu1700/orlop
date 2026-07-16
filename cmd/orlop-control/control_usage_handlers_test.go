@@ -4,18 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
-	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres/db/sqlcdb"
 )
 
@@ -37,16 +33,7 @@ func (f *fakeUsage) GetTenantUsage(_ context.Context, opsAddr, tenantID string) 
 
 func startUsageServer(t *testing.T, pool *pgxpool.Pool, usage tenantUsageClient) (*httptest.Server, *devauth.Service) {
 	t.Helper()
-	svc := devauth.NewService(postgres.New(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	router := newRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeDeps{
-		devAuth:     svc,
-		store:       postgres.New(pool),
-		allocations: allocations.NewService(postgres.New(pool), nil),
-		serverUsage: usage,
-	}, config{})
-	srv := httptest.NewServer(router)
-	t.Cleanup(srv.Close)
-	return srv, svc
+	return startTestServer(t, pool, func(d *runtimeDeps) { d.serverUsage = usage })
 }
 
 func seedServerVMAndPool(t *testing.T, pool *pgxpool.Pool, tenantID, dataAddr, opsAddr string) {
