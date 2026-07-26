@@ -23,11 +23,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo build --locked
+
+      # Release binaries target musl, whose libc ABI differs from glibc for
+      # pthread_t and ancillary-message length fields. Build that exact target
+      # on every PR so tag-only release jobs cannot discover portability bugs.
+      - run: cargo build --release --locked --bin orlop --target x86_64-unknown-linux-musl
 
       - name: Reject accidental libfuse ABI dependency
         run: |

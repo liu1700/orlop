@@ -666,6 +666,9 @@ mod linux {
         rmp_serde::from_slice(&bytes).context("decode handoff frame")
     }
 
+    // glibc exposes these ancillary-data lengths as usize, while musl uses
+    // socklen_t. The conversions are intentionally redundant on glibc.
+    #[allow(clippy::useless_conversion)]
     fn send_fd(stream: &UnixStream, fd: RawFd) -> Result<()> {
         let byte = [0x46u8];
         let mut iov = [IoSlice::new(&byte)];
@@ -676,13 +679,17 @@ mod linux {
         message.msg_iov = iov.as_mut_ptr() as *mut libc::iovec;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-        message.msg_controllen = control.len();
+        message.msg_controllen = control
+            .len()
+            .try_into()
+            .context("SCM_RIGHTS control buffer length does not fit msghdr")?;
         unsafe {
             let header = libc::CMSG_FIRSTHDR(&message);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len =
-                libc::CMSG_LEN(std::mem::size_of::<RawFd>() as libc::c_uint) as usize;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as libc::c_uint)
+                .try_into()
+                .context("SCM_RIGHTS payload length does not fit cmsghdr")?;
             std::ptr::write(libc::CMSG_DATA(header) as *mut RawFd, fd);
             loop {
                 let count = libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL);
@@ -702,6 +709,8 @@ mod linux {
         Ok(())
     }
 
+    // See send_fd: the libc field types differ between glibc and musl.
+    #[allow(clippy::useless_conversion)]
     fn receive_fd(stream: &UnixStream) -> Result<OwnedFd> {
         let mut byte = [0u8; 1];
         let mut iov = [IoSliceMut::new(&mut byte)];
@@ -712,7 +721,10 @@ mod linux {
         message.msg_iov = iov.as_mut_ptr() as *mut libc::iovec;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-        message.msg_controllen = control.len();
+        message.msg_controllen = control
+            .len()
+            .try_into()
+            .context("SCM_RIGHTS control buffer length does not fit msghdr")?;
         let count =
             unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
         if count != 1 || byte[0] != 0x46 {
@@ -723,12 +735,21 @@ mod linux {
         }
         unsafe {
             let header = libc::CMSG_FIRSTHDR(&message);
-            let expected_len =
-                libc::CMSG_LEN(std::mem::size_of::<RawFd>() as libc::c_uint) as usize;
+            let expected_len: usize = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as libc::c_uint)
+                .try_into()
+                .context("SCM_RIGHTS payload length does not fit usize")?;
+            let actual_len: usize = if header.is_null() {
+                0
+            } else {
+                (*header)
+                    .cmsg_len
+                    .try_into()
+                    .context("received SCM_RIGHTS payload length does not fit usize")?
+            };
             if header.is_null()
                 || (*header).cmsg_level != libc::SOL_SOCKET
                 || (*header).cmsg_type != libc::SCM_RIGHTS
-                || (*header).cmsg_len != expected_len
+                || actual_len != expected_len
                 || !libc::CMSG_NXTHDR(&message, header).is_null()
             {
                 anyhow::bail!("handoff message did not contain SCM_RIGHTS");
