@@ -854,8 +854,7 @@ mod tests {
             .await;
         assert!(
             matches!(res, Err(nfsstat3::NFS3ERR_ACCES)),
-            "want NFS3ERR_ACCES, got {:?}",
-            res
+            "want NFS3ERR_ACCES, got {res:?}"
         );
 
         audit.flush().unwrap();

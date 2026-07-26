@@ -58,6 +58,14 @@ enum Command {
         /// --config and --credentials are ignored in this mode.
         #[arg(long)]
         from_env: bool,
+        /// Attach this CLI's management state to an existing live Orlop FUSE
+        /// mount. Linux only; cannot revive a dead FUSE connection.
+        #[arg(long, value_name = "PATH")]
+        adopt: Option<PathBuf>,
+        /// Atomically transfer the live FUSE connection to this executable.
+        /// The path must be absolute and executable.
+        #[arg(long, value_name = "ABSOLUTE_BINARY", requires = "adopt")]
+        replace_with: Option<PathBuf>,
     },
     /// Unmount the Orlop filesystem at the given path (or the default
     /// mountpoint from the active config).
@@ -104,6 +112,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Internal successor entry point for an authenticated live handoff.
+    #[command(name = "__handoff-resume", hide = true)]
+    HandoffResume {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        token: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -121,6 +137,13 @@ enum MountCommand {
         path: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    /// Adopt management of a live Orlop mount. With --replace-with, atomically
+    /// hand the initialized FUSE connection to that binary.
+    Adopt {
+        path: PathBuf,
+        #[arg(long)]
+        replace_with: Option<PathBuf>,
     },
 }
 
@@ -191,8 +214,17 @@ fn main() -> anyhow::Result<()> {
             no_inject,
             credentials,
             from_env,
+            adopt,
+            replace_with,
         } => {
             use std::io::Write as _;
+
+            if adopt.is_some() && action.is_some() {
+                anyhow::bail!("--adopt cannot be combined with a mount subcommand");
+            }
+            if let Some(path) = adopt {
+                return run_mount_adopt(path, replace_with.as_deref());
+            }
 
             if let Some(action) = action {
                 match action {
@@ -232,6 +264,9 @@ fn main() -> anyhow::Result<()> {
                         if !*json {
                             println!("Orlop mount {} is alive", mount.path);
                         }
+                    }
+                    MountCommand::Adopt { path, replace_with } => {
+                        return run_mount_adopt(path, replace_with.as_deref());
                     }
                 }
                 return Ok(());
@@ -381,17 +416,16 @@ fn main() -> anyhow::Result<()> {
                     drop(pipe_reader);
                     let writer = std::sync::Arc::new(std::sync::Mutex::new(Some(pipe_writer)));
                     let writer_for_cb = std::sync::Arc::clone(&writer);
-                    let ready_cb: ReadySignal =
-                        Box::new(move |result| {
-                            if let Some(mut w) = writer_for_cb.lock().unwrap().take() {
-                                let _ = match result {
-                                    Ok(()) => writeln!(w, "READY"),
-                                    Err(msg) => writeln!(w, "ERR {msg}"),
-                                };
-                                let _ = w.flush();
-                                // w dropped here closes the write end → parent's read EOFs
-                            }
-                        });
+                    let ready_cb: ReadySignal = Box::new(move |result| {
+                        if let Some(mut w) = writer_for_cb.lock().unwrap().take() {
+                            let _ = match result {
+                                Ok(()) => writeln!(w, "READY"),
+                                Err(msg) => writeln!(w, "ERR {msg}"),
+                            };
+                            let _ = w.flush();
+                            // w dropped here closes the write end → parent's read EOFs
+                        }
+                    });
 
                     let result = run_mount_payload(
                         cfg,
@@ -536,7 +570,12 @@ fn main() -> anyhow::Result<()> {
                     .as_deref()
                     .and_then(|p| login::load(p).ok().flatten())
                     .map(|c| c.control_plane_url);
-                (config_path, config_has_hosted, credentials_path, control_plane_url)
+                (
+                    config_path,
+                    config_has_hosted,
+                    credentials_path,
+                    control_plane_url,
+                )
             };
             let report = orlop::doctor::gather(orlop::doctor::DoctorInputs {
                 cache_root: chunk_cache_root().ok(),
@@ -585,9 +624,46 @@ fn main() -> anyhow::Result<()> {
         Command::Status { json } => {
             orlop::dev::run_status(*json)?;
         }
+        Command::HandoffResume { socket, token } => {
+            #[cfg(target_os = "linux")]
+            {
+                return run_handoff_successor(socket, token);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (socket, token);
+                anyhow::bail!("live FUSE handoff is supported on Linux only");
+            }
+        }
     }
 
     Ok(())
+}
+
+fn run_mount_adopt(path: &Path, replace_with: Option<&Path>) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = match replace_with {
+            Some(binary) => orlop::handoff::request_upgrade(path, binary)?,
+            None => orlop::handoff::inspect(path)?,
+        };
+        orlop::daemon::write_pid_file_atomic(&orlop::daemon::pid_file_path()?, pid)?;
+        if replace_with.is_some() {
+            println!("handed off Orlop mount {} to PID {}", path.display(), pid);
+        } else {
+            println!(
+                "adopted Orlop mount {} (daemon PID {})",
+                path.display(),
+                pid
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, replace_with);
+        anyhow::bail!("live FUSE adoption is supported on Linux only");
+    }
 }
 
 /// Resolves the config path: explicit `--config` first, then the XDG user
@@ -808,6 +884,7 @@ struct CertManager {
     stop: mpsc::Sender<()>,
     handle: Option<thread::JoinHandle<()>>,
     cert_dir: PathBuf,
+    shred_on_drop: bool,
 }
 
 #[derive(Clone)]
@@ -828,6 +905,7 @@ struct MountLeaseManager {
     stop: mpsc::Sender<()>,
     handle: Option<thread::JoinHandle<()>>,
     revoked: Arc<AtomicBool>,
+    release_on_drop: bool,
 }
 
 impl MountLeaseManager {
@@ -837,6 +915,24 @@ impl MountLeaseManager {
         agent_fingerprint: String,
         tls: TlsIdentity,
         mountpoint: PathBuf,
+    ) -> anyhow::Result<Self> {
+        Self::acquire_with_release(
+            control_plane_url,
+            allocation_id,
+            agent_fingerprint,
+            tls,
+            mountpoint,
+            true,
+        )
+    }
+
+    fn acquire_with_release(
+        control_plane_url: String,
+        allocation_id: String,
+        agent_fingerprint: String,
+        tls: TlsIdentity,
+        mountpoint: PathBuf,
+        release_on_drop: bool,
     ) -> anyhow::Result<Self> {
         let client =
             MountLeaseClient::new(control_plane_url, allocation_id, agent_fingerprint, tls)?;
@@ -858,7 +954,13 @@ impl MountLeaseManager {
             stop,
             handle: Some(handle),
             revoked,
+            release_on_drop,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_handoff(&mut self) {
+        self.release_on_drop = true;
     }
 }
 
@@ -868,7 +970,7 @@ impl Drop for MountLeaseManager {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-        if !self.revoked.load(Ordering::Relaxed) {
+        if self.release_on_drop && !self.revoked.load(Ordering::Relaxed) {
             util::warn_err("mount lease release", self.client.release());
         }
     }
@@ -1031,6 +1133,16 @@ impl CertManager {
         initial: EnrolledCert,
         audit: audit::AuditLog,
     ) -> anyhow::Result<Self> {
+        Self::start_with_cleanup(hosted, creds_override, initial, audit, true)
+    }
+
+    fn start_with_cleanup(
+        hosted: HostedConfig,
+        creds_override: Option<&Path>,
+        initial: EnrolledCert,
+        audit: audit::AuditLog,
+        shred_on_drop: bool,
+    ) -> anyhow::Result<Self> {
         let cert_dir = cert_dir_for_hosted(&hosted, creds_override)?;
         // Pre-enrolled hosted mode (Phase 2 anonymous sandbox): the cert
         // TTL (5 min) equals the session TTL (5 min). The session expires
@@ -1045,6 +1157,7 @@ impl CertManager {
                 stop,
                 handle: None,
                 cert_dir,
+                shred_on_drop,
             });
         }
         let mut tokens = token_manager_for_hosted(&hosted, creds_override)?;
@@ -1057,7 +1170,13 @@ impl CertManager {
             stop,
             handle: Some(handle),
             cert_dir,
+            shred_on_drop,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_handoff(&mut self) {
+        self.shred_on_drop = true;
     }
 }
 
@@ -1067,7 +1186,9 @@ impl Drop for CertManager {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-        util::warn_err("cert shred", enroll::shred(&self.cert_dir));
+        if self.shred_on_drop {
+            util::warn_err("cert shred", enroll::shred(&self.cert_dir));
+        }
     }
 }
 
@@ -1450,74 +1571,84 @@ fn run_mount_payload(
         }
     }
 
-    let (backends, _cert_manager, _lease_manager) = if let Some(hosted) = cfg.hosted.clone() {
-        let enrolled = enroll_for_mount(&hosted, creds_override, &audit)?;
-        let tls = enroll::load_identity(&enrolled)
-            .with_context(|| format!("load identity from {}", enrolled.cert_dir.display()))?;
-        let allocation_id = enrolled.allocation_id.clone().ok_or_else(|| {
-            anyhow!(
-                "no allocation_id in enrollment response; the host must re-enroll \
+    let (backends, _cert_manager, _lease_manager, handoff_enrolled) =
+        if let Some(hosted) = cfg.hosted.clone() {
+            let enrolled = enroll_for_mount(&hosted, creds_override, &audit)?;
+            let tls = enroll::load_identity(&enrolled)
+                .with_context(|| format!("load identity from {}", enrolled.cert_dir.display()))?;
+            let allocation_id = enrolled.allocation_id.clone().ok_or_else(|| {
+                anyhow!(
+                    "no allocation_id in enrollment response; the host must re-enroll \
                  the agent (mint a fresh enroll token and re-run `orlop mount --from-env`)"
-            )
-        })?;
-        // Pre-enrolled hosted mode (Phase 2 anonymous sandbox): the cert
-        // was minted directly by control without a row in agent_enrollments,
-        // so the /api/allocations/{id}/mount endpoint would 401 invalid_client.
-        // Skip the control-plane lease too — the session has no dashboard
-        // takeover surface and expires in 5 min anyway; the data-plane
-        // LeaseGrant RPC below still enforces the per-allocation single-writer
-        // invariant via the mountLeases registry.
-        let pre_enrolled = enroll::load_enrollment_sidecar(&enrolled.cert_dir)?.is_some();
-        let lease_manager = if pre_enrolled {
-            None
-        } else {
-            Some(MountLeaseManager::acquire(
-                control_plane_url_for_hosted(&hosted, creds_override)?,
-                allocation_id.clone(),
-                enrolled.cert_serial.clone(),
-                tls.clone(),
-                mountpoint.clone(),
-            )?)
-        };
-        let addr = enrolled.server_addr.clone();
-        eprintln!(
-            "Allocation {} on {} ({})",
-            allocation_id,
-            addr,
-            format_quota(enrolled.size_bytes),
-        );
-        let mount_cfg = MountConfig {
-            name: "orlop".to_string(),
-            mount: hosted.mount_root.clone().unwrap_or_else(|| "/".to_string()),
-            readonly: cfg.policy.readonly,
-            deny: cfg.policy.deny.clone(),
-            allow: cfg.policy.allow.clone(),
-            addr: Some(addr),
-            server_name: None,
-        };
-        let backends = build_stores(&[mount_cfg], Some(&tls), Arc::clone(&chunk_cache))?;
-        for b in &backends {
-            b.store.set_allocation_id(Some(allocation_id.clone()));
-            // Ensure the agent's disk dir exists so its mount root is writable.
-            // Only for a subtree mount (the tenant root "/" already exists). The
-            // agent-scoped cert can create its own /<id> (its authz root) but not
-            // the tenant root. Idempotent — a re-mount just finds it present.
-            if !b.mount_name.is_empty() {
-                if let Err(e) = b.store.dir_create("", 0o755) {
-                    eprintln!("ensure agent disk dir {}: {e:#}", b.mount_name);
+                )
+            })?;
+            // Pre-enrolled hosted mode (Phase 2 anonymous sandbox): the cert
+            // was minted directly by control without a row in agent_enrollments,
+            // so the /api/allocations/{id}/mount endpoint would 401 invalid_client.
+            // Skip the control-plane lease too — the session has no dashboard
+            // takeover surface and expires in 5 min anyway; the data-plane
+            // LeaseGrant RPC below still enforces the per-allocation single-writer
+            // invariant via the mountLeases registry.
+            let pre_enrolled = enroll::load_enrollment_sidecar(&enrolled.cert_dir)?.is_some();
+            let lease_manager = if pre_enrolled {
+                None
+            } else {
+                Some(MountLeaseManager::acquire(
+                    control_plane_url_for_hosted(&hosted, creds_override)?,
+                    allocation_id.clone(),
+                    enrolled.cert_serial.clone(),
+                    tls.clone(),
+                    mountpoint.clone(),
+                )?)
+            };
+            let addr = enrolled.server_addr.clone();
+            eprintln!(
+                "Allocation {} on {} ({})",
+                allocation_id,
+                addr,
+                format_quota(enrolled.size_bytes),
+            );
+            let mount_cfg = MountConfig {
+                name: "orlop".to_string(),
+                mount: hosted.mount_root.clone().unwrap_or_else(|| "/".to_string()),
+                readonly: cfg.policy.readonly,
+                deny: cfg.policy.deny.clone(),
+                allow: cfg.policy.allow.clone(),
+                addr: Some(addr),
+                server_name: None,
+            };
+            let backends = build_stores(&[mount_cfg], Some(&tls), Arc::clone(&chunk_cache))?;
+            for b in &backends {
+                b.store.set_allocation_id(Some(allocation_id.clone()));
+                // Ensure the agent's disk dir exists so its mount root is writable.
+                // Only for a subtree mount (the tenant root "/" already exists). The
+                // agent-scoped cert can create its own /<id> (its authz root) but not
+                // the tenant root. Idempotent — a re-mount just finds it present.
+                if !b.mount_name.is_empty() {
+                    if let Err(e) = b.store.dir_create("", 0o755) {
+                        eprintln!("ensure agent disk dir {}: {e:#}", b.mount_name);
+                    }
                 }
             }
-        }
-        let cert_manager = CertManager::start(hosted, creds_override, enrolled, audit.clone())
-            .with_context(|| "start hosted client certificate renewal task")?;
-        (backends, Some(cert_manager), lease_manager)
-    } else {
-        (
-            build_stores(&cfg.mounts, None, Arc::clone(&chunk_cache))?,
-            None,
-            None,
-        )
-    };
+            let handoff_enrolled = enrolled.clone();
+            let cert_manager = CertManager::start(hosted, creds_override, enrolled, audit.clone())
+                .with_context(|| "start hosted client certificate renewal task")?;
+            (
+                backends,
+                Some(cert_manager),
+                lease_manager,
+                Some(handoff_enrolled),
+            )
+        } else {
+            (
+                build_stores(&cfg.mounts, None, Arc::clone(&chunk_cache))?,
+                None,
+                None,
+                None,
+            )
+        };
+    #[cfg(not(target_os = "linux"))]
+    let _ = &handoff_enrolled;
 
     std::fs::create_dir_all(&mountpoint)
         .with_context(|| format!("failed to create mountpoint {}", mountpoint.display()))?;
@@ -1604,6 +1735,22 @@ fn run_mount_payload(
 
     // Block until the kernel tears the mount down (Linux) or SIGINT arrives
     // (macOS). MountedFs::Drop runs unmount on all exits.
+    #[cfg(target_os = "linux")]
+    let wait_result = {
+        let gate = Arc::new(fuser::SessionGate::new());
+        let (fuse_fd, gateway) = mounted.handoff_parts()?;
+        let runtime = orlop::handoff::RuntimeSpec {
+            config: cfg.clone(),
+            mountpoint: mountpoint.clone(),
+            credentials: creds_override.map(Path::to_path_buf),
+            enrolled: handoff_enrolled,
+        };
+        let _handoff_service =
+            orlop::handoff::Service::start(runtime, fuse_fd, gateway, Arc::clone(&gate))
+                .context("start live handoff service")?;
+        mounted.wait_with_gate(&gate)
+    };
+    #[cfg(not(target_os = "linux"))]
     let wait_result = mounted.wait();
     let _ = probe_thread.join();
     wait_result?;
@@ -1614,6 +1761,169 @@ fn run_mount_payload(
         anyhow::bail!("mount health probe failed: {msg}");
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_handoff_successor(socket: &Path, token: &str) -> anyhow::Result<()> {
+    let (mut predecessor, fuse_fd, transfer) = orlop::handoff::receive_transfer(socket, token)?;
+    let result = prepare_handoff_successor(fuse_fd, transfer);
+    let (mut mounted, gate, service_parts, mut cert_manager, mut lease_manager) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            orlop::handoff::successor_failed(&mut predecessor, &error);
+            return Err(error);
+        }
+    };
+
+    orlop::handoff::successor_prepared(&mut predecessor)?;
+    let (runtime, fuse_fd, gateway) = service_parts;
+    let mut service = match orlop::handoff::Service::start_staged(
+        runtime,
+        fuse_fd,
+        gateway,
+        Arc::clone(&gate),
+        socket,
+    )
+    .context("stage successor handoff service")
+    {
+        Ok(service) => service,
+        Err(error) => {
+            orlop::handoff::successor_failed(&mut predecessor, &error);
+            return Err(error);
+        }
+    };
+    if let Err(error) = service.activate(socket) {
+        orlop::handoff::successor_failed(&mut predecessor, &error);
+        return Err(error);
+    }
+
+    // The atomic socket swap above is the successor's commit point. From here
+    // it must retain the fd even if the predecessor/requester disconnects.
+    mounted.commit_handoff();
+    if let Some(manager) = &mut cert_manager {
+        manager.commit_handoff();
+    }
+    if let Some(manager) = &mut lease_manager {
+        manager.commit_handoff();
+    }
+    if let Err(error) = orlop::handoff::successor_activated(&mut predecessor) {
+        eprintln!("warning: predecessor activation acknowledgement failed: {error:#}");
+    }
+    if let Err(error) = orlop::daemon::pid_file_path()
+        .and_then(|path| orlop::daemon::write_pid_file_atomic(&path, std::process::id()))
+    {
+        eprintln!("warning: update handoff PID file: {error:#}");
+    }
+    mounted.wait_with_gate(&gate)
+}
+
+#[cfg(target_os = "linux")]
+type PreparedSuccessor = (
+    orlop::mount::MountedFs,
+    Arc<fuser::SessionGate>,
+    (
+        orlop::handoff::RuntimeSpec,
+        std::os::fd::OwnedFd,
+        orlop::fs::GatewayHandoff,
+    ),
+    Option<CertManager>,
+    Option<MountLeaseManager>,
+);
+
+#[cfg(target_os = "linux")]
+fn prepare_handoff_successor(
+    fuse_fd: std::os::fd::OwnedFd,
+    transfer: orlop::handoff::Transfer,
+) -> anyhow::Result<PreparedSuccessor> {
+    let runtime = transfer.runtime;
+    let cfg = &runtime.config;
+    let audit = audit::AuditLog::new(cfg.audit_log.clone())?;
+    let cache_cfg = cfg.cache.clone().unwrap_or_default();
+    let chunk_cache = backend::dataplane::ChunkCache::open(
+        chunk_cache_root()?,
+        cfg.chunk_cache.max_bytes,
+        Some(audit.clone()),
+    )?;
+
+    let (backends, cert_manager, lease_manager) = if let Some(hosted) = cfg.hosted.clone() {
+        let enrolled = runtime
+            .enrolled
+            .clone()
+            .ok_or_else(|| anyhow!("hosted handoff did not include enrollment metadata"))?;
+        if chrono::Utc::now() >= enrolled.expires_at {
+            anyhow::bail!("cannot resume with an expired client certificate");
+        }
+        let tls = enroll::load_identity(&enrolled)
+            .with_context(|| format!("load identity from {}", enrolled.cert_dir.display()))?;
+        let allocation_id = enrolled
+            .allocation_id
+            .clone()
+            .ok_or_else(|| anyhow!("handoff enrollment has no allocation_id"))?;
+        let pre_enrolled = enroll::load_enrollment_sidecar(&enrolled.cert_dir)?.is_some();
+        let lease_manager = if pre_enrolled {
+            None
+        } else {
+            Some(MountLeaseManager::acquire_with_release(
+                control_plane_url_for_hosted(&hosted, runtime.credentials.as_deref())?,
+                allocation_id.clone(),
+                enrolled.cert_serial.clone(),
+                tls.clone(),
+                runtime.mountpoint.clone(),
+                false,
+            )?)
+        };
+        let mount_cfg = MountConfig {
+            name: "orlop".to_string(),
+            mount: hosted.mount_root.clone().unwrap_or_else(|| "/".to_string()),
+            readonly: cfg.policy.readonly,
+            deny: cfg.policy.deny.clone(),
+            allow: cfg.policy.allow.clone(),
+            addr: Some(enrolled.server_addr.clone()),
+            server_name: None,
+        };
+        let backends = build_stores(&[mount_cfg], Some(&tls), Arc::clone(&chunk_cache))?;
+        for backend in &backends {
+            backend.store.set_allocation_id(Some(allocation_id.clone()));
+        }
+        let cert_manager = CertManager::start_with_cleanup(
+            hosted,
+            runtime.credentials.as_deref(),
+            enrolled,
+            audit.clone(),
+            false,
+        )
+        .context("start successor certificate renewal task")?;
+        (backends, Some(cert_manager), lease_manager)
+    } else {
+        (
+            build_stores(&cfg.mounts, None, Arc::clone(&chunk_cache))?,
+            None,
+            None,
+        )
+    };
+
+    let mounted = orlop::mount::mount_from_handoff(
+        backends,
+        audit,
+        &cfg.fuse,
+        cache_cfg.write_buffer_bytes,
+        &runtime.mountpoint,
+        orlop::mount::InheritedFuse {
+            fd: fuse_fd,
+            proto_major: transfer.fuse_proto_major,
+            proto_minor: transfer.fuse_proto_minor,
+            snapshot: transfer.snapshot,
+        },
+    )?;
+    let gate = Arc::new(fuser::SessionGate::new());
+    let (service_fd, gateway) = mounted.handoff_parts()?;
+    Ok((
+        mounted,
+        gate,
+        (runtime, service_fd, gateway),
+        cert_manager,
+        lease_manager,
+    ))
 }
 
 fn shred_hosted_certs(hosted: &HostedConfig, creds_override: Option<&Path>) -> anyhow::Result<()> {
@@ -1646,6 +1956,46 @@ fn release_hosted_mount_lease(
         tls,
     )?;
     client.release()
+}
+
+#[cfg(test)]
+mod cli_parsing {
+    use super::*;
+
+    #[test]
+    fn mount_adopt_flag_accepts_replacement_binary() {
+        let cli = Cli::try_parse_from([
+            "orlop",
+            "mount",
+            "--adopt",
+            "/mnt/orlop",
+            "--replace-with",
+            "/opt/orlop/bin/orlop",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Mount {
+                adopt,
+                replace_with,
+                ..
+            } => {
+                assert_eq!(adopt.as_deref(), Some(Path::new("/mnt/orlop")));
+                assert_eq!(
+                    replace_with.as_deref(),
+                    Some(Path::new("/opt/orlop/bin/orlop"))
+                );
+            }
+            _ => panic!("expected mount command"),
+        }
+    }
+
+    #[test]
+    fn replacement_binary_requires_adopt() {
+        assert!(
+            Cli::try_parse_from(["orlop", "mount", "--replace-with", "/opt/orlop/bin/orlop",])
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

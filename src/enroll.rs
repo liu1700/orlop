@@ -29,7 +29,7 @@ const FILE_CA: &str = "ca.pem";
 /// sandbox: control mints the leaf cert and the spawner bundles it in).
 pub const FILE_ENROLLMENT: &str = "enrollment.json";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrolledCert {
     pub cert_dir: PathBuf,
     pub cert_path: PathBuf,
@@ -260,7 +260,7 @@ fn parse_serial(cert_pem: &[u8]) -> String {
         .serial
         .to_bytes_be()
         .iter()
-        .map(|b| format!("{:02x}", b))
+        .map(|b| format!("{b:02x}"))
         .collect()
 }
 

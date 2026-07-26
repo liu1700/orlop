@@ -6,6 +6,7 @@
 use std::fs;
 use std::io;
 use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -60,6 +61,24 @@ pub fn read_pid_file(path: &Path) -> io::Result<Option<u32>> {
     }
 }
 
+/// Atomically replace a PID file, never exposing a partial value to status or
+/// unmount readers. The temporary file is created in the same directory so
+/// rename is atomic across crashes.
+pub fn write_pid_file_atomic(path: &Path, pid: u32) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("PID file has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary PID file in {}", parent.display()))?;
+    writeln!(temp, "{pid}").context("write PID file")?;
+    temp.as_file().sync_all().context("sync PID file")?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace PID file {}", path.display()))?;
+    Ok(())
+}
+
 /// `kill(pid, 0)` — returns `true` if the process exists and the caller can
 /// signal it, `false` otherwise. Doesn't actually signal the process.
 pub fn pid_alive(pid: u32) -> bool {
@@ -95,9 +114,7 @@ pub fn decode_ready(buf: &str) -> ReadyOutcome {
     let line = buf.lines().next();
     match line {
         Some("READY") => ReadyOutcome::Ready,
-        Some(other) if other.starts_with("ERR ") => {
-            ReadyOutcome::Err(other[4..].to_string())
-        }
+        Some(other) if other.starts_with("ERR ") => ReadyOutcome::Err(other[4..].to_string()),
         Some(other) => ReadyOutcome::Err(format!("unrecognized daemon signal: {other}")),
         None => ReadyOutcome::DaemonExited,
     }
@@ -185,8 +202,7 @@ pub fn is_mountpoint_active(path: &Path) -> bool {
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     stdout.lines().any(|line| {
-        line.contains(&format!(" on {} ", path_str))
-            || line.contains(&format!(" on {}(", path_str))
+        line.contains(&format!(" on {path_str} ")) || line.contains(&format!(" on {path_str}("))
     })
 }
 
@@ -212,13 +228,19 @@ mod tests {
 
     #[test]
     fn classify_stale_pid_only_when_dead_and_no_mount() {
-        assert_eq!(classify(Some(42), false, false), PreflightOutcome::StalePidOnly);
+        assert_eq!(
+            classify(Some(42), false, false),
+            PreflightOutcome::StalePidOnly
+        );
     }
 
     #[test]
     fn classify_stale_pid_only_when_dead_with_mount() {
         // PID dead trumps mount existence — the mount may be a remnant.
-        assert_eq!(classify(Some(42), false, true), PreflightOutcome::StalePidOnly);
+        assert_eq!(
+            classify(Some(42), false, true),
+            PreflightOutcome::StalePidOnly
+        );
     }
 
     #[test]
@@ -252,6 +274,18 @@ mod tests {
         fs::write(&tmp, "not-a-pid\n").unwrap();
         assert_eq!(read_pid_file(&tmp).unwrap(), None);
         fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn atomic_pid_write_replaces_existing_value_without_temp_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mount.pid");
+        fs::write(&path, "41\n").unwrap();
+
+        write_pid_file_atomic(&path, 42).unwrap();
+
+        assert_eq!(read_pid_file(&path).unwrap(), Some(42));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

@@ -55,9 +55,7 @@ pub async fn write_frame_async<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> R
         .map_err(|_| anyhow!("frame payload too large: {} bytes", f.payload.len()))?;
     if len > MAX_PAYLOAD_LEN {
         return Err(anyhow!(
-            "frame payload {} exceeds MAX_PAYLOAD_LEN {}",
-            len,
-            MAX_PAYLOAD_LEN
+            "frame payload {len} exceeds MAX_PAYLOAD_LEN {MAX_PAYLOAD_LEN}"
         ));
     }
     let mut header = [0u8; HEADER_LEN];
@@ -85,9 +83,7 @@ pub async fn read_frame_async<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> 
     let len = u32::from_be_bytes(header[12..16].try_into().unwrap());
     if len > MAX_PAYLOAD_LEN {
         return Err(anyhow!(
-            "frame payload {} exceeds MAX_PAYLOAD_LEN {}",
-            len,
-            MAX_PAYLOAD_LEN
+            "frame payload {len} exceeds MAX_PAYLOAD_LEN {MAX_PAYLOAD_LEN}"
         ));
     }
     let mut payload = vec![0u8; len as usize];

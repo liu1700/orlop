@@ -19,6 +19,8 @@ use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::{os::fd::AsFd, os::fd::OwnedFd};
 
 use anyhow::{Context, Result};
 
@@ -36,6 +38,19 @@ pub struct MountedFs {
     /// full mount lifetime so `lease_release` fires only when the mount tears
     /// down, not at end-of-block.
     _lease_handles: Vec<Arc<LeaseHandle>>,
+    #[cfg(target_os = "linux")]
+    handoff: crate::fs::GatewayHandoff,
+    /// Successors must not unmount the predecessor's live connection if
+    /// preparation fails before COMMIT.
+    unmount_on_drop: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub struct InheritedFuse {
+    pub fd: OwnedFd,
+    pub proto_major: u32,
+    pub proto_minor: u32,
+    pub snapshot: crate::fs::HandoffSnapshot,
 }
 
 #[cfg(target_os = "linux")]
@@ -103,6 +118,7 @@ pub fn mount(
 
         let fs = GatewayFs::new(backends, audit, fuse_cfg, write_buffer_bytes);
         let notifier_slot = fs.notifier_handle();
+        let handoff = fs.handoff_handle();
         // AllowOther: the mounter runs privileged/root, but the executor that
         // reads this mount is distroless `USER nonroot`. Without allow_other a
         // FUSE mount is accessible only to the mounting user, so the executor's
@@ -126,6 +142,8 @@ pub fn mount(
             mountpoint: mountpoint.to_path_buf(),
             inner: Inner::Fuse(Some(session)),
             _lease_handles: lease_handles,
+            handoff,
+            unmount_on_drop: true,
         })
     }
 
@@ -148,6 +166,51 @@ pub fn mount(
             lease_handles,
         )
     }
+}
+
+/// Attach a reconstructed userspace filesystem to an already-mounted,
+/// initialized FUSE connection received from a predecessor process.
+#[cfg(target_os = "linux")]
+pub fn mount_from_handoff(
+    backends: Vec<MountedStore>,
+    audit: AuditLog,
+    fuse_cfg: &FuseConfig,
+    write_buffer_bytes: u64,
+    mountpoint: &Path,
+    inherited: InheritedFuse,
+) -> Result<MountedFs> {
+    let mut lease_handles: Vec<Arc<LeaseHandle>> = Vec::new();
+    for backend in &backends {
+        if let Some(handle) = acquire_mount_lease(backend)? {
+            lease_handles.push(handle);
+        }
+    }
+
+    let fs = GatewayFs::from_handoff(
+        backends,
+        audit,
+        fuse_cfg,
+        write_buffer_bytes,
+        inherited.snapshot,
+    )?;
+    let notifier_slot = fs.notifier_handle();
+    let handoff = fs.handoff_handle();
+    let session = fuser::Session::from_initialized_fd(
+        fs,
+        inherited.fd,
+        fuser::SessionACL::All,
+        inherited.proto_major,
+        inherited.proto_minor,
+    )
+    .context("construct inherited FUSE session")?;
+    let _ = notifier_slot.set(session.notifier());
+    Ok(MountedFs {
+        mountpoint: mountpoint.to_path_buf(),
+        inner: Inner::Fuse(Some(session)),
+        _lease_handles: lease_handles,
+        handoff,
+        unmount_on_drop: false,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -201,10 +264,32 @@ fn mount_macos(
         mountpoint: mountpoint.to_path_buf(),
         inner: Inner::Nfs { rt },
         _lease_handles: lease_handles,
+        unmount_on_drop: true,
     })
 }
 
 impl MountedFs {
+    /// Arm normal unmount-on-drop behavior after the predecessor commits.
+    #[cfg(target_os = "linux")]
+    pub fn commit_handoff(&mut self) {
+        self.unmount_on_drop = true;
+    }
+
+    /// Clone the initialized FUSE connection for a successor process.
+    #[cfg(target_os = "linux")]
+    pub fn handoff_parts(&self) -> Result<(OwnedFd, crate::fs::GatewayHandoff)> {
+        let Inner::Fuse(Some(session)) = &self.inner else {
+            anyhow::bail!("FUSE session is unavailable for handoff");
+        };
+        Ok((
+            session
+                .as_fd()
+                .try_clone_to_owned()
+                .context("duplicate /dev/fuse descriptor")?,
+            self.handoff.clone(),
+        ))
+    }
+
     /// Block the calling thread until the mount is torn down.
     ///
     /// Linux: enters the FUSE dispatch loop via `Session::run`; returns when
@@ -271,6 +356,18 @@ impl MountedFs {
         }
         Ok(())
     }
+
+    /// Serve requests through a gate that can park the dispatcher at a clean
+    /// handoff boundary.
+    #[cfg(target_os = "linux")]
+    pub fn wait_with_gate(mut self, gate: &fuser::SessionGate) -> Result<()> {
+        let Inner::Fuse(session) = &mut self.inner;
+        let mut session = session
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("FUSE session already consumed"))?;
+        session.run_with_gate(gate)?;
+        Ok(())
+    }
 }
 
 /// How often [`MountedFs::wait`] (macOS) re-checks whether the filesystem is
@@ -297,7 +394,9 @@ impl Drop for MountedFs {
         // Best-effort. On Linux the FUSE Session's own Drop normally already
         // unmounted; this is for the panic/early-return path. On macOS this
         // is the only thing that runs umount.
-        let _ = unmount(&self.mountpoint);
+        if self.unmount_on_drop {
+            let _ = unmount(&self.mountpoint);
+        }
     }
 }
 

@@ -9,7 +9,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use anyhow::Context;
 use lru::LruCache;
+use serde::{Deserialize, Serialize};
 
 use fuser::{
     consts::{FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE, FUSE_DO_READDIRPLUS},
@@ -42,7 +44,7 @@ use crate::config::FuseConfig;
 const ROOT_INO: u64 = 1;
 
 pub struct GatewayFs {
-    mounts: Vec<MountedStore>,
+    mounts: Arc<Vec<MountedStore>>,
     audit: AuditLog,
     attr_ttl: Duration,
     entry_ttl: Duration,
@@ -55,7 +57,7 @@ pub struct GatewayFs {
     /// would otherwise reopen `/proc/<pid>/comm` (and possibly `/cmdline`)
     /// — wasteful on chatty agents like `find`.
     command_cache: Mutex<LruCache<u32, Option<String>>>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     /// Populated by `main` after `Session::new` so flush handlers can punch
     /// the kernel's attr/data cache via `inval_inode`. Without this, attrs
     /// from the create reply (size=0) hide bytes flushed later in the same
@@ -73,6 +75,58 @@ struct State {
     aliases: HashMap<u64, HashMap<String, String>>,
     write_handles: HashMap<u64, std::sync::Arc<parking_lot::Mutex<write_handle::WriteHandle>>>,
     next_fh: u64,
+}
+
+/// Versioned userspace state transferred together with an initialized FUSE fd.
+/// Dirty write buffers are flushed before this snapshot is produced, so the
+/// handoff remains bounded regardless of file size.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HandoffSnapshot {
+    version: u32,
+    next_ino: u64,
+    nodes: Vec<HandoffNode>,
+    aliases: HashMap<u64, HashMap<String, String>>,
+    handles: Vec<HandoffWriteHandle>,
+    next_fh: u64,
+}
+
+const HANDOFF_SNAPSHOT_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HandoffNode {
+    ino: u64,
+    full_path: String,
+    mount_idx: Option<usize>,
+    rel_path: String,
+    kind: u8,
+    size: u64,
+    inode_id: u64,
+    nlink: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    atime_ns: u64,
+    rdev: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HandoffWriteHandle {
+    fh: u64,
+    path: String,
+    lease_path: String,
+    mode: u32,
+    mount_idx: usize,
+    opener_pid: u32,
+    spill_threshold: u64,
+    cached: bool,
+}
+
+/// Snapshot access retained outside the `fuser::Session`.
+#[derive(Clone)]
+pub struct GatewayHandoff {
+    mounts: Arc<Vec<MountedStore>>,
+    state: Arc<Mutex<State>>,
+    recovery_leases: Arc<Mutex<Vec<Arc<crate::lease::LeaseHandle>>>>,
 }
 
 impl State {
@@ -213,6 +267,184 @@ impl State {
     }
 }
 
+impl GatewayHandoff {
+    /// Flush every dirty open handle and capture the inode/FH tables.
+    ///
+    /// The caller must first park the fuser dispatch loop. A flush error aborts
+    /// the handoff; no partially-dirty state is sent to the successor.
+    pub fn prepare(&self) -> anyhow::Result<HandoffSnapshot> {
+        let handles: Vec<(u64, Arc<Mutex<write_handle::WriteHandle>>)> = {
+            let state = self.state.lock();
+            state
+                .write_handles
+                .iter()
+                .map(|(fh, handle)| (*fh, Arc::clone(handle)))
+                .collect()
+        };
+
+        for (_, handle) in &handles {
+            let mut handle = handle.lock();
+            let store = self.mounts.get(handle.mount_idx).ok_or_else(|| {
+                anyhow::anyhow!("open handle references invalid mount {}", handle.mount_idx)
+            })?;
+            if handle.dirty {
+                handle
+                    .flush(&*store.store)
+                    .with_context(|| format!("flush open handle {}", handle.path))?;
+            }
+        }
+
+        let state = self.state.lock();
+        let nodes = state
+            .by_ino
+            .values()
+            .map(HandoffNode::from_node)
+            .collect::<Vec<_>>();
+        let handles = handles
+            .into_iter()
+            .map(|(fh, handle)| {
+                let handle = handle.lock();
+                let lease_path = handle_lease_path(&self.mounts, handle.mount_idx, &handle.path)?;
+                Ok(HandoffWriteHandle {
+                    fh,
+                    path: handle.path.clone(),
+                    lease_path,
+                    mode: handle.mode,
+                    mount_idx: handle.mount_idx,
+                    opener_pid: handle.opener_pid,
+                    spill_threshold: handle.spill_threshold,
+                    cached: handle.cached,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(HandoffSnapshot {
+            version: HANDOFF_SNAPSHOT_VERSION,
+            next_ino: state.next_ino,
+            nodes,
+            aliases: state.aliases.clone(),
+            handles,
+            next_fh: state.next_fh,
+        })
+    }
+
+    /// Re-establish root and open-file leases after a successor failed during
+    /// preparation and fenced this process's data-plane connection.
+    pub fn recover_leases(&self) -> anyhow::Result<()> {
+        let mut recovered_roots = Vec::new();
+        for mount in self.mounts.iter() {
+            let Some(manager) = &mount.leases else {
+                continue;
+            };
+            let root = manager
+                .force_reacquire_exclusive("/")?
+                .ok_or_else(|| anyhow::anyhow!("root lease is held by another agent"))?;
+            let session_id = format!(
+                "mount:{}",
+                crate::backend::dataplane::cache::hex_encode(&root.entry().lease_id)
+            );
+            mount.store.set_session(Some(session_id));
+            recovered_roots.push(root);
+        }
+        *self.recovery_leases.lock() = recovered_roots;
+
+        let handles: Vec<Arc<Mutex<write_handle::WriteHandle>>> =
+            self.state.lock().write_handles.values().cloned().collect();
+        for handle in handles {
+            let mut handle = handle.lock();
+            if !handle.cached {
+                continue;
+            }
+            let lease_path = handle_lease_path(&self.mounts, handle.mount_idx, &handle.path)?;
+            let mount = &self.mounts[handle.mount_idx];
+            handle.lease = match &mount.leases {
+                Some(manager) => manager.force_reacquire_exclusive(&lease_path)?,
+                None => None,
+            };
+            handle.cached = handle.lease.is_some();
+        }
+        Ok(())
+    }
+}
+
+impl HandoffNode {
+    fn from_node(node: &Node) -> Self {
+        Self {
+            ino: node.ino,
+            full_path: node.full_path.clone(),
+            mount_idx: node.mount_idx,
+            rel_path: node.rel_path.clone(),
+            kind: file_type_to_wire(node.kind),
+            size: node.size,
+            inode_id: node.inode_id,
+            nlink: node.nlink,
+            mode: node.mode,
+            uid: node.uid,
+            gid: node.gid,
+            atime_ns: node.atime_ns,
+            rdev: node.rdev,
+        }
+    }
+
+    fn into_node(self) -> anyhow::Result<Node> {
+        Ok(Node {
+            ino: self.ino,
+            full_path: self.full_path,
+            mount_idx: self.mount_idx,
+            rel_path: self.rel_path,
+            kind: file_type_from_wire(self.kind)?,
+            size: self.size,
+            inode_id: self.inode_id,
+            nlink: self.nlink,
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            atime_ns: self.atime_ns,
+            rdev: self.rdev,
+        })
+    }
+}
+
+fn file_type_to_wire(kind: FileType) -> u8 {
+    match kind {
+        FileType::NamedPipe => 1,
+        FileType::CharDevice => 2,
+        FileType::BlockDevice => 3,
+        FileType::Directory => 4,
+        FileType::RegularFile => 5,
+        FileType::Symlink => 6,
+        FileType::Socket => 7,
+    }
+}
+
+fn file_type_from_wire(kind: u8) -> anyhow::Result<FileType> {
+    match kind {
+        1 => Ok(FileType::NamedPipe),
+        2 => Ok(FileType::CharDevice),
+        3 => Ok(FileType::BlockDevice),
+        4 => Ok(FileType::Directory),
+        5 => Ok(FileType::RegularFile),
+        6 => Ok(FileType::Symlink),
+        7 => Ok(FileType::Socket),
+        _ => anyhow::bail!("invalid file type {kind} in handoff snapshot"),
+    }
+}
+
+fn handle_lease_path(
+    mounts: &[MountedStore],
+    mount_idx: usize,
+    rel_path: &str,
+) -> anyhow::Result<String> {
+    let mount = mounts
+        .get(mount_idx)
+        .ok_or_else(|| anyhow::anyhow!("invalid mount index {mount_idx}"))?;
+    if mounts.len() == 1 {
+        Ok(join_full("/", rel_path))
+    } else {
+        Ok(join_full(&format!("/{}", mount.mount_name), rel_path))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Node {
     ino: u64,
@@ -248,6 +480,7 @@ impl GatewayFs {
         fuse_cfg: &FuseConfig,
         write_buffer_bytes: u64,
     ) -> Self {
+        let mounts = Arc::new(mounts);
         let mut by_ino = HashMap::new();
         let mut by_path = HashMap::new();
         // With a single mount, the FUSE root IS that mount — `/` is the user's
@@ -286,9 +519,152 @@ impl GatewayFs {
             command_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(COMMAND_CACHE_CAPACITY).expect("nonzero cap"),
             )),
-            state: Mutex::new(State::new(ROOT_INO + 1, by_ino, by_path)),
+            state: Arc::new(Mutex::new(State::new(ROOT_INO + 1, by_ino, by_path))),
             notifier: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Rebuild a filesystem implementation for an already-mounted FUSE
+    /// connection. The snapshot is validated fail-closed before any request is
+    /// served, and open cached handles reacquire their per-file leases.
+    pub fn from_handoff(
+        mounts: Vec<MountedStore>,
+        audit: AuditLog,
+        fuse_cfg: &FuseConfig,
+        write_buffer_bytes: u64,
+        snapshot: HandoffSnapshot,
+    ) -> anyhow::Result<Self> {
+        if snapshot.version != HANDOFF_SNAPSHOT_VERSION {
+            anyhow::bail!(
+                "unsupported handoff snapshot version {} (expected {})",
+                snapshot.version,
+                HANDOFF_SNAPSHOT_VERSION
+            );
+        }
+        let fs = Self::new(mounts, audit, fuse_cfg, write_buffer_bytes);
+        let mut by_ino = HashMap::new();
+        let mut by_path = HashMap::new();
+        let mut by_backend_inode = HashMap::new();
+
+        for encoded in snapshot.nodes {
+            let node = encoded.into_node()?;
+            if node.mount_idx.is_some_and(|idx| idx >= fs.mounts.len()) {
+                anyhow::bail!(
+                    "inode {} references invalid mount {:?}",
+                    node.ino,
+                    node.mount_idx
+                );
+            }
+            if by_path.insert(node.full_path.clone(), node.ino).is_some() {
+                anyhow::bail!("duplicate path {} in handoff snapshot", node.full_path);
+            }
+            if let Some(idx) = node.mount_idx {
+                if node.inode_id != 0
+                    && by_backend_inode
+                        .insert((idx, node.inode_id), node.ino)
+                        .is_some()
+                {
+                    anyhow::bail!(
+                        "duplicate backend inode {} for mount {} in handoff snapshot",
+                        node.inode_id,
+                        idx
+                    );
+                }
+            }
+            let ino = node.ino;
+            if by_ino.insert(ino, node).is_some() {
+                anyhow::bail!("duplicate inode {ino} in handoff snapshot");
+            }
+        }
+        let root = by_ino
+            .get(&ROOT_INO)
+            .ok_or_else(|| anyhow::anyhow!("handoff snapshot is missing root inode"))?;
+        if root.full_path != "/" || root.kind != FileType::Directory {
+            anyhow::bail!("handoff snapshot has an invalid root inode");
+        }
+        let aliases = snapshot.aliases;
+        for (&ino, paths) in &aliases {
+            if !by_ino.contains_key(&ino) {
+                anyhow::bail!("handoff aliases reference missing inode {ino}");
+            }
+            for full_path in paths.keys() {
+                if !full_path.starts_with('/') {
+                    anyhow::bail!("handoff alias path is not absolute: {full_path}");
+                }
+                match by_path.insert(full_path.clone(), ino) {
+                    Some(existing) if existing != ino => {
+                        anyhow::bail!(
+                            "handoff alias path {full_path} maps to both inode {existing} and {ino}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let max_ino = by_ino.keys().copied().max().unwrap_or(ROOT_INO);
+        if snapshot.next_ino <= max_ino {
+            anyhow::bail!(
+                "handoff next inode {} is not above existing inode {}",
+                snapshot.next_ino,
+                max_ino
+            );
+        }
+
+        let mut write_handles = HashMap::new();
+        for encoded in snapshot.handles {
+            let mount = fs.mounts.get(encoded.mount_idx).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "open handle {} references invalid mount {}",
+                    encoded.fh,
+                    encoded.mount_idx
+                )
+            })?;
+            let lease = if encoded.cached {
+                match &mount.leases {
+                    Some(manager) => manager
+                        .acquire_exclusive(&encoded.lease_path)
+                        .with_context(|| {
+                            format!("reacquire handoff lease {}", encoded.lease_path)
+                        })?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let handle = write_handle::WriteHandle::new(
+                encoded.path,
+                encoded.mode,
+                encoded.mount_idx,
+                encoded.opener_pid,
+                encoded.spill_threshold,
+                lease,
+            );
+            if write_handles
+                .insert(encoded.fh, Arc::new(Mutex::new(handle)))
+                .is_some()
+            {
+                anyhow::bail!("duplicate file handle {} in handoff snapshot", encoded.fh);
+            }
+        }
+        let max_fh = write_handles.keys().copied().max().unwrap_or(0);
+        if snapshot.next_fh == 0 || snapshot.next_fh <= max_fh {
+            anyhow::bail!(
+                "handoff next file handle {} is not above existing handle {}",
+                snapshot.next_fh,
+                max_fh
+            );
+        }
+
+        *fs.state.lock() = State {
+            next_ino: snapshot.next_ino,
+            by_ino,
+            by_path,
+            by_backend_inode,
+            aliases,
+            write_handles,
+            next_fh: snapshot.next_fh,
+        };
+        Ok(fs)
     }
 
     /// Hand back a clonable handle to the notifier slot so `main` can
@@ -296,6 +672,16 @@ impl GatewayFs {
     /// before `Session::run()` starts dispatching kernel requests.
     pub fn notifier_handle(&self) -> Arc<OnceLock<Notifier>> {
         Arc::clone(&self.notifier)
+    }
+
+    /// Return a handle that can flush and snapshot the userspace inode/FH
+    /// tables while the FUSE request loop is parked.
+    pub fn handoff_handle(&self) -> GatewayHandoff {
+        GatewayHandoff {
+            mounts: Arc::clone(&self.mounts),
+            state: Arc::clone(&self.state),
+            recovery_leases: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     /// After a successful flush, sync the in-memory size and tell the kernel
@@ -946,7 +1332,7 @@ impl Filesystem for GatewayFs {
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let state = self.state.lock();
         if let Some(node) = state.by_ino.get(&ino) {
             reply.attr(&self.attr_ttl, &self.attr(node));
@@ -2417,10 +2803,74 @@ fn read_command_name(pid: u32) -> Option<String> {
 #[cfg(test)]
 mod fh_tests {
     use super::*;
+    use crate::config::FuseConfig;
     use crate::write_handle::WriteHandle;
 
     fn empty_state() -> State {
         State::new(ROOT_INO + 1, HashMap::new(), HashMap::new())
+    }
+
+    fn root_handoff_snapshot(aliases: HashMap<u64, HashMap<String, String>>) -> HandoffSnapshot {
+        HandoffSnapshot {
+            version: HANDOFF_SNAPSHOT_VERSION,
+            next_ino: ROOT_INO + 1,
+            nodes: vec![HandoffNode {
+                ino: ROOT_INO,
+                full_path: "/".into(),
+                mount_idx: None,
+                rel_path: String::new(),
+                kind: file_type_to_wire(FileType::Directory),
+                size: 0,
+                inode_id: 0,
+                nlink: 1,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                atime_ns: 0,
+                rdev: 0,
+            }],
+            aliases,
+            handles: Vec::new(),
+            next_fh: 1,
+        }
+    }
+
+    fn handoff_audit(dir: &tempfile::TempDir) -> AuditLog {
+        AuditLog::new(dir.path().join("audit.jsonl")).unwrap()
+    }
+
+    #[test]
+    fn handoff_rebuilds_hard_link_alias_path_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let aliases =
+            HashMap::from([(ROOT_INO, HashMap::from([("/alias".into(), "alias".into())]))]);
+        let fs = GatewayFs::from_handoff(
+            Vec::new(),
+            handoff_audit(&dir),
+            &FuseConfig::default(),
+            1024,
+            root_handoff_snapshot(aliases),
+        )
+        .unwrap();
+
+        assert_eq!(fs.state.lock().by_path.get("/alias"), Some(&ROOT_INO));
+    }
+
+    #[test]
+    fn handoff_rejects_alias_for_missing_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let aliases = HashMap::from([(99, HashMap::from([("/alias".into(), "alias".into())]))]);
+        let error = GatewayFs::from_handoff(
+            Vec::new(),
+            handoff_audit(&dir),
+            &FuseConfig::default(),
+            1024,
+            root_handoff_snapshot(aliases),
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("missing inode 99"));
     }
 
     #[test]

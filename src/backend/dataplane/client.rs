@@ -703,8 +703,7 @@ async fn send_on_control_stream(
         Err(_) => {
             handle.pending.lock().remove(&rid);
             Err(io_error(format!(
-                "request timed out after {:?}",
-                request_timeout
+                "request timed out after {request_timeout:?}"
             )))
         }
     }
@@ -743,8 +742,7 @@ async fn chunk_get_via_new_stream(
         Ok(Err(e)) => return Err(e.context("read chunk_get response frame")),
         Err(_) => {
             return Err(io_error(format!(
-                "chunk_get response timed out after {:?}",
-                request_timeout
+                "chunk_get response timed out after {request_timeout:?}"
             )));
         }
     };
@@ -1069,7 +1067,7 @@ fn resolve_addr(addr: &str) -> Result<SocketAddr> {
     addr.to_socket_addrs()
         .context("resolve data-plane server addr")?
         .next()
-        .ok_or_else(|| anyhow!("no addresses for {}", addr))
+        .ok_or_else(|| anyhow!("no addresses for {addr}"))
 }
 
 fn io_error(msg: impl Into<String>) -> anyhow::Error {

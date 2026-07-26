@@ -2,9 +2,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub mountpoint: Option<PathBuf>,
     #[serde(default = "default_audit_log")]
@@ -24,7 +24,7 @@ pub struct Config {
     pub chunk_cache: ChunkCacheConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChunkCacheConfig {
     /// Soft cap for the persistent data-plane chunk cache. LRU prune evicts down
     /// to this size. Default 2 GiB.
@@ -44,7 +44,7 @@ fn default_chunk_cache_max_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct HostedConfig {
     /// Falls back to the `control_plane_url` baked into `~/.config/orlop/credentials.json`.
     pub control_plane_url: Option<String>,
@@ -58,7 +58,7 @@ pub struct HostedConfig {
     pub mount_root: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FuseConfig {
     #[serde(default = "default_fuse_attr_ttl")]
     pub attr_ttl_seconds: u64,
@@ -84,7 +84,7 @@ impl Default for FuseConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CacheConfig {
     #[serde(default = "default_write_buffer_bytes")]
     pub write_buffer_bytes: u64,
@@ -98,7 +98,7 @@ impl Default for CacheConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PolicyConfig {
     #[serde(default = "default_true")]
     pub readonly: bool,
@@ -118,7 +118,7 @@ impl Default for PolicyConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MountConfig {
     pub name: String,

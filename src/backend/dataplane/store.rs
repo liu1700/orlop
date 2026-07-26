@@ -360,7 +360,7 @@ fn normalize_mount_path(p: &str) -> String {
     if trimmed.is_empty() {
         String::new()
     } else {
-        format!("/{}", trimmed)
+        format!("/{trimmed}")
     }
 }
 
@@ -372,12 +372,12 @@ fn join_virtual_path(prefix: &str, path: &str) -> String {
         if trimmed.is_empty() {
             "/".to_string()
         } else {
-            format!("/{}", trimmed)
+            format!("/{trimmed}")
         }
     } else if trimmed.is_empty() {
         prefix.to_string()
     } else {
-        format!("{}/{}", prefix, trimmed)
+        format!("{prefix}/{trimmed}")
     }
 }
 

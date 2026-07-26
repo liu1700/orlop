@@ -162,6 +162,35 @@ debug container, enter the host mount namespace first (for example with
 `nsenter -t 1 -m`) rather than relying on a `chroot` or bind-mounted copy of the
 host filesystem.
 
+### Adopt or replace a live Linux mount client
+
+`adopt` is for a mount whose userspace FUSE process is still alive. Without a
+replacement binary, it authenticates against that process, verifies the exact
+mountpoint, and atomically refreshes Orlop's local PID record:
+
+```bash
+orlop mount --adopt /mnt/orlop
+```
+
+For an in-place binary upgrade, pass an absolute executable path:
+
+```bash
+orlop mount --adopt /mnt/orlop \
+  --replace-with /opt/orlop/releases/0.4.0/orlop
+```
+
+The old process remains authoritative until the new process has received the
+live `/dev/fuse` descriptor, validated the versioned state snapshot, rebuilt
+its backends, and reacquired required leases. Dirty open files are flushed
+before transfer. Any preparation failure resumes the old request loop; success
+returns the successor PID and leaves the mount ID and kernel connection intact.
+
+The handoff socket is owner-only and peers are checked with `SO_PEERCRED`.
+Same-user callers (or root) must run in the same mount namespace, and the new
+binary, configuration, certificates, and backend endpoints must remain
+available there. This cannot revive `ENOTCONN`: after the last `/dev/fuse` fd
+holder dies, use stale cleanup and create a new mount.
+
 ## Going further
 
 - [`manual-bring-up.md`](manual-bring-up.md) — run the control plane, server,
