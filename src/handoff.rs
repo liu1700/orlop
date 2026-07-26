@@ -666,6 +666,9 @@ mod linux {
         rmp_serde::from_slice(&bytes).context("decode handoff frame")
     }
 
+    // glibc exposes these ancillary-data lengths as usize, while musl uses
+    // socklen_t. The conversions are intentionally redundant on glibc.
+    #[allow(clippy::useless_conversion)]
     fn send_fd(stream: &UnixStream, fd: RawFd) -> Result<()> {
         let byte = [0x46u8];
         let mut iov = [IoSlice::new(&byte)];
@@ -706,6 +709,8 @@ mod linux {
         Ok(())
     }
 
+    // See send_fd: the libc field types differ between glibc and musl.
+    #[allow(clippy::useless_conversion)]
     fn receive_fd(stream: &UnixStream) -> Result<OwnedFd> {
         let mut byte = [0u8; 1];
         let mut iov = [IoSliceMut::new(&mut byte)];
