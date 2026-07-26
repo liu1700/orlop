@@ -172,6 +172,14 @@ The dashboard, `/v1/entities`, `/v1/admin`, `/v1/tenants`, journal, and
 edge strips `/api` before forwarding, so the bare paths above are what the
 service actually serves.
 
+Entity provision/resolve responses include `virtual_path`. This value is the
+control plane's authoritative agent-visible mount path and reflects
+`ORLOP_MOUNT_PREFIX`; pass it as `ORLOP_MOUNT_POINT` when launching the mount
+client. The Go SDK's `MountPath` helper only computes the default
+`/mnt/orlop/agents/<id>` fallback for older servers that omit `virtual_path`.
+Embedders that must construct the path before calling the API can use
+`MountPathWithPrefix`.
+
 Revocation note: `PUT /control/cert-revocations` is served by **`orlop-server`**,
 not by the control plane. The control plane is the *client*: a reconcile loop
 (~60s) pushes the active leaf-revocation set to each data-plane server over mTLS,
@@ -269,6 +277,7 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 | `ORLOP_CONTROL_PLANE_TOKEN` | Shared service token gating the `/v1/entities`, `/v1/admin`, `/v1/tenants`, and `/control/sign-server-cert` routes. Empty ⇒ those routes reject every request (fail closed). |
 | `ORLOP_API_TOKEN_TTL` | Expiry for newly minted `orlop_…` API tokens (e.g. `2160h`). `0` (default) ⇒ never expire. |
 | `ORLOP_INITIAL_GRANT_BYTES` | Disk granted at provision when the request specifies no explicit size. Default 1 GiB. |
+| `ORLOP_MOUNT_PREFIX` | Agent-visible prefix used to compute entity `virtual_path` values. Must be an absolute POSIX path. Default `/mnt/orlop`; an entity for agent `<id>` reports `<prefix>/agents/<id>`. |
 | `ORLOP_SERVER_FQDN` | The only name `POST /control/sign-server-cert` will issue a server cert for. Default `orlop-server`. |
 | `ORLOP_SERVER_CERT_TTL` | Validity of a self-provisioned server cert (e.g. `2160h`). Default 90 days. |
 | `ORLOP_IDENTITY_AUDIENCE` | Enables the host-issued JWT identity verifier and mounts `GET /v1/whoami`; pins the JWT `aud`. The other `ORLOP_IDENTITY_*` knobs apply only when this is set. |

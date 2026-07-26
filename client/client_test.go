@@ -310,6 +310,21 @@ func TestFakeAllocateIdempotentAndUsage(t *testing.T) {
 	}
 }
 
+func TestCustomMountPrefix(t *testing.T) {
+	if got := client.MountPathWithPrefix("/mnt/plori/", "agent-1"); got != "/mnt/plori/agents/agent-1" {
+		t.Fatalf("custom mount path = %q", got)
+	}
+
+	f := client.NewFakeWithMountPrefix("/mnt/plori")
+	disk, err := f.AllocateDisk(context.Background(), "agent-1", "owner-1", 128<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disk.VirtualPath != "/mnt/plori/agents/agent-1" {
+		t.Fatalf("fake virtual path = %q", disk.VirtualPath)
+	}
+}
+
 func TestFakeNotFoundMatchesLiveClientContract(t *testing.T) {
 	f := client.NewFake()
 	_, err := f.ResolveDisk(context.Background(), "missing")
