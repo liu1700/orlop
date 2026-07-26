@@ -52,6 +52,9 @@ database:
 control:
   replicas: 1
   port: 8080
+  # Metrics are served on a separate listener so they do not share the
+  # authenticated/public API surface.
+  metricsPort: 9090
   # `orlop-control migrate up` runs as an initContainer before each pod serves.
   # Idempotent and schema-self-checking (see docs/upgrade-safety.md).
   runMigrations: true

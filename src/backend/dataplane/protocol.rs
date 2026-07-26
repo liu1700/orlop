@@ -44,6 +44,7 @@ pub enum Op {
     Symlink = 0x16,
     Readlink = 0x17,
     Mknod = 0x19,
+    Link = 0x1A,
 }
 
 impl Op {
@@ -70,6 +71,7 @@ impl Op {
             0x16 => Some(Op::Symlink),
             0x17 => Some(Op::Readlink),
             0x19 => Some(Op::Mknod),
+            0x1A => Some(Op::Link),
             _ => None,
         }
     }
@@ -133,6 +135,7 @@ mod tests {
             Op::Symlink,
             Op::Readlink,
             Op::Mknod,
+            Op::Link,
         ] {
             assert_eq!(Op::from_u8(op as u8), Some(op));
         }

@@ -1,0 +1,72 @@
+# Reference mount-pod pattern for CSI/controller integrations.
+#
+# The controller that renders this pod must:
+#   1. set nodeName and a unique host targetPath for the volume,
+#   2. inject a fresh, single-use enroll token on every pod replacement,
+#   3. reconcile one pod per desired mount independently of the CSI node-plugin
+#      pod, and
+#   4. delete/recreate this pod (not restart its consumed token) after failure.
+#
+# A readiness failure intentionally does NOT trigger a liveness restart. Killing
+# the process that owns /dev/fuse would create the stale mount being diagnosed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orlop-mount-AGENT_ID
+  labels:
+    app.kubernetes.io/name: orlop
+    app.kubernetes.io/component: mount
+    orlop.dev/agent-id: AGENT_ID
+spec:
+  nodeName: NODE_NAME
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 30
+  containers:
+    - name: mount
+      # Pin a release that contains `orlop mount check`; replace RELEASE_TAG
+      # (or the whole reference with an immutable digest) during reconciliation.
+      image: ghcr.io/liu1700/orlop-mount:RELEASE_TAG
+      imagePullPolicy: IfNotPresent
+      args: ["mount", "--from-env"]
+      env:
+        - name: ORLOP_AGENT_ID
+          value: AGENT_ID
+        - name: ORLOP_CONTROL_PLANE
+          value: https://orlop-control.example
+        - name: ORLOP_ENROLL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: orlop-enroll-AGENT_ID
+              key: token
+        - name: ORLOP_MOUNT_POINT
+          value: /mnt/orlop
+      securityContext:
+        allowPrivilegeEscalation: true
+        capabilities:
+          add: ["SYS_ADMIN"]
+      readinessProbe:
+        exec:
+          command: ["orlop", "mount", "check", "/mnt/orlop"]
+        initialDelaySeconds: 2
+        periodSeconds: 10
+        timeoutSeconds: 4
+        failureThreshold: 2
+      lifecycle:
+        preStop:
+          exec:
+            command: ["orlop", "unmount", "/mnt/orlop"]
+      volumeMounts:
+        - name: fuse
+          mountPath: /dev/fuse
+        - name: target
+          mountPath: /mnt/orlop
+          mountPropagation: Bidirectional
+  volumes:
+    - name: fuse
+      hostPath:
+        path: /dev/fuse
+        type: CharDevice
+    - name: target
+      hostPath:
+        path: /var/lib/orlop/mounts/AGENT_ID
+        type: DirectoryOrCreate

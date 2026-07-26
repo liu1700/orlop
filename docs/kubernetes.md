@@ -90,7 +90,7 @@ derives each from a single source, so they cannot drift:
 
 ## Per-component reference
 
-### orlop-control — Deployment + `migrate` initContainer + ClusterIP Service `:8080`
+### orlop-control — Deployment + `migrate` initContainer + ClusterIP Service
 
 | Env | Value / source |
 |---|---|
@@ -102,6 +102,7 @@ derives each from a single source, so they cannot drift:
 | `ORLOP_SERVER_FQDN` | `serverFQDN` |
 | `ORLOP_TRUST_DOMAIN` | `trustDomain` |
 | `ORLOP_ORG_NAME` | `orgName` |
+| `ORLOP_METRICS_ADDR` | `:<control.metricsPort>` (`:9090`) |
 
 The `migrate` initContainer runs `orlop-control migrate up` (the **same binary**;
 `migrate` is a subcommand) before the pod serves. It is idempotent and
@@ -140,6 +141,7 @@ rendered from chart values; the object store and routes DB live on the PVC at
 | `orgName` | `ORL` | |
 | `control.replicas` | `1` | |
 | `control.port` | `8080` | control HTTP API port |
+| `control.metricsPort` | `9090` | private Prometheus metrics listener |
 | `server.opsPort` / `server.dataPort` | `7878` / `8443` | mTLS listeners |
 | `server.persistence.size` | `10Gi` | size of the PVC at `dataDir` |
 | `server.persistence.storageClass` | `""` (cluster default) | |
@@ -147,6 +149,45 @@ rendered from chart values; the object store and routes DB live on the PVC at
 | `server.podSecurityContext.fsGroup` | `65532` | makes the PVC writable by the distroless nonroot uid (without it many CSI drivers leave `/data` root-owned and the pod crashes) |
 | `server.quota.enforce` | `false` | |
 | `server.tenant.id` / `server.tenant.name` | `a_demo` / `demo agent disk` | bootstrap tenant |
+
+## FUSE client lifecycle
+
+Treat a host-visible FUSE mount as node infrastructure, not as an incidental
+child of a controller process. Keep the mount client's lifetime independent
+from rolling control-plane or CSI/controller upgrades, give it a graceful
+termination window, and run liveness/readiness checks against the mounted path.
+If a mount must be visible outside its pod, configure the required mount
+propagation explicitly and run inspection or cleanup in the same mount
+namespace as the mount.
+
+The reference [`orlop-mount-pod.yaml`](../deploy/examples/orlop-mount-pod.yaml)
+shows the supported CSI integration boundary: one independently reconciled pod
+per desired mount, pinned to the target node, with `/dev/fuse`, bidirectional
+mount propagation, a fail-closed readiness probe, and graceful pre-stop
+unmount. The CSI node-plugin creates/reconciles these pods but must not own the
+FUSE process itself. A plugin rollout then leaves the mount pod and its open
+`/dev/fuse` fd untouched.
+
+Do not use a mounted-path liveness probe. If the FUSE request path is wedged,
+killing the fd owner turns a degraded connection into an `ENOTCONN` stale
+mount. `orlop mount check <path>` is intentionally a readiness check only. A
+mount pod uses a single-use enroll token, so after the pod itself fails the
+controller must clean the stale mount and create a replacement pod with a fresh
+token; container restart with the consumed token cannot recover it.
+
+For a dead client, use `orlop mount ls --json` to discover Orlop entries from
+`/proc/self/mountinfo`, then `orlop unmount --stale` to lazy-detach only paths
+that return `ENOTCONN`. Cleanup is safe to retry and refuses a path with a
+non-Orlop filesystem stacked at the same location. A node-debug pod normally
+needs to enter the host namespace first, for example with `nsenter -t 1 -m`.
+
+This is crash cleanup, not transparent handoff. Once the last process holding
+the connection's `/dev/fuse` fd dies, Linux has no API that can attach a new fd
+to that disconnected connection; the remaining mount shell can only be
+detached and recreated. A zero-disruption mount-client binary upgrade would
+require fd handoff while the old process is still alive and is not currently
+supported. Schedule a mount-pod replacement as a disruptive event for workloads
+using that mount.
 
 ## See also
 

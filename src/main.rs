@@ -36,6 +36,8 @@ enum Command {
     /// FUSE; macOS uses a localhost NFSv3 server. Blocks until the kernel
     /// unmount syscall returns (e.g. `orlop unmount` from another shell).
     Mount {
+        #[command(subcommand)]
+        action: Option<MountCommand>,
         #[arg(short, long)]
         mountpoint: Option<PathBuf>,
         #[arg(long)]
@@ -61,6 +63,10 @@ enum Command {
     /// mountpoint from the active config).
     Unmount {
         target: Option<PathBuf>,
+        /// Lazy-detach every Orlop FUSE mount in this namespace whose
+        /// userspace server is gone (ENOTCONN). Linux only.
+        #[arg(long)]
+        stale: bool,
         /// Override credentials file location (default ~/.config/orlop/credentials.json).
         /// Use the same path as `orlop mount --credentials` so the lease/cert
         /// teardown targets the isolated session.
@@ -95,6 +101,24 @@ enum Command {
     /// Report a running `orlop dev` stack and any mount daemon. `--json` prints
     /// a machine-readable report.
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum MountCommand {
+    /// List Orlop mounts from the current Linux mount namespace. Stacked
+    /// mounts are returned as separate rows.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check that one path is a live, exclusively-Orlop mount. Intended for
+    /// readiness probes; exits non-zero for stale, inaccessible, mixed, or
+    /// missing mounts.
+    Check {
+        path: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -161,6 +185,7 @@ fn main() -> anyhow::Result<()> {
 
     match &cli.command {
         Command::Mount {
+            action,
             mountpoint,
             foreground,
             no_inject,
@@ -168,6 +193,49 @@ fn main() -> anyhow::Result<()> {
             from_env,
         } => {
             use std::io::Write as _;
+
+            if let Some(action) = action {
+                match action {
+                    MountCommand::Ls { json } => {
+                        let mounts = orlop::mounts::list()?;
+                        if *json {
+                            println!("{}", serde_json::to_string_pretty(&mounts)?);
+                        } else if mounts.is_empty() {
+                            println!("no Orlop mounts in this mount namespace");
+                        } else {
+                            for mount in mounts {
+                                let detail = mount
+                                    .error
+                                    .as_deref()
+                                    .map(|error| format!(" ({error})"))
+                                    .unwrap_or_default();
+                                println!(
+                                    "{}\t{:?}\t{}{}",
+                                    mount.mount_id, mount.state, mount.path, detail
+                                );
+                            }
+                        }
+                    }
+                    MountCommand::Check { path, json } => {
+                        let mount = orlop::mounts::inspect(path)?;
+                        if *json {
+                            println!("{}", serde_json::to_string_pretty(&mount)?);
+                        }
+                        if mount.state != orlop::mounts::MountState::Alive {
+                            let detail = mount.error.as_deref().unwrap_or("health probe failed");
+                            anyhow::bail!(
+                                "Orlop mount {} is {:?}: {detail}",
+                                mount.path,
+                                mount.state
+                            );
+                        }
+                        if !*json {
+                            println!("Orlop mount {} is alive", mount.path);
+                        }
+                    }
+                }
+                return Ok(());
+            }
 
             if *from_env {
                 // In-pod mounter: env vars carry everything (agent id, mount
@@ -356,8 +424,24 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Unmount {
             target,
+            stale,
             credentials,
         } => {
+            if *stale {
+                if target.is_some() {
+                    anyhow::bail!("unmount --stale does not accept a target path");
+                }
+                let detached = orlop::mounts::reclaim_stale()?;
+                if detached.is_empty() {
+                    println!("no stale Orlop mounts found");
+                } else {
+                    for path in &detached {
+                        println!("detached stale Orlop mount {}", path.display());
+                    }
+                    println!("detached {} stale mount record(s)", detached.len());
+                }
+                return Ok(());
+            }
             let creds_override = credentials.as_deref();
             let loaded_cfg = try_load_config(&cli).ok().flatten();
             let target = target

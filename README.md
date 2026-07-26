@@ -39,6 +39,11 @@ idle compute.
 - 🧩 **Drop-in POSIX**: FUSE on Linux, in-process NFSv3 loopback on macOS; the
   agent just sees a directory.
 
+The exact per-platform contract is in the
+[POSIX compatibility matrix](docs/posix-compatibility.md); the validation and
+release gates are documented in
+[quality and robustness](docs/quality-and-robustness.md).
+
 > **Built for agent memory.** orlop is the *storage substrate* for an agent-memory
 > stack (durable, cheap to update, and safe under multi-tenancy), but it does no
 > extraction, ranking, or semantic consolidation; the layer above does. See

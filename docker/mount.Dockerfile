@@ -1,10 +1,11 @@
 # orlop (mount client): the disk-mount binary with FUSE available at runtime.
 #
-# This is the image that saves consumers the Rust toolchain + libfuse3 build the
-# mount client otherwise needs. It carries the pre-built, release-versioned
-# `orlop` binary on a slim Debian base with fuse3 installed (fusermount3 +
-# libfuse3, which the Linux build links). Build context is docker/; the per-arch
-# binary is staged at bin/<arch>/ by release.yml.
+# This is the image that saves consumers the Rust toolchain build the mount
+# client otherwise needs. It carries the static, release-versioned
+# `orlop` binary on a slim Debian base with the fusermount3 helper. The binary
+# uses fuser's pure-Linux backend and does not link libfuse3.so, so consumers
+# may also COPY it into a different Linux base. Build context is docker/; the
+# per-arch binary is staged at bin/<arch>/ by release.yml.
 #
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     -f docker/mount.Dockerfile -t ghcr.io/liu1700/orlop-mount:vX.Y.Z docker/
@@ -17,16 +18,17 @@
 #   Entry : the bare binary; pass a subcommand, e.g. `orlop mount …` or
 #           `orlop --from-env`.
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
-# fuse3 provides fusermount3 + libfuse3, which the Linux mount client links;
-# ca-certificates for the control-plane HTTPS fetch. Installed natively (the
-# release job builds each arch on its own runner), so no emulation.
+# fuse3 provides fusermount3 for unprivileged mounts; ca-certificates is for
+# control-plane HTTPS. libfuse is not a binary dependency.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends fuse3 ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 ARG TARGETARCH
 COPY bin/${TARGETARCH}/orlop /usr/local/bin/orlop
+
+RUN orlop --version
 
 ENTRYPOINT ["orlop"]

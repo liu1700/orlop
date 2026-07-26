@@ -12,6 +12,8 @@ import (
 // Manifest is the per-path record describing how a file maps to chunks.
 type Manifest struct {
 	Path    string
+	InodeID uint64
+	Nlink   uint32
 	Size    uint64
 	Mode    uint32
 	Mtime   int64
@@ -129,13 +131,15 @@ func (m *ManifestStore) SetJournal(j *SessionJournal) {
 // Get returns the manifest for path. ErrManifestNotFound if missing.
 func (m *ManifestStore) Get(p string) (Manifest, error) {
 	row := m.db.QueryRow(`
-		select path, size, mode, mtime, version, chunks, uid, gid, atime
-		from manifests
-		where path = ?
+		select mf.path, mf.inode_id,
+		       (select count(*) from manifests links where links.inode_id = mf.inode_id),
+		       mf.size, mf.mode, mf.mtime, mf.version, mf.chunks, mf.uid, mf.gid, mf.atime
+		from manifests mf
+		where mf.path = ?
 	`, p)
 	var blob []byte
 	out := Manifest{}
-	err := row.Scan(&out.Path, &out.Size, &out.Mode, &out.Mtime, &out.Version, &blob, &out.Uid, &out.Gid, &out.Atime)
+	err := row.Scan(&out.Path, &out.InodeID, &out.Nlink, &out.Size, &out.Mode, &out.Mtime, &out.Version, &blob, &out.Uid, &out.Gid, &out.Atime)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Manifest{}, ErrManifestNotFound
 	}
@@ -183,6 +187,20 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// A new inode takes the SQLite writer lock before any reads. This avoids
+	// SQLITE_BUSY_SNAPSHOT under concurrent creates and makes allocation +
+	// manifest insertion one serialized transaction.
+	var allocatedInodeID uint64
+	if expectedVersion == 0 {
+		if err := tx.QueryRow(`
+			update inode_counter set next_id = next_id + 1
+			where singleton = 1
+			returning next_id
+		`).Scan(&allocatedInodeID); err != nil {
+			return 0, fmt.Errorf("allocate inode id: %w", err)
+		}
+	}
+
 	// 1. Parent-existence check.
 	parent, name := splitParentName(p)
 	if err := checkParentExists(tx, p); err != nil {
@@ -201,11 +219,12 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 		oldUID          uint32
 		oldGID          uint32
 		oldAtime        int64
+		oldInodeID      uint64
 		haveOld         bool
 	)
 	scanErr := tx.QueryRow(
-		`select version, size, mode, mtime, chunks, uid, gid, atime from manifests where path = ?`, p,
-	).Scan(&existingVersion, &oldSize, &oldMode, &oldMtime, &oldBlob, &oldUID, &oldGID, &oldAtime)
+		`select version, size, mode, mtime, chunks, uid, gid, atime, inode_id from manifests where path = ?`, p,
+	).Scan(&existingVersion, &oldSize, &oldMode, &oldMtime, &oldBlob, &oldUID, &oldGID, &oldAtime, &oldInodeID)
 	if scanErr == nil {
 		haveOld = true
 		oldChunks, err = unpackChunks(oldBlob)
@@ -258,10 +277,10 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 			newAtime = mf.Mtime
 		}
 		res, err := tx.Exec(`
-			insert into manifests (path, size, mode, mtime, version, chunks, uid, gid, atime)
-			values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			insert into manifests (path, inode_id, size, mode, mtime, version, chunks, uid, gid, atime)
+			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			on conflict(path) do nothing
-		`, p, mf.Size, mf.Mode, mf.Mtime, newVersion, blob, mf.Uid, mf.Gid, newAtime)
+		`, p, allocatedInodeID, mf.Size, mf.Mode, mf.Mtime, newVersion, blob, mf.Uid, mf.Gid, newAtime)
 		if err != nil {
 			return 0, fmt.Errorf("insert manifest %s: %w", p, err)
 		}
@@ -283,8 +302,8 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 		res, err := tx.Exec(`
 			update manifests
 			set size = ?, mode = ?, mtime = ?, version = ?, chunks = ?, uid = ?, gid = ?, atime = ?
-			where path = ? and version = ?
-		`, mf.Size, mf.Mode, mf.Mtime, newVersion, blob, keepUID, keepGID, keepAtime, p, expectedVersion)
+			where inode_id = ?
+		`, mf.Size, mf.Mode, mf.Mtime, newVersion, blob, keepUID, keepGID, keepAtime, oldInodeID)
 		if err != nil {
 			return 0, fmt.Errorf("update manifest %s: %w", p, err)
 		}
@@ -315,6 +334,91 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 		m.journal.Broadcast(journalEntry.AllocationID, *journalEntry)
 	}
 	return newVersion, nil
+}
+
+// Link creates a second directory entry for the same regular-file inode.
+// Content/chunk ownership remains per inode: linking does not increment chunk
+// refcounts, and deleting a non-final link does not decrement them.
+func (m *ManifestStore) Link(from, to, sessionID, allocationID, agentID string) (uint32, error) {
+	if sessionID != "" && allocationID == "" {
+		return 0, fmt.Errorf("link: empty allocation_id required")
+	}
+	tx, err := m.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := checkParentExists(tx, to); err != nil {
+		return 0, err
+	}
+	kind, err := resolveKindTx(tx, to)
+	if err != nil {
+		return 0, err
+	}
+	if kind != nodeAbsent {
+		return 0, ErrAlreadyExists
+	}
+
+	var (
+		inodeID uint64
+		size    uint64
+		mode    uint32
+		mtime   int64
+		version uint64
+		blob    []byte
+		uid     uint32
+		gid     uint32
+		atime   int64
+	)
+	err = tx.QueryRow(`
+		select inode_id, size, mode, mtime, version, chunks, uid, gid, atime
+		from manifests where path = ?
+	`, from).Scan(&inodeID, &size, &mode, &mtime, &version, &blob, &uid, &gid, &atime)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrManifestNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	// SQLite scans a zero-length BLOB into a nil []byte; passing that slice
+	// back to database/sql encodes SQL NULL, which violates chunks NOT NULL.
+	if blob == nil {
+		blob = []byte{}
+	}
+
+	if _, err := tx.Exec(`
+		insert into manifests(path, inode_id, size, mode, mtime, version, chunks, uid, gid, atime)
+		values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, to, inodeID, size, mode, mtime, version, blob, uid, gid, atime); err != nil {
+		return 0, fmt.Errorf("insert hard link %s -> %s: %w", to, from, err)
+	}
+	parent, name := splitParentName(to)
+	if _, err := tx.Exec(`insert into dir_entries(parent, name) values(?, ?)`, parent, name); err != nil {
+		return 0, fmt.Errorf("register hard link %s: %w", to, err)
+	}
+
+	var journalEntry *SessionJournalEntry
+	if sessionID != "" {
+		entry, err := journalBeforeWrite(
+			tx, sessionID, allocationID, agentID, SessionOpCreate, to, nil, &version, "", m.metrics,
+		)
+		if err != nil {
+			return 0, err
+		}
+		journalEntry = entry
+	}
+	var nlink uint32
+	if err := tx.QueryRow(`select count(*) from manifests where inode_id = ?`, inodeID).Scan(&nlink); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	if journalEntry != nil && m.journal != nil {
+		m.journal.Broadcast(journalEntry.AllocationID, *journalEntry)
+	}
+	return nlink, nil
 }
 
 // deleteSymlink removes the symlinks row (and its dir_entry) for p. Returns
@@ -387,14 +491,19 @@ func (m *ManifestStore) Delete(p string, expectedVersion uint64, sessionID, allo
 
 	var (
 		version uint64
+		inodeID uint64
+		nlink   uint32
 		size    uint64
 		mode    uint32
 		mtime   int64
 		blob    []byte
 	)
 	err = tx.QueryRow(
-		`select version, size, mode, mtime, chunks from manifests where path = ?`, p,
-	).Scan(&version, &size, &mode, &mtime, &blob)
+		`select mf.version, mf.inode_id,
+		        (select count(*) from manifests links where links.inode_id = mf.inode_id),
+		        mf.size, mf.mode, mf.mtime, mf.chunks
+		   from manifests mf where mf.path = ?`, p,
+	).Scan(&version, &inodeID, &nlink, &size, &mode, &mtime, &blob)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrManifestNotFound
 	}
@@ -416,16 +525,31 @@ func (m *ManifestStore) Delete(p string, expectedVersion uint64, sessionID, allo
 			Path: p, Size: size, Mode: mode, Mtime: mtime,
 			Version: version, Chunks: oldChunks,
 		}
-		entry, err := journalBeforeWrite(tx, sessionID, allocationID, agentID, SessionOpDelete, p, &prior, nil, "", m.metrics)
+		// For a non-final hard-link delete, remember a surviving alias. Revert
+		// must LINK that inode back rather than Put a duplicate inode (which
+		// would double-own the chunks and break inode identity).
+		var survivingAlias string
+		if nlink > 1 {
+			if err := tx.QueryRow(
+				`select path from manifests where inode_id = ? and path <> ? order by path limit 1`,
+				inodeID, p,
+			).Scan(&survivingAlias); err != nil {
+				return fmt.Errorf("find surviving hard-link alias for %s: %w", p, err)
+			}
+		}
+		entry, err := journalBeforeWrite(tx, sessionID, allocationID, agentID, SessionOpDelete, p, &prior, nil, survivingAlias, m.metrics)
 		if err != nil {
 			return err
 		}
 		journalEntry = entry
 	}
 
-	// Decrement refcounts for all chunks referenced by this manifest.
-	if err := applyChunkRefDelta(tx, chunkRefDelta(oldChunks, nil)); err != nil {
-		return err
+	// Chunks belong to the inode, not each directory entry. Reclaim only when
+	// this is the final hard link.
+	if nlink == 1 {
+		if err := applyChunkRefDelta(tx, chunkRefDelta(oldChunks, nil)); err != nil {
+			return err
+		}
 	}
 
 	if _, err := tx.Exec(`delete from manifests where path = ?`, p); err != nil {
@@ -556,16 +680,26 @@ func removeDirEntryTx(tx *sql.Tx, p string) error {
 func deleteDestTx(tx *sql.Tx, to string, k nodeKind) error {
 	switch k {
 	case nodeRegular:
-		var blob []byte
-		if err := tx.QueryRow(`select chunks from manifests where path = ?`, to).Scan(&blob); err != nil {
+		var (
+			blob    []byte
+			inodeID uint64
+			nlink   uint32
+		)
+		if err := tx.QueryRow(`
+			select mf.chunks, mf.inode_id,
+			       (select count(*) from manifests links where links.inode_id = mf.inode_id)
+			from manifests mf where mf.path = ?
+		`, to).Scan(&blob, &inodeID, &nlink); err != nil {
 			return fmt.Errorf("read dest chunks %s: %w", to, err)
 		}
-		dstChunks, err := unpackChunks(blob)
-		if err != nil {
-			return fmt.Errorf("unpack dest chunks %s: %w", to, err)
-		}
-		if err := applyChunkRefDelta(tx, chunkRefDelta(dstChunks, nil)); err != nil {
-			return err
+		if nlink == 1 {
+			dstChunks, err := unpackChunks(blob)
+			if err != nil {
+				return fmt.Errorf("unpack dest chunks %s: %w", to, err)
+			}
+			if err := applyChunkRefDelta(tx, chunkRefDelta(dstChunks, nil)); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.Exec(`delete from manifests where path = ?`, to); err != nil {
 			return fmt.Errorf("delete dest manifest %s: %w", to, err)
@@ -690,6 +824,17 @@ func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint
 		if src, err = readRenameSourceTx(tx, from, expectedFrom); err != nil {
 			return 0, err
 		}
+		// POSIX: if both names already resolve to the same inode, rename is a
+		// no-op. In particular, do not remove one of the hard-link names.
+		if dstKind == nodeRegular {
+			var dstInodeID uint64
+			if err := tx.QueryRow(`select inode_id from manifests where path = ?`, to).Scan(&dstInodeID); err != nil {
+				return 0, fmt.Errorf("read dest inode %s: %w", to, err)
+			}
+			if dstInodeID == src.inodeID {
+				return src.version, nil
+			}
+		}
 	}
 
 	// 7. Overwrite the destination in-tx (if present and compatible).
@@ -706,7 +851,7 @@ func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint
 	}
 
 	// 9. Move the source's backing row to `to`.
-	if err := moveRenameSourceTx(tx, from, to, srcKind, newVersion); err != nil {
+	if err := moveRenameSourceTx(tx, from, to, srcKind, newVersion, src.inodeID); err != nil {
 		return 0, err
 	}
 
@@ -786,6 +931,7 @@ func resolveRenameDestTx(tx *sql.Tx, to string, srcKind nodeKind, noReplace bool
 // renameSource is the regular-file source row renameOpt reads up front — the
 // CAS check, the journal entry, and the manifest move all need it.
 type renameSource struct {
+	inodeID uint64
 	version uint64
 	blob    []byte
 	size    uint64
@@ -801,8 +947,8 @@ type renameSource struct {
 func readRenameSourceTx(tx *sql.Tx, from string, expectedFrom uint64) (renameSource, error) {
 	var src renameSource
 	if qErr := tx.QueryRow(
-		`select version, size, mode, mtime, chunks, uid, gid, atime from manifests where path = ?`, from,
-	).Scan(&src.version, &src.size, &src.mode, &src.mtime, &src.blob, &src.uid, &src.gid, &src.atime); qErr != nil {
+		`select inode_id, version, size, mode, mtime, chunks, uid, gid, atime from manifests where path = ?`, from,
+	).Scan(&src.inodeID, &src.version, &src.size, &src.mode, &src.mtime, &src.blob, &src.uid, &src.gid, &src.atime); qErr != nil {
 		return renameSource{}, fmt.Errorf("read source manifest %s: %w", from, qErr)
 	}
 	if src.version != expectedFrom {
@@ -844,14 +990,16 @@ func (m *ManifestStore) journalRenameTx(tx *sql.Tx, from, to string, srcKind nod
 // moveRenameSourceTx moves the source's backing row to `to`: a path (and, for
 // regular files, version) rewrite on the kind's own table, or a descendant
 // re-parent for directories.
-func moveRenameSourceTx(tx *sql.Tx, from, to string, srcKind nodeKind, newVersion uint64) error {
+func moveRenameSourceTx(tx *sql.Tx, from, to string, srcKind nodeKind, newVersion, inodeID uint64) error {
 	switch srcKind {
 	case nodeRegular:
-		if _, err := tx.Exec(
-			`update manifests set path = ?, version = ? where path = ?`,
-			to, newVersion, from,
-		); err != nil {
+		if _, err := tx.Exec(`update manifests set path = ? where path = ?`, to, from); err != nil {
 			return fmt.Errorf("move manifest %s->%s: %w", from, to, err)
+		}
+		// Version is inode metadata: every hard-link name must observe the same
+		// value or later CAS writes through another name would spuriously fail.
+		if _, err := tx.Exec(`update manifests set version = ? where inode_id = ?`, newVersion, inodeID); err != nil {
+			return fmt.Errorf("update renamed inode version %d: %w", inodeID, err)
 		}
 	case nodeSymlink:
 		if _, err := tx.Exec(`update symlinks set path = ? where path = ?`, to, from); err != nil {
@@ -927,14 +1075,16 @@ func (m *ManifestStore) RegisterDir(parent, name string) error {
 // owner + atime. Kind is "file", "dir", or "symlink". Size is the content size
 // for files, the target length for symlinks, and zero for directories.
 type DirChild struct {
-	Name  string
-	IsDir bool
-	Kind  string
-	Mode  uint32
-	Size  uint64
-	Uid   uint32
-	Gid   uint32
-	Atime int64
+	Name    string
+	IsDir   bool
+	Kind    string
+	Mode    uint32
+	Size    uint64
+	Uid     uint32
+	Gid     uint32
+	Atime   int64
+	InodeID uint64
+	Nlink   uint32
 }
 
 // ListChildren returns the children of `parent` from dir_entries, joined with
@@ -951,7 +1101,11 @@ func (m *ManifestStore) ListChildren(parent string) ([]DirChild, error) {
 		       COALESCE(mf.mode, sl.mode, d.mode, 493) AS mode,
 		       COALESCE(mf.uid, sl.uid, d.uid, 0) AS uid,
 		       COALESCE(mf.gid, sl.gid, d.gid, 0) AS gid,
-		       COALESCE(mf.atime, sl.atime, d.atime, 0) AS atime
+		       COALESCE(mf.atime, sl.atime, d.atime, 0) AS atime,
+		       COALESCE(mf.inode_id, 0) AS inode_id,
+		       CASE WHEN mf.inode_id IS NULL THEN 1
+		            ELSE (select count(*) from manifests links where links.inode_id = mf.inode_id)
+		       END AS nlink
 		FROM dir_entries d
 		LEFT JOIN manifests mf
 		  ON mf.path = CASE WHEN d.parent = '/' THEN '/' || d.name
@@ -970,7 +1124,7 @@ func (m *ManifestStore) ListChildren(parent string) ([]DirChild, error) {
 	var out []DirChild
 	for rows.Next() {
 		var c DirChild
-		if err := rows.Scan(&c.Name, &c.Kind, &c.Size, &c.Mode, &c.Uid, &c.Gid, &c.Atime); err != nil {
+		if err := rows.Scan(&c.Name, &c.Kind, &c.Size, &c.Mode, &c.Uid, &c.Gid, &c.Atime, &c.InodeID, &c.Nlink); err != nil {
 			return nil, err
 		}
 		c.IsDir = c.Kind == "dir"
@@ -1291,7 +1445,10 @@ func (m *ManifestStore) SetMode(p string, mode uint32, sessionID, allocationID, 
 // (ErrManifestNotFound) when p does not exist; root ("/") succeeds as a no-op.
 func (m *ManifestStore) SetOwner(p string, uid, gid uint32) error {
 	// File.
-	if res, fErr := m.db.Exec(`update manifests set uid = ?, gid = ? where path = ?`, uid, gid, p); fErr != nil {
+	if res, fErr := m.db.Exec(`
+		update manifests set uid = ?, gid = ?
+		where inode_id = (select inode_id from manifests where path = ?)
+	`, uid, gid, p); fErr != nil {
 		return fErr
 	} else if n, _ := res.RowsAffected(); n > 0 {
 		return nil
@@ -1328,7 +1485,10 @@ func (m *ManifestStore) SetOwner(p string, uid, gid uint32) error {
 // not-journaled model as SetOwner.
 func (m *ManifestStore) SetAtime(p string, atime int64) error {
 	// File.
-	if res, fErr := m.db.Exec(`update manifests set atime = ? where path = ?`, atime, p); fErr != nil {
+	if res, fErr := m.db.Exec(`
+		update manifests set atime = ?
+		where inode_id = (select inode_id from manifests where path = ?)
+	`, atime, p); fErr != nil {
 		return fErr
 	} else if n, _ := res.RowsAffected(); n > 0 {
 		return nil
@@ -1527,6 +1687,16 @@ func (m *ManifestStore) PutWithLeaseCheck(
 		return 0, err
 	}
 	return m.Put(p, expectedVersion, mf, sessionID, allocationID, agentID)
+}
+
+// LinkWithLeaseCheck wraps Link with session_id authenticity validation.
+func (m *ManifestStore) LinkWithLeaseCheck(
+	from, to, sessionID, allocationID, agentID, activeLeaseHex string,
+) (uint32, error) {
+	if err := validateSessionIDForLease(sessionID, activeLeaseHex); err != nil {
+		return 0, err
+	}
+	return m.Link(from, to, sessionID, allocationID, agentID)
 }
 
 // DeleteWithLeaseCheck wraps Delete with session_id authenticity validation.

@@ -69,6 +69,8 @@ struct State {
     next_ino: u64,
     by_ino: HashMap<u64, Node>,
     by_path: HashMap<String, u64>,
+    by_backend_inode: HashMap<(usize, u64), u64>,
+    aliases: HashMap<u64, HashMap<String, String>>,
     write_handles: HashMap<u64, std::sync::Arc<parking_lot::Mutex<write_handle::WriteHandle>>>,
     next_fh: u64,
 }
@@ -79,6 +81,8 @@ impl State {
             next_ino,
             by_ino,
             by_path,
+            by_backend_inode: HashMap::new(),
+            aliases: HashMap::new(),
             write_handles: HashMap::new(),
             next_fh: 1,
         }
@@ -110,7 +114,25 @@ impl State {
     /// Drop the inode mapping for `path` (called on unlink/rmdir).
     pub fn evict_node(&mut self, path: &str) {
         if let Some(ino) = self.by_path.remove(path) {
-            self.by_ino.remove(&ino);
+            if let Some(paths) = self.aliases.get_mut(&ino) {
+                paths.remove(path);
+                if let Some((full, rel)) = paths.iter().next() {
+                    if let Some(node) = self.by_ino.get_mut(&ino) {
+                        node.full_path.clone_from(full);
+                        node.rel_path.clone_from(rel);
+                        node.nlink = node.nlink.saturating_sub(1).max(1);
+                    }
+                    return;
+                }
+            }
+            self.aliases.remove(&ino);
+            if let Some(node) = self.by_ino.remove(&ino) {
+                if let (Some(mount_idx), inode_id) = (node.mount_idx, node.inode_id) {
+                    if inode_id != 0 {
+                        self.by_backend_inode.remove(&(mount_idx, inode_id));
+                    }
+                }
+            }
         }
     }
 
@@ -152,13 +174,30 @@ impl State {
     /// `new_rel` is the post-rename rel_path so subsequent ops (`setattr`,
     /// `read`, etc.) hit the moved manifest instead of the vacated source.
     pub fn rename_node(&mut self, old: &str, new: &str, new_rel: &str) {
+        if self.by_path.contains_key(old) && self.by_path.get(old) == self.by_path.get(new) {
+            return;
+        }
+        self.evict_node(new);
         if let Some(ino) = self.by_path.remove(old) {
             self.by_path.insert(new.to_string(), ino);
+            if let Some(paths) = self.aliases.get_mut(&ino) {
+                paths.remove(old);
+                paths.insert(new.to_string(), new_rel.to_string());
+            }
             if let Some(node) = self.by_ino.get_mut(&ino) {
                 node.full_path = new.to_string();
                 node.rel_path = new_rel.to_string();
             }
         }
+    }
+
+    /// Add another path for an existing inode after a successful backend link.
+    pub fn link_node(&mut self, ino: u64, full: String, rel: String, nlink: u32) -> Option<Node> {
+        let node = self.by_ino.get_mut(&ino)?;
+        node.nlink = nlink.max(1);
+        self.by_path.insert(full.clone(), ino);
+        self.aliases.entry(ino).or_default().insert(full, rel);
+        Some(node.clone())
     }
 
     /// Return the full_path for an inode (test helper).
@@ -182,6 +221,10 @@ struct Node {
     rel_path: String,
     kind: FileType,
     size: u64,
+    /// Stable server inode id and current POSIX link count for regular files.
+    /// inode_id=0/nlink=0 are backward-compatible "unknown" values.
+    inode_id: u64,
+    nlink: u32,
     /// Stored POSIX permission bits (perm only; type comes from `kind`).
     /// 0 means "unknown" — `attr` falls back to a kind-based default. Refreshed
     /// on chmod so getattr reflects the stored mode after the attr TTL expires.
@@ -221,6 +264,8 @@ impl GatewayFs {
                 rel_path: String::new(),
                 kind: FileType::Directory,
                 size: 0,
+                inode_id: 0,
+                nlink: 2,
                 mode: 0,
                 uid: 0,
                 gid: 0,
@@ -304,7 +349,13 @@ impl GatewayFs {
                     _ => 0o644,
                 }
             },
-            nlink: 1,
+            nlink: if node.nlink != 0 {
+                node.nlink
+            } else if node.kind == FileType::Directory {
+                2
+            } else {
+                1
+            },
             // Stored owner; 0/0 (root) is the correct default on a
             // single-identity mount (== self.uid/self.gid when the mount runs
             // as root). chown stores the value, this reads it back.
@@ -402,28 +453,71 @@ impl GatewayFs {
         gid: u32,
         atime_ns: u64,
         rdev: u64,
+        inode_id: u64,
+        nlink: u32,
     ) -> Node {
         if let Some(ino) = state.by_path.get(&full_path).copied() {
-            let node = state.by_ino.get_mut(&ino).unwrap();
-            node.kind = kind;
-            node.size = size;
-            node.rdev = rdev;
-            // Only overwrite a known mode; a caller that doesn't know the mode
-            // passes 0 and must not clobber a mode we already learned.
-            if mode != 0 {
-                node.mode = mode;
+            let result = {
+                let node = state.by_ino.get_mut(&ino).unwrap();
+                node.kind = kind;
+                node.size = size;
+                node.rdev = rdev;
+                if inode_id != 0 {
+                    node.inode_id = inode_id;
+                }
+                if nlink != 0 {
+                    node.nlink = nlink;
+                }
+                // Only overwrite a known mode; a caller that doesn't know the mode
+                // passes 0 and must not clobber a mode we already learned.
+                if mode != 0 {
+                    node.mode = mode;
+                }
+                // Owner: 0/0 is a real value (root), so the entry-based callers
+                // always carry authoritative uid/gid — refresh from them. Synthetic
+                // callers (mount dirs) never re-intern a real file.
+                node.uid = uid;
+                node.gid = gid;
+                // Only overwrite a known atime; an unknown (0) atime must not clobber
+                // one we already learned, matching the mode guard.
+                if atime_ns != 0 {
+                    node.atime_ns = atime_ns;
+                }
+                node.clone()
+            };
+            state
+                .aliases
+                .entry(ino)
+                .or_default()
+                .insert(full_path, rel_path);
+            if let Some(mount_idx) = mount_idx {
+                if inode_id != 0 {
+                    state.by_backend_inode.insert((mount_idx, inode_id), ino);
+                }
             }
-            // Owner: 0/0 is a real value (root), so the entry-based callers
-            // always carry authoritative uid/gid — refresh from them. Synthetic
-            // callers (mount dirs) never re-intern a real file.
-            node.uid = uid;
-            node.gid = gid;
-            // Only overwrite a known atime; an unknown (0) atime must not clobber
-            // one we already learned, matching the mode guard.
-            if atime_ns != 0 {
-                node.atime_ns = atime_ns;
+            return result;
+        }
+
+        if inode_id != 0 {
+            if let Some(mount_idx) = mount_idx {
+                if let Some(ino) = state.by_backend_inode.get(&(mount_idx, inode_id)).copied() {
+                    state.by_path.insert(full_path.clone(), ino);
+                    state
+                        .aliases
+                        .entry(ino)
+                        .or_default()
+                        .insert(full_path, rel_path);
+                    let node = state.by_ino.get_mut(&ino).expect("backend inode mapping");
+                    node.size = size;
+                    node.mode = mode;
+                    node.uid = uid;
+                    node.gid = gid;
+                    node.atime_ns = atime_ns;
+                    node.rdev = rdev;
+                    node.nlink = nlink.max(1);
+                    return node.clone();
+                }
             }
-            return node.clone();
         }
 
         let ino = state.next_ino;
@@ -435,6 +529,8 @@ impl GatewayFs {
             rel_path,
             kind,
             size,
+            inode_id,
+            nlink,
             mode,
             uid,
             gid,
@@ -442,6 +538,16 @@ impl GatewayFs {
             rdev,
         };
         state.by_path.insert(full_path, ino);
+        state
+            .aliases
+            .entry(ino)
+            .or_default()
+            .insert(node.full_path.clone(), node.rel_path.clone());
+        if let Some(mount_idx) = mount_idx {
+            if inode_id != 0 {
+                state.by_backend_inode.insert((mount_idx, inode_id), ino);
+            }
+        }
         state.by_ino.insert(ino, node.clone());
         node
     }
@@ -648,6 +754,8 @@ impl GatewayFs {
                     0,
                     0,
                     0,
+                    0,
+                    2,
                 );
                 entries.push((mount_node.ino, FileType::Directory, name));
             }
@@ -687,6 +795,8 @@ impl GatewayFs {
                 entry.gid,
                 entry.atime as u64,
                 entry.rdev,
+                entry.inode_id,
+                entry.nlink,
             );
             entries.push((child.ino, kind, entry.name));
         }
@@ -772,6 +882,8 @@ impl Filesystem for GatewayFs {
                     0,
                     0,
                     0,
+                    0,
+                    2,
                 );
                 self.record(
                     req,
@@ -823,6 +935,8 @@ impl Filesystem for GatewayFs {
                     entry.gid,
                     entry.atime as u64,
                     entry.rdev,
+                    entry.inode_id,
+                    entry.nlink,
                 );
                 self.record(req, event::LOOKUP, &full, Some(entry.size), None, true);
                 reply.entry(&self.entry_ttl, &self.attr(&node), 0);
@@ -1134,6 +1248,8 @@ impl Filesystem for GatewayFs {
             0,
             mtime_ns,
             0,
+            0,
+            1,
         );
         let ino = node.ino;
         let mut wh = write_handle::WriteHandle::new(
@@ -1455,6 +1571,93 @@ impl Filesystem for GatewayFs {
         reply.ok();
     }
 
+    fn link(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let (source, parent) = {
+            let state = self.state.lock();
+            (
+                state.by_ino.get(&ino).cloned(),
+                state.by_ino.get(&newparent).cloned(),
+            )
+        };
+        let (Some(source), Some(parent)) = (source, parent) else {
+            reply.error(ENOENT);
+            return;
+        };
+        if source.kind != FileType::RegularFile {
+            reply.error(libc::EPERM);
+            return;
+        }
+        let (Some(source_mount), Some(target_mount)) = (source.mount_idx, parent.mount_idx) else {
+            reply.error(EACCES);
+            return;
+        };
+        if source_mount != target_mount {
+            reply.error(libc::EXDEV);
+            return;
+        }
+        if check_name_len(newname).is_err() {
+            reply.error(ENAMETOOLONG);
+            return;
+        }
+        let Some(name) = newname.to_str() else {
+            reply.error(EINVAL);
+            return;
+        };
+        self.assert_write_session(source_mount);
+        let to_full = join_full(&parent.full_path, name);
+        let to_rel = join_rel(&parent.rel_path, name);
+        let mount = &self.mounts[source_mount];
+        if !mount.policy.permits_write(&source.rel_path) || !mount.policy.permits_write(&to_rel) {
+            self.audit.record(
+                self.write_audit_event(req, source_mount, event::LINK, &source.full_path, false)
+                    .with_to_path(&to_full),
+            );
+            reply.error(EACCES);
+            return;
+        }
+        let nlink = match mount.store.hard_link(&source.rel_path, &to_rel) {
+            Ok(nlink) => nlink,
+            Err(err) => {
+                eprintln!(
+                    "warning: hard link {} -> {} failed: {err:#}",
+                    source.rel_path, to_rel
+                );
+                self.audit.record(
+                    self.write_audit_event(
+                        req,
+                        source_mount,
+                        event::LINK,
+                        &source.full_path,
+                        false,
+                    )
+                    .with_to_path(&to_full),
+                );
+                reply.error(backend_errno(&err, EIO));
+                return;
+            }
+        };
+        let linked = self
+            .state
+            .lock()
+            .link_node(ino, to_full.clone(), to_rel, nlink)
+            .unwrap_or_else(|| source.clone());
+        if let Some(notifier) = self.notifier.get() {
+            let _ = notifier.inval_inode(ino, 0, 0);
+        }
+        self.audit.record(
+            self.write_audit_event(req, source_mount, event::LINK, &source.full_path, true)
+                .with_to_path(&to_full),
+        );
+        reply.entry(&self.entry_ttl, &self.attr(&linked), 0);
+    }
+
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let (mount_idx, full, rel) = match self.resolve_child(parent, name) {
             Ok(t) => t,
@@ -1528,6 +1731,8 @@ impl Filesystem for GatewayFs {
             0,
             0,
             0,
+            0,
+            2,
         );
         let ino = node.ino;
         drop(state);
@@ -1960,6 +2165,8 @@ impl Filesystem for GatewayFs {
                 0,
                 0,
                 0,
+                0,
+                1,
             )
             .ino
         };
@@ -2030,13 +2237,13 @@ impl Filesystem for GatewayFs {
         // file type (or no type bits) is just a file create — route it through
         // the empty-manifest create path, identical to `create()`, so the node
         // gets a manifest + lease and behaves like any other file.
-        let ftype = mode & (libc::S_IFMT as u32);
+        let ftype = mode & libc::S_IFMT;
         let file_type = match ftype {
-            v if v == libc::S_IFIFO as u32 => FileType::NamedPipe,
-            v if v == libc::S_IFSOCK as u32 => FileType::Socket,
-            v if v == libc::S_IFCHR as u32 => FileType::CharDevice,
-            v if v == libc::S_IFBLK as u32 => FileType::BlockDevice,
-            v if v == libc::S_IFREG as u32 || v == 0 => {
+            v if v == libc::S_IFIFO => FileType::NamedPipe,
+            v if v == libc::S_IFSOCK => FileType::Socket,
+            v if v == libc::S_IFCHR => FileType::CharDevice,
+            v if v == libc::S_IFBLK => FileType::BlockDevice,
+            v if v == libc::S_IFREG || v == 0 => {
                 self.mknod_regular(req, mount_idx, full, rel, mode, reply);
                 return;
             }
@@ -2071,6 +2278,8 @@ impl Filesystem for GatewayFs {
                 0,
                 0,
                 rdev as u64,
+                0,
+                1,
             )
         };
         self.audit.record(
@@ -2127,6 +2336,8 @@ impl GatewayFs {
                 0,
                 mtime_ns,
                 0,
+                0,
+                1,
             )
             .ino
         };
@@ -2244,6 +2455,8 @@ mod fh_tests {
             rel_path: "a/b.txt".to_string(),
             kind: FileType::RegularFile,
             size: 0,
+            inode_id: 0,
+            nlink: 1,
             mode: 0,
             uid: 0,
             gid: 0,
@@ -2260,6 +2473,49 @@ mod fh_tests {
     }
 
     #[test]
+    fn hard_link_alias_keeps_inode_alive_and_repoints_backend_path() {
+        let mut state = empty_state();
+        let ino = state.next_ino;
+        state.next_ino += 1;
+        let node = Node {
+            ino,
+            full_path: "/a".to_string(),
+            mount_idx: Some(0),
+            rel_path: "a".to_string(),
+            kind: FileType::RegularFile,
+            size: 7,
+            inode_id: 41,
+            nlink: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime_ns: 0,
+            rdev: 0,
+        };
+        state.by_path.insert("/a".to_string(), ino);
+        state.by_ino.insert(ino, node);
+        state.by_backend_inode.insert((0, 41), ino);
+        state
+            .aliases
+            .entry(ino)
+            .or_default()
+            .insert("/a".to_string(), "a".to_string());
+
+        let linked = state
+            .link_node(ino, "/b".to_string(), "b".to_string(), 2)
+            .unwrap();
+        assert_eq!(linked.nlink, 2);
+        assert_eq!(state.lookup_path_for("/a"), Some(ino));
+        assert_eq!(state.lookup_path_for("/b"), Some(ino));
+
+        state.evict_node("/a");
+        assert_eq!(state.lookup_path(ino).as_deref(), Some("/b"));
+        assert_eq!(state.by_ino[&ino].rel_path, "b");
+        assert_eq!(state.by_ino[&ino].nlink, 1);
+        assert_eq!(state.by_backend_inode.get(&(0, 41)), Some(&ino));
+    }
+
+    #[test]
     fn set_node_size_updates_known_inode() {
         let mut state = empty_state();
         let ino = state.next_ino;
@@ -2271,6 +2527,8 @@ mod fh_tests {
             rel_path: "probe.txt".to_string(),
             kind: FileType::RegularFile,
             size: 0,
+            inode_id: 0,
+            nlink: 1,
             mode: 0,
             uid: 0,
             gid: 0,
@@ -2308,6 +2566,8 @@ mod fh_tests {
             rel_path: "a/b.txt".to_string(),
             kind: FileType::RegularFile,
             size: 0,
+            inode_id: 0,
+            nlink: 1,
             mode: 0,
             uid: 0,
             gid: 0,

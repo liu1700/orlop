@@ -35,6 +35,7 @@ docker run --rm \
   -e ORLOP_BIN=/build/target/release/orlop \
   -e RESULTS_DIR=/results \
   -e PJDFS_TESTS="${PJDFS_TESTS:-}" \
+  -e PJDFS_STRICT="${PJDFS_STRICT:-0}" \
   -e PJDFS_FS="${PJDFS_FS:-ext4}" \
   "$IMAGE" \
   bash scripts/pjdfstest-rig.sh

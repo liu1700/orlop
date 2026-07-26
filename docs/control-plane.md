@@ -76,6 +76,18 @@ Errors use an OAuth-style body. `error_description` is omitted when empty.
 { "error": "access_denied", "error_description": "tenant_suspended" }
 ```
 
+Every response also carries `X-Request-ID`, the same identifier written to the
+control-plane request log.
+
+The Go SDK returns non-2xx responses as `*client.APIError`, including the
+operation, method, path, status, machine-readable code, message, request ID,
+response headers, and a bounded (64 KiB) raw response body. Use `errors.As` for
+the full response and `errors.Is(err, client.ErrNotFound)` for stable branches.
+`APIError.Retryable()` classifies only `429`, `500`, `502`, `503`, and `504`;
+when `RetryAfter` is non-zero, wait at least that long and add jitter before
+retrying. The SDK deliberately does not retry automatically: callers must
+decide whether replaying the operation is safe and must bound attempts.
+
 ### Versioning and compatibility
 
 The control-plane API is versioned by a single **major** number, carried by the
@@ -245,6 +257,7 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 | Variable | Meaning |
 | --- | --- |
 | `PORT` | HTTP listen port. Default `8080`. |
+| `ORLOP_METRICS_ADDR` | Separate Prometheus listener. Default `:9090`; set to an empty value to disable. |
 | `DATABASE_URL` | Storage backend. Accepts a `postgres://…` DSN or a `sqlite:…` URL; the scheme selects the backend. Without it, the dashboard, `/v1/entities`, journal, and enroll routes are not mounted. See [`database-backends.md`](database-backends.md). |
 | `ORLOP_SECRETS_DIR` | Filesystem secrets root holding CA material (the default CA backend). |
 | `ORLOP_SECRETS_BACKEND` | `postgres` keeps the CA (root key + tenant intermediates) in the shared DB instead of on disk; any other value uses the filesystem backend at `ORLOP_SECRETS_DIR`. `/agent/enroll` mounts whenever a CA is configured by *either* backend, so `ORLOP_SECRETS_DIR` is not strictly required. `postgres` requires a Postgres `DATABASE_URL`. |

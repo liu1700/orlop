@@ -1,0 +1,54 @@
+name: posix
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/posix.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "cmd/orlop-server/**"
+      - "scripts/pjdfstest*"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/posix.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "cmd/orlop-server/**"
+      - "scripts/pjdfstest*"
+
+concurrency:
+  group: posix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hard-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure FUSE device
+        run: |
+          if [ ! -c /dev/fuse ]; then
+            sudo mknod /dev/fuse c 10 229
+            sudo chmod 0666 /dev/fuse
+          fi
+          test -c /dev/fuse
+      - name: Run hard-link POSIX conformance
+        env:
+          # The rig's mount smoke covers regular-file inode/content/nlink
+          # semantics. pjdfstest link/01.t covers the matching error surface;
+          # the full link category also requires special-node hard links,
+          # which Orlop intentionally does not claim yet.
+          PJDFS_TESTS: link/01.t
+          PJDFS_STRICT: "1"
+        run: scripts/pjdfstest-docker.sh
+      - name: Upload conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pjdfstest-hard-links
+          path: pjdfstest-results/
+          if-no-files-found: warn

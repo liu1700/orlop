@@ -30,6 +30,10 @@ pub struct Entry {
     pub name: String,
     pub kind: EntryKind,
     pub size: u64,
+    /// Stable backend inode identity for regular files. Zero means unknown.
+    pub inode_id: u64,
+    /// POSIX hard-link count. Zero means unknown and callers fall back to one.
+    pub nlink: u32,
     /// POSIX permission + type bits as stored server-side. 0 means the server
     /// did not report a mode (old server) — callers fall back to a kind default.
     pub mode: u32,

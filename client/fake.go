@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"fmt"
 	"sync"
 )
 
@@ -46,7 +45,11 @@ func (f *Fake) SetDiskQuota(_ context.Context, agentID string, grantBytes int64)
 	defer f.mu.Unlock()
 	d, ok := f.disks[agentID]
 	if !ok {
-		return fmt.Errorf("orlop: no disk for agent %q", agentID)
+		return fakeNotFound(
+			"SetDiskQuota",
+			entityPath(agentID),
+			"no disk for agent "+agentID,
+		)
 	}
 	d.QuotaBytes = grantBytes
 	f.disks[agentID] = d
@@ -88,7 +91,11 @@ func (f *Fake) ResolveDisk(_ context.Context, agentID string) (Disk, error) {
 	defer f.mu.Unlock()
 	d, ok := f.disks[agentID]
 	if !ok {
-		return Disk{}, fmt.Errorf("orlop: no disk for agent %q", agentID)
+		return Disk{}, fakeNotFound(
+			"ResolveDisk",
+			entityPath(agentID),
+			"no disk for agent "+agentID,
+		)
 	}
 	return d, nil
 }

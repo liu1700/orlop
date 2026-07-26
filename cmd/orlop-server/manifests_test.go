@@ -40,6 +40,7 @@ const testSchemaSQL = `
 	);
 	create table manifests (
 	  path text primary key,
+	  inode_id integer not null,
 	  size integer not null,
 	  mode integer not null,
 	  mtime integer not null,
@@ -49,6 +50,12 @@ const testSchemaSQL = `
 	  gid integer not null default 0,
 	  atime integer not null default 0
 	);
+	create index manifests_inode_id on manifests(inode_id);
+	create table inode_counter (
+	  singleton integer primary key check (singleton = 1),
+	  next_id integer not null
+	);
+	insert into inode_counter(singleton, next_id) values(1, 0);
 	create table dir_entries (
 	  parent text not null,
 	  name text not null,
@@ -328,6 +335,152 @@ func TestManifestGetNotFound(t *testing.T) {
 	store := NewManifestStore(openTestDB(t), nil)
 	if _, err := store.Get("/missing"); !errors.Is(err, ErrManifestNotFound) {
 		t.Fatalf("expected not-found, got %v", err)
+	}
+}
+
+func TestHardLinkSharesInodeContentAndChunkOwnership(t *testing.T) {
+	db := openTestDB(t)
+	store := NewManifestStore(db, nil)
+	chunks := sampleChunks()
+	original := Manifest{
+		Path: "/a", Size: 3072, Mode: 0o644, Mtime: 10, Chunks: chunks,
+	}
+	if _, err := store.Put("/a", 0, original, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range chunks {
+		assertRefcount(t, db, c.Hash, 1)
+	}
+
+	nlink, err := store.Link("/a", "/b", "", "", "")
+	if err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	if nlink != 2 {
+		t.Fatalf("nlink = %d, want 2", nlink)
+	}
+	a, err := store.Get("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := store.Get("/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.InodeID == 0 || a.InodeID != b.InodeID || a.Nlink != 2 || b.Nlink != 2 {
+		t.Fatalf("link identity: a=(%d,%d) b=(%d,%d)", a.InodeID, a.Nlink, b.InodeID, b.Nlink)
+	}
+	// Linking adds a name, not a second owner of the chunks.
+	for _, c := range chunks {
+		assertRefcount(t, db, c.Hash, 1)
+	}
+
+	updated := b
+	updated.Path = "/b"
+	updated.Size = 42
+	updated.Mode = 0o600
+	if _, err := store.Put("/b", b.Version, updated, "", "", ""); err != nil {
+		t.Fatalf("write through alias: %v", err)
+	}
+	a, err = store.Get("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err = store.Get("/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Size != 42 || a.Mode != 0o600 || a.Version != b.Version {
+		t.Fatalf("inode metadata diverged after alias write: a=%+v b=%+v", a, b)
+	}
+
+	// POSIX rename when source and destination are the same inode is a no-op:
+	// both names remain present.
+	if _, err := store.Rename("/a", "/b", a.Version, b.Version, "", "", ""); err != nil {
+		t.Fatalf("same-inode rename: %v", err)
+	}
+	if _, err := store.Get("/a"); err != nil {
+		t.Fatalf("same-inode rename removed source: %v", err)
+	}
+
+	if err := store.Delete("/a", a.Version, "", "", ""); err != nil {
+		t.Fatalf("delete non-final link: %v", err)
+	}
+	b, err = store.Get("/b")
+	if err != nil {
+		t.Fatalf("remaining link missing: %v", err)
+	}
+	if b.Nlink != 1 {
+		t.Fatalf("remaining nlink = %d, want 1", b.Nlink)
+	}
+	for _, c := range chunks {
+		assertRefcount(t, db, c.Hash, 1)
+	}
+	if err := store.Delete("/b", b.Version, "", "", ""); err != nil {
+		t.Fatalf("delete final link: %v", err)
+	}
+	for _, c := range chunks {
+		assertRefcount(t, db, c.Hash, 0)
+	}
+}
+
+func TestHardLinkEmptyFileKeepsNonNullChunkBlob(t *testing.T) {
+	store := NewManifestStore(openTestDB(t), nil)
+	if _, err := store.Put("/empty", 0, Manifest{Path: "/empty"}, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Link("/empty", "/alias", "", "", ""); err != nil {
+		t.Fatalf("link empty file: %v", err)
+	}
+	alias, err := store.Get("/alias")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alias.Nlink != 2 || len(alias.Chunks) != 0 {
+		t.Fatalf("alias = %+v, want nlink=2 and no chunks", alias)
+	}
+}
+
+func TestHardLinkDeleteJournalRevertRestoresSharedInode(t *testing.T) {
+	db := openTestDB(t)
+	store := NewManifestStore(db, nil)
+	journal := NewSessionJournal(db, nil)
+	chunks := sampleChunks()
+	if _, err := store.Put("/a", 0, Manifest{Path: "/a", Chunks: chunks}, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Link("/a", "/b", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := store.Get("/a")
+	if err := store.Delete("/a", a.Version, "sess-1", "alloc-1", "agent-1"); err != nil {
+		t.Fatal(err)
+	}
+	row, err := journal.latestRowForPath("alloc-1", "/a")
+	if err != nil || row == nil {
+		t.Fatalf("delete journal row: row=%v err=%v", row, err)
+	}
+	if row.RenameFrom != "/b" {
+		t.Fatalf("surviving alias = %q, want /b", row.RenameFrom)
+	}
+	b, _ := store.Get("/b")
+	working := map[string]*uint64{"/a": nil, "/b": &b.Version}
+	if err := applyInverse(store, *row, working, "", "", ""); err != nil {
+		t.Fatalf("revert hard-link delete: %v", err)
+	}
+	a, err = store.Get("/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err = store.Get("/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.InodeID != b.InodeID || a.Nlink != 2 || b.Nlink != 2 {
+		t.Fatalf("revert split inode: a=(%d,%d) b=(%d,%d)", a.InodeID, a.Nlink, b.InodeID, b.Nlink)
+	}
+	for _, c := range chunks {
+		assertRefcount(t, db, c.Hash, 1)
 	}
 }
 

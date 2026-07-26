@@ -41,12 +41,13 @@ async-trait = "0.1"
 daemonize = "0.5"
 os_pipe = "1.2"
 
-# fuser is gated to Linux so darwin can cross-compile from Linux runners via
-# cargo-zigbuild — its build.rs calls pkg-config for libfuse3 / macFUSE which
-# isn't available outside a true macOS host with macFUSE installed. macOS
-# uses the in-process NFSv3 path in src/nfs.rs and never needs fuser at all.
+# fuser is gated to Linux and built without its default `libfuse` feature.
+# Its pure-Linux backend talks to /dev/fuse directly (falling back to the
+# fusermount3 helper for unprivileged mounts), so the release binary has no
+# libfuse3.so ABI dependency and can be shipped across distro generations.
+# macOS uses the in-process NFSv3 path in src/nfs.rs and never needs fuser.
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.14", features = ["abi-7-31"] }
+fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }
 
 [dev-dependencies]
 hex = "0.4"

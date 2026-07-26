@@ -113,6 +113,7 @@ calling process (`command`, `agent_pid`, `uid`, `gid`).
 | `unlink` | file remove | none |
 | `rmdir` | directory remove | none |
 | `rename` | rename | `to_path` (`path` is the source) |
+| `link` | create a hard-link name | `to_path` (`path` is an existing name) |
 | `symlink` | symlink create | none |
 | `setattr` | `chmod`/`chown`/`truncate`/`utimes` | `setattr_fields` (bitmask) |
 | `flush` | dirty file flushed to the server | `size`, `chunks_new`, `chunks_reused`, `cas_retries`, `version_new`, `recovery_*` (on a write conflict) |
@@ -206,6 +207,7 @@ not over HTTP. Identity comes from the agent's client cert: these lines carry
 | `manifest_put` | write a path's manifest (CAS on version) | `size`, `version` (post-write), `session_id?` |
 | `manifest_delete` | delete a path | `session_id?` |
 | `manifest_rename` | rename a path | `path` = source, `session_id?` |
+| `link` | create a hard-link name | `path` = existing name, `session_id?` |
 | `dir_create` | create a directory | `session_id?` |
 | `dir_remove` | remove a directory | `session_id?` |
 | `setattr` | apply attribute change | `session_id?` |
@@ -306,7 +308,7 @@ The four primary collectors:
 
   ```
   list  stat  manifest_get  manifest_put  manifest_delete  manifest_rename
-  dir_create  dir_remove  setattr  symlink  readlink  mknod
+  dir_create  dir_remove  setattr  symlink  readlink  mknod  link
   chunk_get  chunk_has  chunk_put  journal_query  journal_revert_path
   ping  close  lease_grant  lease_refresh  lease_release  lease_revoke
   ```

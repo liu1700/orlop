@@ -22,16 +22,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install fuse3 dev headers
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
-
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo build --locked
 
+      - name: Reject accidental libfuse ABI dependency
+        run: |
+          if ldd target/debug/orlop | grep -q libfuse; then
+            echo "orlop must use fuser's pure /dev/fuse backend" >&2
+            exit 1
+          fi
+
       - run: cargo test --locked
+
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
 # Note: macOS builds live in release.yml (runs on tag push only). They need no
 # macFUSE: `fuser` is Linux-gated in Cargo.toml, so the darwin build uses the

@@ -215,6 +215,15 @@ impl Store for DataStore {
         )
     }
 
+    fn hard_link(&self, from: &str, to: &str) -> anyhow::Result<u32> {
+        self.client.hard_link(
+            &self.virtual_path(from),
+            &self.virtual_path(to),
+            self.current_session_id(),
+            self.current_allocation_id(),
+        )
+    }
+
     fn dir_list(&self, path: &str) -> anyhow::Result<Vec<Entry>> {
         let entries = self.client.list(&self.virtual_path(path))?;
         entries.into_iter().map(entry_from_wire).collect()
@@ -336,6 +345,8 @@ fn entry_from_wire(w: EntryWire) -> Result<Entry> {
         name: w.name,
         kind,
         size: w.size,
+        inode_id: w.inode_id,
+        nlink: w.nlink,
         mode: w.mode,
         uid: w.uid,
         gid: w.gid,

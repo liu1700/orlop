@@ -131,12 +131,13 @@ create table chunks (
 );
 
 create table manifests (
-  path    text primary key,
-  size    integer not null,
-  mode    integer not null,
-  mtime   integer not null,
-  version integer not null,                   -- monotonic per path
-  chunks  blob not null                       -- packed [hash(32) | offset(8) | len(4)] …
+  path     text primary key,
+  inode_id integer not null,
+  size     integer not null,
+  mode     integer not null,
+  mtime    integer not null,
+  version  integer not null,                  -- monotonic per inode
+  chunks   blob not null                      -- packed [hash(32) | offset(8) | len(4)] …
 );
 
 create table dir_entries (
@@ -146,6 +147,9 @@ create table dir_entries (
 );
 ```
 
+Multiple rows may share one `inode_id`: those paths are hard-link directory
+entries for the same regular file and carry identical content and metadata.
+Chunk refcounts are owned once per inode, not once per path.
 (`symlinks` and `special_nodes` tables hold the corresponding node types;
 `uid`/`gid`/`atime` columns were added to `manifests` later for POSIX
 ownership and times.)
@@ -341,6 +345,7 @@ pushes to the client. (Codes from `cmd/orlop-server/dataplane/protocol.go`.)
 | `READLINK` | 0x17 | client → server |
 | `JOURNAL_REVERT_PATH` | 0x18 | client → server |
 | `MKNOD` | 0x19 | client → server |
+| `LINK` | 0x1A | client → server |
 
 A benchmark harness (`orlop-bench`, in `bench/`) drives synthetic filesystem
 workloads under emulated WAN to compare TCP and QUIC; TCP stays the default

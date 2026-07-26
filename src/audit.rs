@@ -29,6 +29,7 @@ pub mod event {
     pub const RMDIR: &str = "rmdir";
     pub const MKDIR: &str = "mkdir";
     pub const RENAME: &str = "rename";
+    pub const LINK: &str = "link";
     pub const SETATTR: &str = "setattr";
     pub const SYMLINK: &str = "symlink";
     pub const LEASE_DENIED: &str = "lease_denied";

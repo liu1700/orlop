@@ -11,7 +11,7 @@ no in-Docker rebuild.
 |---|---|---|---|
 | `ghcr.io/liu1700/orlop-control` | control plane | HTTP API **and** operator CLI — `migrate` is a subcommand of this one binary, not a separate image | distroless static, nonroot |
 | `ghcr.io/liu1700/orlop-server` | data plane | the data-plane server (ops + data listeners, mTLS) | distroless static, nonroot |
-| `ghcr.io/liu1700/orlop-mount` | mount client | the `orlop` disk-mount binary with `fuse3` available at runtime | debian bookworm-slim |
+| `ghcr.io/liu1700/orlop-mount` | mount client | static `orlop` disk-mount binary with `fusermount3` available at runtime | debian trixie-slim |
 
 ## Tags & pinning
 
@@ -64,7 +64,16 @@ docker run --rm \
 ## `orlop-mount`
 
 The mount client with FUSE available at runtime — the image that saves you the
-Rust + `libfuse3` build.
+Rust build. Linux releases use fuser's pure backend and a static musl binary:
+there is no `libfuse3.so` dependency. `fuse3` in the image supplies the
+`fusermount3` helper used when the process cannot mount `/dev/fuse` directly.
+The binary is therefore safe to copy into bookworm, trixie, or another Linux
+base with a compatible kernel:
+
+```dockerfile
+COPY --from=ghcr.io/liu1700/orlop-mount:vX.Y.Z \
+  /usr/local/bin/orlop /usr/local/bin/orlop
+```
 
 | | |
 |---|---|

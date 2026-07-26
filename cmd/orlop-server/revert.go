@@ -303,6 +303,30 @@ func applyInverse(
 		if curr := working[row.Path]; curr != nil {
 			return &RevertConflictError{Path: row.Path, CurrentVersion: *curr}
 		}
+		if row.RenameFrom != "" {
+			// A delete of one hard-link name records a surviving alias in
+			// RenameFrom. Restore the directory entry onto that same inode;
+			// using Put here would allocate a second inode and refcount chunks
+			// twice.
+			source, ok := working[row.RenameFrom]
+			if !ok {
+				live, err := liveManifestVersion(manifests, row.RenameFrom)
+				if err != nil {
+					return err
+				}
+				source = live
+				working[row.RenameFrom] = live
+			}
+			if source == nil {
+				return &RevertConflictError{Path: row.RenameFrom, CurrentVersion: 0}
+			}
+			if _, err := manifests.Link(row.RenameFrom, row.Path, sessionID, allocationID, agentID); err != nil {
+				return wrapCAS(err, row.Path)
+			}
+			version := *source
+			working[row.Path] = &version
+			return nil
+		}
 		prior, err := decodeJournalManifest(row.Path, row.BeforeManifest)
 		if err != nil {
 			return err
