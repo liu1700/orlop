@@ -80,7 +80,7 @@ pub fn build_stores(
             let server_prefix = if mount_name.is_empty() {
                 String::new()
             } else {
-                format!("/{}", mount_name)
+                format!("/{mount_name}")
             };
 
             // Every mount is remote — the data plane is the only backend.

@@ -131,6 +131,17 @@ impl LeaseManager {
         })))
     }
 
+    /// Discard the connection-local cache entry and obtain a fresh server
+    /// lease. Used only when a failed live-handoff successor may have
+    /// superseded this connection's lease id.
+    pub fn force_reacquire_exclusive(
+        self: &Arc<Self>,
+        path: &str,
+    ) -> Result<Option<Arc<LeaseHandle>>> {
+        self.state.lock().by_path.remove(path);
+        self.acquire_exclusive(path)
+    }
+
     /// If we currently hold a lease for `path`, refcount-bump and return a
     /// handle. Does not contact the server. Used for graceful flush+release on
     /// rename without re-acquiring across the rename gap.

@@ -149,8 +149,7 @@ fn concurrent_writers_cas_retry() {
     let final_v = stats1.version_new.max(stats2.version_new);
     assert_eq!(
         final_v, 2,
-        "expected final manifest version 2, got {}",
-        final_v
+        "expected final manifest version 2, got {final_v}"
     );
 }
 

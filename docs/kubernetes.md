@@ -181,13 +181,42 @@ that return `ENOTCONN`. Cleanup is safe to retry and refuses a path with a
 non-Orlop filesystem stacked at the same location. A node-debug pod normally
 needs to enter the host namespace first, for example with `nsenter -t 1 -m`.
 
-This is crash cleanup, not transparent handoff. Once the last process holding
-the connection's `/dev/fuse` fd dies, Linux has no API that can attach a new fd
-to that disconnected connection; the remaining mount shell can only be
-detached and recreated. A zero-disruption mount-client binary upgrade would
-require fd handoff while the old process is still alive and is not currently
-supported. Schedule a mount-pod replacement as a disruptive event for workloads
-using that mount.
+Crash cleanup and live upgrade are different paths. Once the last process
+holding the connection's `/dev/fuse` fd dies, Linux has no API that can attach a
+new fd to that disconnected connection; the remaining mount shell can only be
+detached and recreated. `orlop mount --adopt` deliberately refuses that case.
+
+While the old client is still healthy, an operator in the same mount namespace
+can attach management state without remounting:
+
+```bash
+orlop mount --adopt /mnt/orlop
+```
+
+To replace the running mount-client binary without dropping the kernel mount,
+stage the new executable at an absolute path visible to the old process, then
+request a live handoff:
+
+```bash
+orlop mount --adopt /mnt/orlop \
+  --replace-with /var/lib/orlop/releases/0.4.0/orlop
+```
+
+The predecessor authenticates the local peer, starts the successor with a
+one-time token, parks FUSE dispatch between requests, flushes dirty write
+handles, and transfers the initialized `/dev/fuse` fd plus a versioned inode and
+open-handle snapshot over `SCM_RIGHTS`. The successor validates the snapshot,
+rebuilds data-plane connections and leases, then acknowledges readiness. Only
+then does the predecessor commit and exit without unmounting. A timeout,
+protocol mismatch, invalid binary, failed flush, or successor setup error
+aborts the transaction: the predecessor resumes dispatch and reacquires leases.
+
+This upgrades a process in the existing pod/namespace; it does not make a
+normal Kubernetes pod replacement preserve an fd across containers. For a
+mount-pod rollout, either stage releases on a volume shared with the existing
+container and invoke the command there, or treat pod replacement as disruptive
+and coordinate workload quiescence. Never kill the predecessor before the
+handoff command reports the successor PID.
 
 ## See also
 

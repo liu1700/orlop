@@ -304,6 +304,40 @@ export RUST_BACKTRACE=1
 log "Mounting orlop FUSE at $MNT"
 start_mount
 
+log "Live handoff smoke (dirty open FH + stable kernel mount)"
+HANDOFF_MOUNT_ID="$(findmnt -n -o ID --target "$MNT")"
+HANDOFF_OLD_PID="$MOUNT_PID"
+HANDOFF_BIN="$RIG_DIR/orlop-successor"
+cp "$ORLOP_BIN" "$HANDOFF_BIN"
+chmod 0755 "$HANDOFF_BIN"
+exec 9>"$MNT/_rig-handoff-open"
+printf before- >&9
+mv "$CLIENT_CERT_DIR/key.pem" "$CLIENT_CERT_DIR/key.pem.away"
+if "$ORLOP_BIN" mount --adopt "$MNT" --replace-with "$HANDOFF_BIN" \
+  >>"$LOG_DIR/handoff-rollback.log" 2>&1; then
+  mv "$CLIENT_CERT_DIR/key.pem.away" "$CLIENT_CERT_DIR/key.pem"
+  fail "handoff unexpectedly succeeded without the successor client key"
+fi
+mv "$CLIENT_CERT_DIR/key.pem.away" "$CLIENT_CERT_DIR/key.pem"
+kill -0 "$HANDOFF_OLD_PID" 2>/dev/null || fail "predecessor died after rejected handoff"
+mountpoint -q "$MNT" || fail "mount disappeared after rejected handoff"
+printf rollback- >&9
+HANDOFF_OUT="$("$ORLOP_BIN" mount --adopt "$MNT" --replace-with "$HANDOFF_BIN")"
+MOUNT_PID="$(printf '%s\n' "$HANDOFF_OUT" | sed -n 's/.* PID \([0-9][0-9]*\)$/\1/p')"
+[[ -n "$MOUNT_PID" ]] || fail "could not parse successor PID from: $HANDOFF_OUT"
+wait "$HANDOFF_OLD_PID"
+kill -0 "$MOUNT_PID" 2>/dev/null || fail "handoff successor $MOUNT_PID is not running"
+mountpoint -q "$MNT" || fail "mount disappeared during live handoff"
+[[ "$(findmnt -n -o ID --target "$MNT")" == "$HANDOFF_MOUNT_ID" ]] \
+  || fail "kernel mount ID changed during live handoff"
+[[ "$("$ORLOP_BIN" mount --adopt "$MNT")" == *"PID $MOUNT_PID)"* ]] \
+  || fail "successor did not answer adopt inspection"
+printf after >&9
+exec 9>&-
+[[ "$(cat "$MNT/_rig-handoff-open")" == "before-rollback-after" ]] \
+  || fail "open file handle did not survive live handoff"
+rm "$MNT/_rig-handoff-open"
+
 log "Mount smoke (create/write/read/hard-link/rename/unlink)"
 echo smoke >"$MNT/_rig-smoke"
 grep -q smoke "$MNT/_rig-smoke"

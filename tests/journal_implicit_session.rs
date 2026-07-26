@@ -237,7 +237,7 @@ fn session_id_format_matches_spec() {
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{:02x}", b));
+        out.push_str(&format!("{b:02x}"));
     }
     out
 }

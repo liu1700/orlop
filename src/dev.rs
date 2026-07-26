@@ -647,7 +647,7 @@ fn print_ready_banner(state: &DevState) {
     eprintln!("  data plane     ops {}  data {}", state.ops_addr, state.data_addr);
     eprintln!("  disk mounted   {}  (agent {})", mp, state.agent_id);
     eprintln!();
-    eprintln!("  try it:   echo hi > {}/hello.txt", mp);
+    eprintln!("  try it:   echo hi > {mp}/hello.txt");
     eprintln!("  status:   orlop status");
     eprintln!("  stop:     Ctrl-C, or `orlop dev down` from another shell");
 }

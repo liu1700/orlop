@@ -16,12 +16,19 @@ mount, crash boundaries, migrations, and operational recovery.
 | Distribution | run the static mount binary on supported Debian bases |
 | Operations | bounded-cardinality metrics, health check, stale-mount cleanup |
 | Metadata | transactional mutations, CAS, chunk refcount invariants, migration tests |
+| Live handoff | versioned snapshot validation, authenticated fd transfer, timeout rollback, lease recovery |
 
 The pull-request POSIX gate currently runs a regular-file hard-link smoke and
 pjdfstest's link error-semantics test because together they cross the inode,
 manifest, journal, protocol, FUSE-cache, and chunk-GC boundaries. The full
 pjdfstest suite remains available through the same rig; failures and mount
 deaths are preserved as artifacts.
+
+Linux live-upgrade tests separately exercise request-loop pause/resume,
+negotiated FUSE protocol restoration, bounded frame decoding, `SCM_RIGHTS`
+descriptor identity, and peer credentials. The failure contract is fail-safe:
+the predecessor remains the fd owner and resumes service until a successor has
+validated all transferred state and acknowledged commit readiness.
 
 ## Practices adopted from similar filesystems
 

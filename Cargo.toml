@@ -1,5 +1,6 @@
 [workspace]
 members = ["bench"]
+exclude = ["third_party/fuser"]
 resolver = "2"
 
 [package]
@@ -47,7 +48,15 @@ os_pipe = "1.2"
 # libfuse3.so ABI dependency and can be shipped across distro generations.
 # macOS uses the in-process NFSv3 path in src/nfs.rs and never needs fuser.
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }
+fuser = { version = "0.15.1", default-features = false, features = ["abi-7-31"] }
+
+[patch.crates-io]
+# Orlop's live-upgrade protocol needs two narrowly-scoped session primitives
+# that upstream fuser does not expose yet: pausing the request loop at a
+# dispatch boundary and resuming an already-initialized connection from an
+# inherited fd. The vendored crate is unmodified fuser 0.15.1 except for those
+# documented additions; see third_party/fuser/ORLOP_PATCH.md.
+fuser = { path = "third_party/fuser" }
 
 [dev-dependencies]
 hex = "0.4"

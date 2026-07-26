@@ -14,6 +14,8 @@ pub mod enroll;
 // crate root, not under `fs::`, so they stay available on every platform.
 #[cfg(target_os = "linux")]
 pub mod fs;
+#[cfg(target_os = "linux")]
+pub mod handoff;
 pub mod lease;
 pub mod login;
 pub mod mount;

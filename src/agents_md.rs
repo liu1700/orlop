@@ -36,7 +36,7 @@ pub enum InjectAction {
 pub fn render_stanza(mountpoint: &Path) -> String {
     let mp = mountpoint.display();
     format!(
-        "{begin}\n## Orlop — cross-agent persistent disk\n\n\
+        "{BEGIN_MARKER}\n## Orlop — cross-agent persistent disk\n\n\
 Orlop is mounted at `{mp}`. Treat it as an ordinary directory and operate\n\
 with normal filesystem tools (ls, cat, rg, edit, python). Files persist\n\
 across sessions, machines, and agent runtimes.\n\n\
@@ -46,10 +46,7 @@ read later. Skip for scratch work or files inside this repo.\n\n\
 If an orlop command fails with an authentication error, ask the host to\n\
 re-enroll this agent (mint a fresh enroll token and re-run\n\
 `orlop mount --from-env`).\n\
-{end}\n",
-        begin = BEGIN_MARKER,
-        end = END_MARKER,
-        mp = mp,
+{END_MARKER}\n",
     )
 }
 
@@ -97,7 +94,7 @@ pub fn inject(path: &Path, stanza: &str) -> Result<InjectAction> {
             let before = &body[..start];
             let after = &body[end + END_MARKER.len()..];
             let trimmed_after = after.strip_prefix('\n').unwrap_or(after);
-            let new_body = format!("{}{}{}", before, stanza, trimmed_after);
+            let new_body = format!("{before}{stanza}{trimmed_after}");
             if new_body == body {
                 return Ok(InjectAction::Unchanged);
             }
@@ -113,7 +110,7 @@ pub fn inject(path: &Path, stanza: &str) -> Result<InjectAction> {
     } else {
         "\n\n"
     };
-    let new_body = format!("{}{}{}", body, separator, stanza);
+    let new_body = format!("{body}{separator}{stanza}");
     fs::write(path, &new_body).with_context(|| format!("write {}", path.display()))?;
     Ok(if body.is_empty() {
         InjectAction::Created
