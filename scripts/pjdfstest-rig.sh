@@ -86,7 +86,10 @@ if [[ "$ORLOP_BUILD" == "1" ]]; then
   # rig would silently test old code (observed 2026-06-12).
   rm -f "$ORLOP_BIN" "$SERVER_BIN"
   cargo build --release --bin orlop
-  ( cd cmd/orlop-server && go build -o "$SERVER_BIN" . )
+  # The repo is bind-mounted into the container and CI checkout ownership may
+  # differ from the container uid. The rig does not consume Go VCS stamping,
+  # so disable it instead of weakening Git safe.directory globally.
+  ( cd cmd/orlop-server && go build -buildvcs=false -o "$SERVER_BIN" . )
 fi
 [[ -x "$ORLOP_BIN" ]] || fail "orlop binary missing at $ORLOP_BIN (build failed?)"
 [[ -x "$SERVER_BIN" ]] || fail "orlop-server binary missing at $SERVER_BIN"
