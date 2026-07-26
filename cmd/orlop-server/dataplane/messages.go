@@ -13,6 +13,11 @@ type EntryWire struct {
 	Name string `msgpack:"name"`
 	Kind string `msgpack:"kind"` // "file", "dir", or "symlink"
 	Size uint64 `msgpack:"size"`
+	// InodeID is stable for every directory entry that names the same regular
+	// file. Nlink is the current number of such names. Zero/omitted keeps
+	// compatibility with pre-hard-link clients.
+	InodeID uint64 `msgpack:"inode_id,omitempty"`
+	Nlink   uint32 `msgpack:"nlink,omitempty"`
 	// Mode is the POSIX permission bits. Append-only msgpack field — old
 	// clients/servers omit it and fall back to kind-based defaults.
 	Mode uint32 `msgpack:"mode,omitempty"`
@@ -184,6 +189,17 @@ type ManifestRenameRequest struct {
 
 type ManifestRenameResponse struct {
 	NewVersionAtTo uint64 `msgpack:"new_version_at_to"`
+}
+
+type LinkRequest struct {
+	From         string  `msgpack:"from"`
+	To           string  `msgpack:"to"`
+	SessionID    *string `msgpack:"session_id,omitempty"`
+	AllocationID *string `msgpack:"allocation_id,omitempty"`
+}
+
+type LinkResponse struct {
+	Nlink uint32 `msgpack:"nlink"`
 }
 
 type DirCreateRequest struct {

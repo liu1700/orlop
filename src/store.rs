@@ -80,6 +80,9 @@ pub trait Store: Send + Sync {
         expected_version_from: u64,
         expected_version_to: u64,
     ) -> anyhow::Result<u64>;
+    fn hard_link(&self, _from: &str, _to: &str) -> anyhow::Result<u32> {
+        anyhow::bail!("hard links not supported by this store")
+    }
 
     fn dir_list(&self, path: &str) -> anyhow::Result<Vec<Entry>>;
     fn dir_create(&self, path: &str, mode: u32) -> anyhow::Result<()>;

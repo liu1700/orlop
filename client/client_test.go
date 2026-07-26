@@ -3,10 +3,13 @@ package client_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/liu1700/orlop/client"
 )
@@ -130,12 +133,127 @@ func TestHTTPClientUserDiskUsage(t *testing.T) {
 
 func TestHTTPClientErrorStatus(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-ID", "req-123")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":             "server_error",
+			"error_description": "boom",
+		})
 	}))
 	defer ts.Close()
 	c := client.New(ts.URL, "")
-	if _, err := c.AllocateDisk(context.Background(), agentID, ownerID, 0); err == nil {
+	_, err := c.AllocateDisk(context.Background(), agentID, ownerID, 0)
+	if err == nil {
 		t.Fatal("expected error on 500")
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T; want *client.APIError", err)
+	}
+	if apiErr.Op != "AllocateDisk" ||
+		apiErr.Method != http.MethodPost ||
+		apiErr.Path != "/v1/entities" ||
+		apiErr.StatusCode != http.StatusInternalServerError ||
+		apiErr.Code != "server_error" ||
+		apiErr.Message != "boom" ||
+		apiErr.RequestID != "req-123" ||
+		apiErr.Header.Get("Content-Type") != "application/json" ||
+		apiErr.RetryAfter != 7*time.Second ||
+		!strings.Contains(apiErr.Body, `"server_error"`) {
+		t.Fatalf("APIError = %+v", apiErr)
+	}
+	if !apiErr.Retryable() {
+		t.Fatal("500 should be retryable")
+	}
+}
+
+func TestAPIErrorRetryableStatusIsBounded(t *testing.T) {
+	for _, status := range []int{
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		if !(&client.APIError{StatusCode: status}).Retryable() {
+			t.Errorf("status %d should be retryable", status)
+		}
+	}
+	for _, status := range []int{
+		http.StatusBadRequest,
+		http.StatusNotImplemented,
+		http.StatusHTTPVersionNotSupported,
+	} {
+		if (&client.APIError{StatusCode: status}).Retryable() {
+			t.Errorf("status %d should not be retryable", status)
+		}
+	}
+}
+
+func TestHTTPClientErrorSentinels(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		code   string
+		target error
+	}{
+		{"not found", http.StatusNotFound, "not_found", client.ErrNotFound},
+		{"conflict", http.StatusConflict, "already_mounted", client.ErrConflict},
+		{"unauthorized", http.StatusUnauthorized, "invalid_token", client.ErrUnauthorized},
+		{"forbidden", http.StatusForbidden, "access_denied", client.ErrForbidden},
+		{"rate limited", http.StatusTooManyRequests, "rate_limited", client.ErrRateLimited},
+		{"quota", http.StatusConflict, "quota_exceeded", client.ErrQuotaExceeded},
+		{"capacity", http.StatusConflict, "insufficient_capacity", client.ErrInsufficientCapacity},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				writeErr := map[string]string{"error": tt.code}
+				w.WriteHeader(tt.status)
+				_ = json.NewEncoder(w).Encode(writeErr)
+			}))
+			defer ts.Close()
+
+			_, err := client.New(ts.URL, "tok").ResolveDisk(context.Background(), agentID)
+			if !errors.Is(err, tt.target) {
+				t.Fatalf("errors.Is(%v, %v) = false", err, tt.target)
+			}
+		})
+	}
+}
+
+func TestHTTPClientPlainTextErrorIsPreserved(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "plain failure", http.StatusBadGateway)
+	}))
+	defer ts.Close()
+
+	_, err := client.New(ts.URL, "tok").ResolveDisk(context.Background(), agentID)
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T; want *client.APIError", err)
+	}
+	if apiErr.Message != "plain failure" || !apiErr.Retryable() {
+		t.Fatalf("APIError = %+v", apiErr)
+	}
+}
+
+func TestHTTPClientErrorBodyIsBounded(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(strings.Repeat("x", (64<<10)+1024)))
+	}))
+	defer ts.Close()
+
+	_, err := client.New(ts.URL, "tok").ResolveDisk(context.Background(), agentID)
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T; want *client.APIError", err)
+	}
+	if len(apiErr.Body) != 64<<10 {
+		t.Fatalf("error body length = %d; want %d", len(apiErr.Body), 64<<10)
 	}
 }
 
@@ -189,6 +307,22 @@ func TestFakeAllocateIdempotentAndUsage(t *testing.T) {
 	f.SetUserDiskUsage("owner-1", 5<<30)
 	if got, _ := f.UserDiskUsage(context.Background(), "owner-1"); got != 5<<30 {
 		t.Fatalf("usage = %d", got)
+	}
+}
+
+func TestFakeNotFoundMatchesLiveClientContract(t *testing.T) {
+	f := client.NewFake()
+	_, err := f.ResolveDisk(context.Background(), "missing")
+	if !errors.Is(err, client.ErrNotFound) {
+		t.Fatalf("ResolveDisk error = %v; want ErrNotFound", err)
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.Op != "ResolveDisk" || apiErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("ResolveDisk error = %#v; want typed 404", err)
+	}
+
+	if err := f.SetDiskQuota(context.Background(), "missing", 1); !errors.Is(err, client.ErrNotFound) {
+		t.Fatalf("SetDiskQuota error = %v; want ErrNotFound", err)
 	}
 }
 

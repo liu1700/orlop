@@ -38,6 +38,14 @@ func OpenTenantDB(path string) (*TenantDB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open tenant db %s: %w", path, err)
 	}
+	// SQLite has one writer. database/sql otherwise opens multiple physical
+	// connections, while PRAGMA busy_timeout applies only to the one on which
+	// it was executed; concurrent metadata writes then fail immediately with
+	// SQLITE_BUSY. One connection gives deterministic transactional ordering
+	// (WAL still benefits readers in other processes) and avoids partial
+	// per-connection PRAGMA state.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping tenant db %s: %w", path, err)
@@ -71,6 +79,7 @@ func ensureTenantSchema(db *sql.DB) error {
 		);
 		create table if not exists manifests (
 		  path text primary key,
+		  inode_id integer not null,
 		  size integer not null,
 		  mode integer not null,
 		  mtime integer not null,
@@ -118,6 +127,7 @@ func ensureTenantSchema(db *sql.DB) error {
 		`alter table manifests add column uid integer not null default 0`,
 		`alter table manifests add column gid integer not null default 0`,
 		`alter table manifests add column atime integer not null default 0`,
+		`alter table manifests add column inode_id integer not null default 0`,
 		`alter table dir_entries add column uid integer not null default 0`,
 		`alter table dir_entries add column gid integer not null default 0`,
 		`alter table dir_entries add column atime integer not null default 0`,
@@ -128,6 +138,30 @@ func ensureTenantSchema(db *sql.DB) error {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
 		}
+	}
+	// Existing databases predate inode identity. Seed each existing path with a
+	// distinct stable id; hard links intentionally share this value.
+	if _, err := db.Exec(`update manifests set inode_id = rowid where inode_id = 0`); err != nil {
+		return err
+	}
+	// Allocate inode ids from one transactional counter. MAX(inode_id)+1 in a
+	// deferred transaction is race-prone: two concurrent creates can observe
+	// the same max before either becomes the SQLite writer.
+	if _, err := db.Exec(`
+		create table if not exists inode_counter (
+		  singleton integer primary key check (singleton = 1),
+		  next_id integer not null
+		);
+		insert or ignore into inode_counter(singleton, next_id)
+		values(1, (select coalesce(max(inode_id), 0) from manifests));
+		update inode_counter
+		set next_id = max(next_id, (select coalesce(max(inode_id), 0) from manifests))
+		where singleton = 1;
+	`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`create index if not exists manifests_inode_id on manifests(inode_id)`); err != nil {
+		return err
 	}
 	return nil
 }

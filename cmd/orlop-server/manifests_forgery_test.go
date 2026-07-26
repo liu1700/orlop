@@ -80,6 +80,33 @@ func TestManifestDeleteRejectsForgedSessionID(t *testing.T) {
 	}
 }
 
+// TestManifestLinkRejectsForgedSessionID confirms hard links cannot bypass
+// the same mount-lease authenticity check as other manifest writes.
+func TestManifestLinkRejectsForgedSessionID(t *testing.T) {
+	db := openTestDB(t)
+	store := NewManifestStore(db, nil)
+
+	leaseHex := hex.EncodeToString([]byte("aaaaaaaaaaaaaaaa"))
+	validSessionID := "mount:" + leaseHex
+	if _, err := store.PutWithLeaseCheck(
+		"/from", 0, Manifest{Path: "/from", Size: 0, Mode: 0o644},
+		validSessionID, "alloc_test", "agent_test", leaseHex,
+	); err != nil {
+		t.Fatalf("seed put failed: %v", err)
+	}
+
+	forged := "mount:" + hex.EncodeToString([]byte("bbbbbbbbbbbbbbbb"))
+	_, err := store.LinkWithLeaseCheck(
+		"/from", "/to", forged, "alloc_test", "agent_test", leaseHex,
+	)
+	if err == nil {
+		t.Fatal("expected EACCES on forged session_id during Link, got nil")
+	}
+	if !strings.Contains(err.Error(), "session_id mismatch") {
+		t.Fatalf("expected session_id mismatch error, got: %v", err)
+	}
+}
+
 // TestManifestRenameRejectsForgedSessionID confirms the same check on Rename.
 func TestManifestRenameRejectsForgedSessionID(t *testing.T) {
 	db := openTestDB(t)

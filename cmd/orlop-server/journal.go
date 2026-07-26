@@ -26,7 +26,9 @@ const (
 // SessionJournalEntry is one row read back from session_journal.
 //
 // BeforeVersion / BeforeManifest are nil for SessionOpCreate (no prior state
-// to undo to). RenameFrom is empty unless Op == SessionOpRename. AfterVersion
+// to undo to). RenameFrom names the old source for SessionOpRename; for a
+// non-final hard-link SessionOpDelete it names a surviving inode alias.
+// AfterVersion
 // is the version the forward op left at `path`; nil for delete rows. Used by
 // revert as the CAS-expected when applying the inverse so concurrent writers
 // surface as RevertConflict instead of being silently overwritten. Distinct

@@ -17,6 +17,7 @@ pub mod fs;
 pub mod lease;
 pub mod login;
 pub mod mount;
+pub mod mounts;
 // Not cfg-gated to macOS: building it everywhere lets its unit tests run on
 // Linux CI (only the mount path is macOS-specific).
 pub mod nfs;

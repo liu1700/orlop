@@ -131,6 +131,37 @@ Plain `orlop doctor` (no `--dev`) additionally looks for a config + credentials;
 those are only for a config-based `orlop mount` — `orlop dev up` supplies them
 itself, so ignore those notes here.
 
+### Find and reclaim stale Linux FUSE mounts
+
+If a mount client's supervisor dies, the kernel mount may remain while the
+userspace FUSE server is gone. Such a path returns `ENOTCONN` ("Transport
+endpoint is not connected"). Enumerate from the mount table rather than with a
+filesystem glob, because a glob can silently skip the disconnected path:
+
+```bash
+orlop mount ls
+orlop mount ls --json
+orlop mount check /mnt/orlop  # exits non-zero unless this exact mount is alive
+```
+
+Each path probe has a two-second deadline. A wedged but still-connected FUSE
+daemon is reported as `inaccessible` after the deadline and is never treated as
+safe to detach.
+
+Cleanup is idempotent, including when two janitors race, and only lazy-detaches
+Orlop-only mount stacks that currently return `ENOTCONN`; it stops if a live
+layer is exposed and skips a path entirely if another filesystem is stacked
+there:
+
+```bash
+orlop unmount --stale
+```
+
+The command acts in its current Linux mount namespace. From a Kubernetes node
+debug container, enter the host mount namespace first (for example with
+`nsenter -t 1 -m`) rather than relying on a `chroot` or bind-mounted copy of the
+host filesystem.
+
 ## Going further
 
 - [`manual-bring-up.md`](manual-bring-up.md) — run the control plane, server,

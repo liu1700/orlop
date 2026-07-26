@@ -287,6 +287,7 @@ var OpTable = map[dataplane.Op]opSpec{
 	dataplane.OpSymlink:           {"symlink", handleSymlink},
 	dataplane.OpReadlink:          {"readlink", handleReadlink},
 	dataplane.OpMknod:             {"mknod", handleMknod},
+	dataplane.OpLink:              {"link", handleLink},
 	dataplane.OpChunkGet:          {"chunk_get", handleChunkGet},
 	dataplane.OpChunkHas:          {"chunk_has", handleChunkHas},
 	dataplane.OpChunkPut:          {"chunk_put", handleChunkPut},
@@ -401,7 +402,7 @@ func handleList(s *serverState, tenant *tenantState, ident Identity, w *frameWri
 		if !s.policy.Permits(policyPath(child)) {
 			continue
 		}
-		e := dataplane.EntryWire{Name: c.Name, Kind: c.Kind, Size: c.Size, Mode: c.Mode, Uid: c.Uid, Gid: c.Gid, Atime: c.Atime}
+		e := dataplane.EntryWire{Name: c.Name, Kind: c.Kind, Size: c.Size, Mode: c.Mode, Uid: c.Uid, Gid: c.Gid, Atime: c.Atime, InodeID: c.InodeID, Nlink: c.Nlink}
 		// Best-effort: ListChildren's JOIN does not cover special_nodes, so a
 		// special node lands here as "dir". Reclassify it (and carry rdev) with a
 		// targeted lookup. On error or absence we leave the "dir" default — a
@@ -442,7 +443,7 @@ func handleStat(s *serverState, tenant *tenantState, ident Identity, w *frameWri
 	var entry dataplane.EntryWire
 	switch err {
 	case nil:
-		entry = dataplane.EntryWire{Name: base, Kind: "file", Size: mf.Size, Mode: mf.Mode, Uid: mf.Uid, Gid: mf.Gid, Atime: mf.Atime}
+		entry = dataplane.EntryWire{Name: base, Kind: "file", Size: mf.Size, Mode: mf.Mode, Uid: mf.Uid, Gid: mf.Gid, Atime: mf.Atime, InodeID: mf.InodeID, Nlink: mf.Nlink}
 	default:
 		if target, mode, uid, gid, atime, isSym, sErr := tenant.manifests.SymlinkInfo(req.Path); sErr != nil {
 			writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEIO(sErr.Error()))
@@ -646,6 +647,32 @@ func handleManifestRename(s *serverState, tenant *tenantState, ident Identity, w
 	}
 	sendResp(w, frame, dataplane.ManifestRenameResponse{NewVersionAtTo: newV})
 	s.recordDataAudit(ident, "manifest_rename", req.From, nil, true, req.SessionID)
+}
+
+func handleLink(s *serverState, tenant *tenantState, ident Identity, w *frameWriter, frame dataplane.Frame) {
+	req, ok := decodeReq[dataplane.LinkRequest](w, frame, "link")
+	if !ok {
+		return
+	}
+	if !s.policy.Permits(policyPath(req.From)) || !s.policy.Permits(policyPath(req.To)) {
+		s.recordDataAudit(ident, "link", req.From, nil, false, req.SessionID)
+		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("path denied by policy"))
+		return
+	}
+	if !s.checkAgentPath(ident, w, frame, req.From) || !s.checkAgentPath(ident, w, frame, req.To) {
+		return
+	}
+	sessionID, allocationID, activeLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
+	if !ok {
+		return
+	}
+	nlink, err := tenant.manifests.LinkWithLeaseCheck(req.From, req.To, sessionID, allocationID, ident.AgentID, activeLeaseHex)
+	if err != nil {
+		writeFrameError(w, frame.Op, frame.RID, manifestErrToWire(err))
+		return
+	}
+	sendResp(w, frame, dataplane.LinkResponse{Nlink: nlink})
+	s.recordDataAudit(ident, "link", req.From, nil, true, req.SessionID)
 }
 
 func handleDirCreate(s *serverState, tenant *tenantState, ident Identity, w *frameWriter, frame dataplane.Frame) {

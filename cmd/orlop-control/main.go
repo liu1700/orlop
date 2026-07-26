@@ -35,6 +35,7 @@ const shutdownTimeout = 10 * time.Second
 
 type config struct {
 	Addr        string
+	MetricsAddr string
 	DatabaseURL string
 	SecretsDir  string
 	// SecretsBackend selects where the CA (root key + tenant intermediates) lives:
@@ -98,6 +99,10 @@ type config struct {
 
 func loadConfig() (config, error) {
 	port := getenv("PORT", "8080")
+	metricsAddr := ":9090"
+	if value, ok := os.LookupEnv("ORLOP_METRICS_ADDR"); ok {
+		metricsAddr = strings.TrimSpace(value)
+	}
 	allowDynamicTenants, err := parseBoolEnv("ORLOP_CA_ALLOW_DYNAMIC_TENANTS", true)
 	if err != nil {
 		return config{}, err
@@ -116,6 +121,7 @@ func loadConfig() (config, error) {
 	}
 	return config{
 		Addr:                  ":" + port,
+		MetricsAddr:           metricsAddr,
 		DatabaseURL:           os.Getenv("DATABASE_URL"),
 		SecretsDir:            os.Getenv("ORLOP_SECRETS_DIR"),
 		SecretsBackend:        os.Getenv("ORLOP_SECRETS_BACKEND"),
@@ -376,10 +382,11 @@ type runtimeDeps struct {
 	certRevReconcile *certRevocationReconciler
 	hostIdentity     identity.Verifier
 	cookieDomain     string
+	metrics          *controlMetrics
 }
 
 func run(ctx context.Context, logger *slog.Logger, cfg config) error {
-	deps := runtimeDeps{}
+	deps := runtimeDeps{metrics: newControlMetrics()}
 	// Mode B host-identity verifier. Independent of the DB: it verifies a
 	// host-issued JWT and maps an allowlisted claim onto the tenant subject. A
 	// misconfiguration fails startup (fail closed) rather than silently leaving
@@ -451,6 +458,11 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 				return fmt.Errorf("load ca: %w", err)
 			}
 			deps.agentCA = agentCA
+			rootCert, err := ca.DecodeCertPEM(agentCA.RootPEM())
+			if err != nil {
+				return fmt.Errorf("decode root CA certificate: %w", err)
+			}
+			deps.metrics.setCAExpiry("root", rootCert.NotAfter)
 
 			certPEM, keyPEM, serial, err := agentCA.MintControlPlaneCert(30 * 24 * time.Hour)
 			if err != nil {
@@ -485,15 +497,25 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		}
 	}
 
-	router := newRouter(logger, deps, cfg)
-	server := &http.Server{
+	apiServer := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           router,
+		Handler:           newRouter(logger, deps, cfg),
 		ReadHeaderTimeout: 5 * time.Second,
+	}
+	servers := []*http.Server{apiServer}
+	if cfg.MetricsAddr != "" {
+		servers = append(servers, &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           deps.metrics.handler(),
+			ReadHeaderTimeout: 5 * time.Second,
+		})
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if ctx.Err() != nil {
+		return nil
+	}
 
 	// Fan the cert deny-list out to data-plane servers and keep them converged
 	// (issue #5). Stops when ctx is cancelled on shutdown.
@@ -501,39 +523,49 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		go deps.certRevReconcile.Run(ctx)
 	}
 
-	errs := make(chan error, 1)
-	go func() {
-		logger.Info("starting orlop-control",
-			"addr", cfg.Addr,
-			"database_url_configured", cfg.DatabaseURL != "",
-			"device_flow_enabled", deps.devAuth != nil,
-			"dashboard_enabled", deps.devAuth != nil && deps.store != nil && deps.allocations != nil,
-			"agent_enroll_enabled", deps.devAuth != nil && deps.store != nil && deps.agentCA != nil,
-		)
-		errs <- server.ListenAndServe()
-	}()
+	logger.Info("starting orlop-control",
+		"addr", cfg.Addr,
+		"metrics_addr", cfg.MetricsAddr,
+		"database_url_configured", cfg.DatabaseURL != "",
+		"device_flow_enabled", deps.devAuth != nil,
+		"dashboard_enabled", deps.devAuth != nil && deps.store != nil && deps.allocations != nil,
+		"agent_enroll_enabled", deps.devAuth != nil && deps.store != nil && deps.agentCA != nil,
+	)
+	errs := make(chan error, len(servers))
+	for _, server := range servers {
+		server := server
+		go func() {
+			errs <- server.ListenAndServe()
+		}()
+	}
 
+	var serveErr error
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			return err
-		}
-		logger.Info("orlop-control stopped")
-		return nil
 	case err := <-errs:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+		if !errors.Is(err, http.ErrServerClosed) {
+			serveErr = err
 		}
-		return err
 	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	var shutdownErr error
+	for _, server := range servers {
+		shutdownErr = errors.Join(shutdownErr, server.Shutdown(shutdownCtx))
+	}
+	logger.Info("orlop-control stopped")
+	return errors.Join(serveErr, shutdownErr)
 }
 
 func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
+	if deps.metrics == nil {
+		deps.metrics = newControlMetrics()
+	}
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(middleware.RealIP)
+	router.Use(deps.metrics.middleware)
 	router.Use(middleware.Recoverer)
 	router.Use(apiVersionHeader)
 	router.Use(requestLogger(logger))
@@ -634,6 +666,9 @@ func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
+			// Make the same ID used in the structured request log available to
+			// SDK callers so an APIError can be correlated with the server log.
+			w.Header().Set("X-Request-ID", middleware.GetReqID(r.Context()))
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 			next.ServeHTTP(ww, r)
 			logger.Info("request",

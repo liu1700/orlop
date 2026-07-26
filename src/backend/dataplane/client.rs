@@ -32,11 +32,11 @@ use super::messages::{
     ChunkPutResponse, ChunkRef, DirCreateRequest, DirCreateResponse, DirRemoveRequest,
     DirRemoveResponse, EntryWire, ErrorPayload, LeaseGrantRequest, LeaseGrantResponse, LeaseMode,
     LeaseRefreshRequest, LeaseRefreshResponse, LeaseReleaseRequest, LeaseReleaseResponse,
-    ListRequest, ListResponse, ManifestDeleteRequest, ManifestDeleteResponse, ManifestGetRequest,
-    ManifestGetResponse, ManifestPutRequest, ManifestPutResponse, ManifestRenameRequest,
-    ManifestRenameResponse, MknodRequest, MknodResponse, PingRequest, ReadlinkRequest,
-    ReadlinkResponse, SetattrRequest, SetattrResponse, StatRequest, StatResponse, SymlinkRequest,
-    SymlinkResponse,
+    LinkRequest, LinkResponse, ListRequest, ListResponse, ManifestDeleteRequest,
+    ManifestDeleteResponse, ManifestGetRequest, ManifestGetResponse, ManifestPutRequest,
+    ManifestPutResponse, ManifestRenameRequest, ManifestRenameResponse, MknodRequest,
+    MknodResponse, PingRequest, ReadlinkRequest, ReadlinkResponse, SetattrRequest, SetattrResponse,
+    StatRequest, StatResponse, SymlinkRequest, SymlinkResponse,
 };
 use super::protocol::{errno, flags, Op, MAX_PAYLOAD_LEN};
 use crate::backend::tls::TlsIdentity;
@@ -395,6 +395,25 @@ impl DataClient {
         Ok(resp.new_version_at_to)
     }
 
+    pub fn hard_link(
+        &self,
+        from: &str,
+        to: &str,
+        session_id: Option<String>,
+        allocation_id: Option<String>,
+    ) -> Result<u32> {
+        let resp: LinkResponse = self.rpc(
+            Op::Link,
+            &LinkRequest {
+                from: from.into(),
+                to: to.into(),
+                session_id,
+                allocation_id,
+            },
+        )?;
+        Ok(resp.nlink)
+    }
+
     pub fn dir_create(&self, path: &str, mode: u32, session_id: Option<String>) -> Result<()> {
         let _: DirCreateResponse = self.rpc(
             Op::DirCreate,
@@ -532,7 +551,8 @@ impl DataClient {
     }
 
     pub fn readlink(&self, path: &str) -> Result<String> {
-        let resp: ReadlinkResponse = self.rpc(Op::Readlink, &ReadlinkRequest { path: path.into() })?;
+        let resp: ReadlinkResponse =
+            self.rpc(Op::Readlink, &ReadlinkRequest { path: path.into() })?;
         Ok(resp.target)
     }
 

@@ -23,6 +23,12 @@ pub struct EntryWire {
     /// "file" or "dir".
     pub kind: String,
     pub size: u64,
+    /// Stable regular-file inode identity. 0 means an older server omitted it.
+    #[serde(default)]
+    pub inode_id: u64,
+    /// Number of directory entries that name this inode. 0 means unknown.
+    #[serde(default)]
+    pub nlink: u32,
     /// POSIX permission + type bits. 0 → `attr()` falls back to a kind default.
     #[serde(default)]
     pub mode: u32,
@@ -306,6 +312,21 @@ pub struct ManifestRenameRequest {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestRenameResponse {
     pub new_version_at_to: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkRequest {
+    pub from: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkResponse {
+    pub nlink: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -629,6 +650,23 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("no_replace"));
         let got: ManifestRenameRequest = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(create_only, got);
+    }
+
+    #[test]
+    fn link_round_trip() {
+        let req = LinkRequest {
+            from: "/a".into(),
+            to: "/b".into(),
+            session_id: Some("mount:abc".into()),
+            allocation_id: Some("alloc-1".into()),
+        };
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
+        let got: LinkRequest = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(got, req);
+        let response = LinkResponse { nlink: 2 };
+        let bytes = rmp_serde::to_vec_named(&response).unwrap();
+        let got: LinkResponse = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(got, response);
     }
 
     #[test]

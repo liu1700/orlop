@@ -1,12 +1,12 @@
 # Runner image for scripts/pjdfstest-rig.sh: Rust + Go toolchains, FUSE,
 # and a prebuilt pjdfstest under /opt/pjdfstest. Built/run by
 # scripts/pjdfstest-docker.sh; the repo is bind-mounted at /src.
-FROM rust:1-bookworm
+FROM rust:1-trixie
 
 ARG GO_VERSION=1.25.7
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      fuse3 libfuse3-dev pkg-config util-linux openssl sqlite3 git perl python3 bc \
+      fuse3 util-linux openssl sqlite3 git perl python3 bc \
       autoconf automake libtool build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

@@ -43,6 +43,7 @@ const (
 	OpReadlink          Op = 0x17
 	OpJournalRevertPath Op = 0x18
 	OpMknod             Op = 0x19
+	OpLink              Op = 0x1A
 )
 
 // String returns the canonical name for log lines.
@@ -82,6 +83,8 @@ func (o Op) String() string {
 		return "READLINK"
 	case OpMknod:
 		return "MKNOD"
+	case OpLink:
+		return "LINK"
 	case OpLeaseGrant:
 		return "LEASE_GRANT"
 	case OpLeaseRefresh:
@@ -105,7 +108,7 @@ func (o Op) Valid() bool {
 	case OpList, OpStat, OpPing, OpClose,
 		OpManifestGet, OpManifestPut, OpChunkGet, OpChunkHas, OpChunkPut,
 		OpManifestDelete, OpManifestRename, OpDirCreate, OpDirRemove,
-		OpSetattr, OpSymlink, OpReadlink, OpMknod,
+		OpSetattr, OpSymlink, OpReadlink, OpMknod, OpLink,
 		OpLeaseGrant, OpLeaseRefresh, OpLeaseRelease, OpLeaseRevoke,
 		OpJournalQuery, OpJournalRevertPath:
 		return true

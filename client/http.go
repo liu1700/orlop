@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // APIVersion is the control-plane API major version this SDK is written against.
@@ -57,7 +60,7 @@ func (c *HTTPClient) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
-func (c *HTTPClient) do(ctx context.Context, method, path string, body, out any) error {
+func (c *HTTPClient) do(ctx context.Context, op, method, path string, body, out any) error {
 	buf := &bytes.Buffer{}
 	if body != nil {
 		if err := json.NewEncoder(buf).Encode(body); err != nil {
@@ -84,12 +87,63 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body, out any)
 		return &APIVersionError{Client: APIVersion, Server: sv}
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("orlop %s %s: status %d", method, path, resp.StatusCode)
+		return decodeAPIError(op, method, path, resp)
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
+}
+
+const maxErrorBodyBytes = 64 << 10
+
+func decodeAPIError(op, method, path string, resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	var envelope struct {
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+		Code             string `json:"code"`
+		Message          string `json:"message"`
+		Detail           string `json:"detail"`
+	}
+	decodeErr := json.Unmarshal(body, &envelope)
+
+	code := orDefault(envelope.Error, envelope.Code)
+	message := envelope.ErrorDescription
+	if message == "" {
+		message = orDefault(envelope.Message, envelope.Detail)
+	}
+	if message == "" && (decodeErr != nil || (envelope.Error == "" && envelope.Code == "")) {
+		message = strings.TrimSpace(string(body))
+	}
+	return &APIError{
+		Op:         op,
+		Method:     method,
+		Path:       path,
+		StatusCode: resp.StatusCode,
+		Code:       code,
+		Message:    message,
+		RequestID:  resp.Header.Get("X-Request-ID"),
+		Header:     resp.Header.Clone(),
+		Body:       string(body),
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+	}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseUint(value, 10, 32); err == nil {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		if delay := at.Sub(now); delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 type entityResp struct {
@@ -129,7 +183,7 @@ func entityPath(agentID string) string {
 // AllocateDisk implements Client.
 func (c *HTTPClient) AllocateDisk(ctx context.Context, agentID, ownerID string, grantBytes int64) (Disk, error) {
 	var ent entityResp
-	if err := c.do(ctx, http.MethodPost, "/v1/entities", entityBody(agentID, ownerID, grantBytes), &ent); err != nil {
+	if err := c.do(ctx, "AllocateDisk", http.MethodPost, "/v1/entities", entityBody(agentID, ownerID, grantBytes), &ent); err != nil {
 		return Disk{}, err
 	}
 	return ent.toDisk(agentID), nil
@@ -138,7 +192,7 @@ func (c *HTTPClient) AllocateDisk(ctx context.Context, agentID, ownerID string, 
 // ResolveDisk implements Client.
 func (c *HTTPClient) ResolveDisk(ctx context.Context, agentID string) (Disk, error) {
 	var ent entityResp
-	if err := c.do(ctx, http.MethodGet, entityPath(agentID), nil, &ent); err != nil {
+	if err := c.do(ctx, "ResolveDisk", http.MethodGet, entityPath(agentID), nil, &ent); err != nil {
 		return Disk{}, err
 	}
 	return ent.toDisk(agentID), nil
@@ -147,26 +201,26 @@ func (c *HTTPClient) ResolveDisk(ctx context.Context, agentID string) (Disk, err
 // SetDiskQuota implements Client.
 func (c *HTTPClient) SetDiskQuota(ctx context.Context, agentID string, grantBytes int64) error {
 	body := map[string]any{"grant_bytes": grantBytes}
-	return c.do(ctx, http.MethodPatch, entityPath(agentID), body, nil)
+	return c.do(ctx, "SetDiskQuota", http.MethodPatch, entityPath(agentID), body, nil)
 }
 
 // RevokeDisk implements Client.
 func (c *HTTPClient) RevokeDisk(ctx context.Context, agentID string) error {
-	return c.do(ctx, http.MethodDelete, entityPath(agentID), nil, nil)
+	return c.do(ctx, "RevokeDisk", http.MethodDelete, entityPath(agentID), nil, nil)
 }
 
 // SetAccountBudget implements Client.
 // POST /v1/entities/account/{ownerID}/budget {"disk_bytes": N}.
 func (c *HTTPClient) SetAccountBudget(ctx context.Context, ownerID string, diskBytes int64) error {
 	body := map[string]any{"disk_bytes": diskBytes}
-	return c.do(ctx, http.MethodPost, fmt.Sprintf("/v1/entities/account/%s/budget", ownerID), body, nil)
+	return c.do(ctx, "SetAccountBudget", http.MethodPost, fmt.Sprintf("/v1/entities/account/%s/budget", ownerID), body, nil)
 }
 
 // ReassignDisk implements Client.
 // POST /v1/entities/agent/{id}/reassign {"owner_id": "<new owner>"}.
 func (c *HTTPClient) ReassignDisk(ctx context.Context, agentID, newOwnerID string) error {
 	body := map[string]any{"owner_id": newOwnerID}
-	return c.do(ctx, http.MethodPost, entityPath(agentID)+"/reassign", body, nil)
+	return c.do(ctx, "ReassignDisk", http.MethodPost, entityPath(agentID)+"/reassign", body, nil)
 }
 
 type enrollTokenResp struct {
@@ -181,7 +235,7 @@ type tenantUsageResp struct {
 // UserDiskUsage implements Client.
 func (c *HTTPClient) UserDiskUsage(ctx context.Context, ownerID string) (int64, error) {
 	var r tenantUsageResp
-	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/v1/tenants/%s/usage", ownerID), nil, &r); err != nil {
+	if err := c.do(ctx, "UserDiskUsage", http.MethodGet, fmt.Sprintf("/v1/tenants/%s/usage", ownerID), nil, &r); err != nil {
 		return 0, err
 	}
 	return r.UsedBytes, nil
@@ -191,7 +245,7 @@ func (c *HTTPClient) UserDiskUsage(ctx context.Context, ownerID string) (int64, 
 func (c *HTTPClient) MintEnrollToken(ctx context.Context, agentID string) (string, error) {
 	var r enrollTokenResp
 	path := fmt.Sprintf("/v1/agents/%s/enroll-token", agentID)
-	if err := c.do(ctx, http.MethodPost, path, nil, &r); err != nil {
+	if err := c.do(ctx, "MintEnrollToken", http.MethodPost, path, nil, &r); err != nil {
 		return "", err
 	}
 	if r.Token == "" {

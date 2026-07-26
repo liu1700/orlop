@@ -18,6 +18,7 @@
 #   PJDFS_FS       fs type reported to pjdfstest's conf (default ext4 — assert
 #                  baseline Linux-fs expectations against orlop)
 #   PJDFS_TESTS    subset to run, relative to pjdfstest/tests (default: all)
+#   PJDFS_STRICT   1 = return non-zero on any failed test or mount death
 #   ORLOP_BUILD=0  skip cargo/go builds (binaries must already exist)
 set -euo pipefail
 
@@ -32,6 +33,7 @@ RESULTS_DIR="${RESULTS_DIR:-$RIG_DIR/results}"
 PJDFSTEST_DIR="${PJDFSTEST_DIR:-/opt/pjdfstest}"
 PJDFS_FS="${PJDFS_FS:-ext4}"
 PJDFS_TESTS="${PJDFS_TESTS:-}"
+PJDFS_STRICT="${PJDFS_STRICT:-0}"
 ORLOP_BUILD="${ORLOP_BUILD:-1}"
 
 CERT_DIR="$RIG_DIR/certs"
@@ -55,7 +57,11 @@ log() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'pjdfstest-rig: %s\n' "$*" >&2; exit 1; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"; }
 
+# Invoked indirectly by the EXIT/INT/TERM trap below.
+# shellcheck disable=SC2329
 cleanup() {
+  mkdir -p "$RESULTS_DIR" 2>/dev/null || true
+  cp "$LOG_DIR"/*.log "$RESULTS_DIR/" 2>/dev/null || true
   if mountpoint -q "$MNT" 2>/dev/null; then
     fusermount3 -u "$MNT" 2>/dev/null || umount "$MNT" 2>/dev/null || true
   fi
@@ -94,6 +100,23 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
   -keyout "$CERT_DIR/ca.key" -out "$CERT_DIR/ca.crt" \
   -subj "/CN=pjdfs-rig-ca" >/dev/null 2>&1
 
+# Agent leaves must be signed by a tenant-scoped intermediate, matching the
+# production CA hierarchy and the server's fail-closed tenant binding check.
+cat >"$CERT_DIR/tenant-int.cnf" <<EOF
+[v3]
+basicConstraints = critical,CA:true,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+EOF
+openssl req -new -nodes -newkey rsa:2048 \
+  -keyout "$CERT_DIR/tenant-int.key" -out "$CERT_DIR/tenant-int.csr" \
+  -subj "/CN=pjdfs-tenant-intermediate/OU=tenant=$TENANT_ID" >/dev/null 2>&1
+openssl x509 -req -in "$CERT_DIR/tenant-int.csr" \
+  -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
+  -out "$CERT_DIR/tenant-int.crt" -days 2 \
+  -extfile "$CERT_DIR/tenant-int.cnf" -extensions v3 >/dev/null 2>&1
+
 cat >"$CERT_DIR/server.cnf" <<EOF
 [req]
 prompt = no
@@ -129,7 +152,7 @@ openssl req -new -nodes -newkey rsa:2048 \
   -keyout "$CERT_DIR/client.key" -out "$CERT_DIR/client.csr" \
   -config "$CERT_DIR/client.cnf" >/dev/null 2>&1
 openssl x509 -req -in "$CERT_DIR/client.csr" \
-  -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" -CAcreateserial \
+  -CA "$CERT_DIR/tenant-int.crt" -CAkey "$CERT_DIR/tenant-int.key" -CAcreateserial \
   -out "$CERT_DIR/client.crt" -days 2 -extfile "$CERT_DIR/client.cnf" -extensions v3 >/dev/null 2>&1
 
 # ── Tenant store + routes ────────────────────────────────────────────────────
@@ -215,7 +238,8 @@ start_server
 # no control plane, no /agent/enroll round-trip; the data-plane LeaseGrant
 # still enforces the single-writer invariant.
 log "Materialising pre-enrolled cert_dir + client config"
-install -m 0600 "$CERT_DIR/client.crt" "$CLIENT_CERT_DIR/cert.pem"
+cat "$CERT_DIR/client.crt" "$CERT_DIR/tenant-int.crt" >"$CLIENT_CERT_DIR/cert.pem"
+chmod 0600 "$CLIENT_CERT_DIR/cert.pem"
 install -m 0600 "$CERT_DIR/client.key" "$CLIENT_CERT_DIR/key.pem"
 install -m 0600 "$CERT_DIR/ca.crt" "$CLIENT_CERT_DIR/ca.pem"
 CERT_SERIAL="$(openssl x509 -in "$CLIENT_CERT_DIR/cert.pem" -noout -serial | cut -d= -f2 | tr 'A-F' 'a-f')"
@@ -254,10 +278,10 @@ start_mount() {
   MOUNT_PID=$!
   for _ in $(seq 1 150); do
     mountpoint -q "$MNT" && return 0
-    kill -0 "$MOUNT_PID" 2>/dev/null || { tail -20 "$LOG_DIR/mount.log" >&2; fail "orlop mount exited early"; }
+    kill -0 "$MOUNT_PID" 2>/dev/null || { tail -80 "$LOG_DIR/mount.log" >&2; fail "orlop mount exited early"; }
     sleep 0.2
   done
-  tail -20 "$LOG_DIR/mount.log" >&2; fail "mount did not become ready"
+  tail -80 "$LOG_DIR/mount.log" >&2; fail "mount did not become ready"
 }
 
 # Tear down and bring back the whole stack. Used when a test kills the FUSE
@@ -277,11 +301,24 @@ export RUST_BACKTRACE=1
 log "Mounting orlop FUSE at $MNT"
 start_mount
 
-log "Mount smoke (create/write/read/rename/unlink)"
+log "Mount smoke (create/write/read/hard-link/rename/unlink)"
 echo smoke >"$MNT/_rig-smoke"
 grep -q smoke "$MNT/_rig-smoke"
+ln "$MNT/_rig-smoke" "$MNT/_rig-link"
+[[ "$(stat -c %i "$MNT/_rig-smoke")" == "$(stat -c %i "$MNT/_rig-link")" ]]
+[[ "$(stat -c %h "$MNT/_rig-smoke")" == "2" ]]
+printf linked >"$MNT/_rig-link"
+grep -q linked "$MNT/_rig-smoke"
+rm "$MNT/_rig-smoke"
+grep -q linked "$MNT/_rig-link"
+[[ "$(stat -c %h "$MNT/_rig-link")" == "1" ]]
+mv "$MNT/_rig-link" "$MNT/_rig-smoke"
 mv "$MNT/_rig-smoke" "$MNT/_rig-smoke2"
 rm "$MNT/_rig-smoke2"
+: >"$MNT/_rig-empty"
+ln "$MNT/_rig-empty" "$MNT/_rig-empty-link"
+[[ "$(stat -c %i "$MNT/_rig-empty")" == "$(stat -c %i "$MNT/_rig-empty-link")" ]]
+rm "$MNT/_rig-empty" "$MNT/_rig-empty-link"
 
 # ── pjdfstest ────────────────────────────────────────────────────────────────
 if [[ ! -x "$PJDFSTEST_DIR/pjdfstest" ]]; then
@@ -298,6 +335,8 @@ git -C "$PJDFSTEST_DIR" rev-parse HEAD >"$RESULTS_DIR/pjdfstest-commit.txt" 2>/d
 # no statfs). Patch in an env override so we can assert the EXT4/baseline
 # expectation set against the orlop mount.
 if ! grep -q PJDFS_FS_OVERRIDE "$PJDFSTEST_DIR/tests/conf"; then
+  # The replacement is intentionally literal shell for tests/conf to evaluate.
+  # shellcheck disable=SC2016
   sed -i 's|^if \[ -z "${fs}" \]; then|fs="${PJDFS_FS_OVERRIDE:-${fs}}"\nif [ -z "${fs}" ]; then|' \
     "$PJDFSTEST_DIR/tests/conf"
   grep -q PJDFS_FS_OVERRIDE "$PJDFSTEST_DIR/tests/conf" || fail "failed to patch pjdfstest tests/conf"
@@ -376,4 +415,8 @@ PY
 
 cp "$LOG_DIR/mount.log" "$LOG_DIR/server.log" "$RESULTS_DIR/" 2>/dev/null || true
 log "Done. Results in $RESULTS_DIR (raw.tap, summary.tsv, failures.txt)"
+if [[ "$PJDFS_STRICT" == "1" ]]; then
+  [[ ! -s "$RESULTS_DIR/mount-deaths.txt" ]] || exit 1
+  exit "$PROVE_RC"
+fi
 exit 0

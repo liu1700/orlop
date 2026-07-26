@@ -44,9 +44,13 @@ spec:
           ports:
             - name: http
               containerPort: {{ .Values.control.port }}
+            - name: metrics
+              containerPort: {{ .Values.control.metricsPort }}
           env:
             - name: PORT
               value: {{ .Values.control.port | quote }}
+            - name: ORLOP_METRICS_ADDR
+              value: {{ printf ":%v" .Values.control.metricsPort | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -118,3 +122,6 @@ spec:
     - name: http
       port: {{ .Values.control.port }}
       targetPort: http
+    - name: metrics
+      port: {{ .Values.control.metricsPort }}
+      targetPort: metrics

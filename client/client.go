@@ -10,6 +10,10 @@
 //
 // The service bearer token passed to New authorizes control-plane operations.
 // It is an operator credential and is never exposed to agents.
+//
+// Non-2xx responses are returned as *APIError. Callers can inspect fields with
+// errors.As, branch on common cases with errors.Is and the exported sentinel
+// errors, and use APIError.Retryable for HTTP-level retry classification.
 package client
 
 import "context"
