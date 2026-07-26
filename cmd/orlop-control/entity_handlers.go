@@ -7,6 +7,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -26,11 +28,27 @@ import (
 // front; the cap changes only via PATCH (handleSetQuota), never by usage.
 const agentDiskInitialGrantBytes = 1 * 1024 * 1024 * 1024 // 1 GiB
 
+const defaultMountPrefix = "/mnt/orlop"
+
+// normalizeMountPrefix validates the POSIX path prefix reported to entity API
+// callers. The control plane may run on a different host from the agent, so
+// path (not filepath) is intentional here.
+func normalizeMountPrefix(prefix string) (string, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return defaultMountPrefix, nil
+	}
+	if !path.IsAbs(prefix) {
+		return "", errors.New("ORLOP_MOUNT_PREFIX must be an absolute POSIX path")
+	}
+	return path.Clean(prefix), nil
+}
+
 // agentVirtualPath is the stable mount path for an agent's disk. It must match
 // the control-plane's mount-path scheme so every pod for the same
 // agent lands on the same files.
-func agentVirtualPath(agentID string) string {
-	return "/mnt/orlop/agents/" + agentID
+func agentVirtualPath(mountPrefix, agentID string) string {
+	return path.Join(mountPrefix, "agents", agentID)
 }
 
 // entityQuerier is the slice of the storage layer the entity handlers need:
@@ -86,6 +104,9 @@ type entityHandlers struct {
 	// caller passes no quota_bytes (ORLOP_INITIAL_GRANT_BYTES; defaults to
 	// agentDiskInitialGrantBytes).
 	initialGrantBytes int64
+	// mountPrefix is the operator-configured, agent-visible path prefix used in
+	// every entity response (ORLOP_MOUNT_PREFIX; default /mnt/orlop).
+	mountPrefix string
 }
 
 // allocationResizer applies an end-to-end quota resize (DB size_bytes +
@@ -102,11 +123,14 @@ type allocationPurger interface {
 	PurgeAllocation(ctx context.Context, api allocations.AgentDataPurger, allocationID pgtype.UUID) error
 }
 
-func newEntityHandlers(logger *slog.Logger, q entityQuerier, mintEnroll enrollTokenMinter, resize allocationResizer, serverAPI allocations.TenantResizer, purge allocationPurger, purgeAPI allocations.AgentDataPurger, initialGrantBytes int64) *entityHandlers {
+func newEntityHandlers(logger *slog.Logger, q entityQuerier, mintEnroll enrollTokenMinter, resize allocationResizer, serverAPI allocations.TenantResizer, purge allocationPurger, purgeAPI allocations.AgentDataPurger, initialGrantBytes int64, mountPrefix string) *entityHandlers {
 	if initialGrantBytes <= 0 {
 		initialGrantBytes = agentDiskInitialGrantBytes
 	}
-	return &entityHandlers{logger: logger, queries: q, mintEnroll: mintEnroll, resize: resize, serverAPI: serverAPI, purge: purge, purgeAPI: purgeAPI, initialGrantBytes: initialGrantBytes}
+	if mountPrefix == "" {
+		mountPrefix = defaultMountPrefix
+	}
+	return &entityHandlers{logger: logger, queries: q, mintEnroll: mintEnroll, resize: resize, serverAPI: serverAPI, purge: purge, purgeAPI: purgeAPI, initialGrantBytes: initialGrantBytes, mountPrefix: mountPrefix}
 }
 
 // mountEntities registers the provisioning routes on both the bare `/v1/...`
@@ -263,7 +287,7 @@ func (h *entityHandlers) handleProvision(w http.ResponseWriter, r *http.Request)
 
 	writeJSON(w, http.StatusOK, entityResponse{
 		Handle:      row.ID.String(),
-		VirtualPath: agentVirtualPath(req.EntityID),
+		VirtualPath: agentVirtualPath(h.mountPrefix, req.EntityID),
 	})
 }
 
@@ -292,7 +316,7 @@ func (h *entityHandlers) handleResolve(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, entityResponse{
 		Handle:      row.ID.String(),
-		VirtualPath: agentVirtualPath(agentID),
+		VirtualPath: agentVirtualPath(h.mountPrefix, agentID),
 	})
 }
 
@@ -352,7 +376,7 @@ func (h *entityHandlers) handleSetQuota(w http.ResponseWriter, r *http.Request) 
 	}
 	writeJSON(w, http.StatusOK, entityResponse{
 		Handle:      uuidString(resized.ID),
-		VirtualPath: agentVirtualPath(agentID),
+		VirtualPath: agentVirtualPath(h.mountPrefix, agentID),
 	})
 }
 

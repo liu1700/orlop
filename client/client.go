@@ -16,17 +16,24 @@
 // errors, and use APIError.Retryable for HTTP-level retry classification.
 package client
 
-import "context"
+import (
+	"context"
+	"path"
+)
 
 // EntityType is the orlop entity namespace for agent disks. Each agent maps
 // 1:1 to one unique disk.
 const EntityType = "agent"
 
+// DefaultMountPrefix is the control plane's default agent-visible mount prefix.
+// A deployment may override it with ORLOP_MOUNT_PREFIX.
+const DefaultMountPrefix = "/mnt/orlop"
+
 // Disk is the handle to an agent's unique orlop disk.
 type Disk struct {
 	AgentID     string `json:"agent_id"`
 	Handle      string `json:"handle"`       // opaque allocation handle
-	VirtualPath string `json:"virtual_path"` // stable mount path, e.g. /mnt/orlop/agents/<id>
+	VirtualPath string `json:"virtual_path"` // authoritative server-configured mount path
 	QuotaBytes  int64  `json:"quota_bytes"`  // hard size cap; 0 => the server default
 }
 
@@ -64,8 +71,18 @@ type Client interface {
 	UserDiskUsage(ctx context.Context, ownerID string) (int64, error)
 }
 
-// MountPath returns the deterministic mount path for an agent's disk, so every
-// run for the same agent lands on exactly the same files.
+// MountPath returns the default mount path for an agent's disk. Prefer the
+// server-returned Disk.VirtualPath, which reflects ORLOP_MOUNT_PREFIX.
 func MountPath(agentID string) string {
-	return "/mnt/orlop/agents/" + agentID
+	return MountPathWithPrefix(DefaultMountPrefix, agentID)
+}
+
+// MountPathWithPrefix returns an agent mount path under an embedding product's
+// configured prefix. It is useful when constructing ORLOP_MOUNT_POINT before
+// an entity response is available.
+func MountPathWithPrefix(prefix, agentID string) string {
+	if prefix == "" {
+		prefix = DefaultMountPrefix
+	}
+	return path.Join(prefix, "agents", agentID)
 }

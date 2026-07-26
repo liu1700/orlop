@@ -51,6 +51,8 @@ spec:
               value: {{ .Values.control.port | quote }}
             - name: ORLOP_METRICS_ADDR
               value: {{ printf ":%v" .Values.control.metricsPort | quote }}
+            - name: ORLOP_MOUNT_PREFIX
+              value: {{ .Values.control.mountPrefix | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

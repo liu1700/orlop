@@ -42,6 +42,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Keep every artifact name and embedded binary version derived from the
+      # same value. Tag builds use X.Y.Z; workflow_dispatch smoke builds use a
+      # short commit so they remain identifiable without pretending to be a
+      # release.
+      - name: Resolve build version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(git rev-parse --short HEAD)"
+          fi
+          echo "ORLOP_BUILD_VERSION=${version}" >> "$GITHUB_ENV"
+
       - name: Install musl toolchain (Linux only)
         if: matrix.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -62,12 +75,8 @@ jobs:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          if [ "$GITHUB_REF_NAME" = "$version" ]; then
-            version="$(git rev-parse --short HEAD)"   # workflow_dispatch: no tag
-          fi
           mkdir -p dist
-          ldflags="-s -w -X github.com/liu1700/orlop/internal/buildinfo.version=${version}"
+          ldflags="-s -w -X github.com/liu1700/orlop/internal/buildinfo.version=${ORLOP_BUILD_VERSION}"
           go build -trimpath -ldflags "$ldflags" -o dist/orlop-control ./cmd/orlop-control
           go build -trimpath -ldflags "$ldflags" -o dist/orlop-server  ./cmd/orlop-server
 
@@ -83,20 +92,21 @@ jobs:
       - name: Smoke Linux binary on Debian 12 and 13
         if: matrix.os == 'linux'
         run: |
+          expected="orlop ${ORLOP_BUILD_VERSION}"
           for suite in bookworm trixie; do
-            docker run --rm \
+            actual="$(docker run --rm \
               -v "$PWD/dist/orlop:/orlop:ro" \
-              "debian:${suite}-slim" /orlop --version
+              "debian:${suite}-slim" /orlop --version)"
+            if [ "$actual" != "$expected" ]; then
+              echo "${suite}: --version reported '$actual', want '$expected'" >&2
+              exit 1
+            fi
           done
 
       - name: Package tarball + checksum
         id: package
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          if [ "$GITHUB_REF_NAME" = "$version" ]; then
-            version="$(git rev-parse --short HEAD)"   # workflow_dispatch: no tag
-          fi
-          name="orlop_${version}_${{ matrix.os }}_${{ matrix.arch }}"
+          name="orlop_${ORLOP_BUILD_VERSION}_${{ matrix.os }}_${{ matrix.arch }}"
           tar -C dist -czf "${name}.tar.gz" orlop orlop-control orlop-server
           shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
           echo "tarball=${name}.tar.gz" >> "$GITHUB_OUTPUT"

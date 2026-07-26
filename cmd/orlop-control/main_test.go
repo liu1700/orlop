@@ -62,6 +62,23 @@ func TestLoadConfigInitialGrant(t *testing.T) {
 	}
 }
 
+func TestLoadConfigMountPrefix(t *testing.T) {
+	t.Setenv("ORLOP_MOUNT_PREFIX", "")
+	if cfg := mustLoadConfig(t); cfg.MountPrefix != defaultMountPrefix {
+		t.Errorf("default mount prefix = %q; want %q", cfg.MountPrefix, defaultMountPrefix)
+	}
+
+	t.Setenv("ORLOP_MOUNT_PREFIX", "/mnt/plori/")
+	if cfg := mustLoadConfig(t); cfg.MountPrefix != "/mnt/plori" {
+		t.Errorf("mount prefix = %q; want /mnt/plori", cfg.MountPrefix)
+	}
+
+	t.Setenv("ORLOP_MOUNT_PREFIX", "relative/path")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("relative ORLOP_MOUNT_PREFIX should fail configuration")
+	}
+}
+
 // TestParseBoolEnvRejectsTypos covers the security-review fix: a set-but-
 // unrecognized boolean is an error (fail boot), not a silent fallback that
 // would leave a security toggle in its permissive default.

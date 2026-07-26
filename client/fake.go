@@ -9,17 +9,29 @@ import (
 // entity = agent (1:1) contract: one unique disk per agent with a stable handle
 // and a deterministic mount path.
 type Fake struct {
-	mu      sync.Mutex
-	disks   map[string]Disk
-	usage   map[string]int64 // ownerID -> aggregate used_bytes
-	budgets map[string]int64 // ownerID -> account disk budget
+	mu          sync.Mutex
+	mountPrefix string
+	disks       map[string]Disk
+	usage       map[string]int64 // ownerID -> aggregate used_bytes
+	budgets     map[string]int64 // ownerID -> account disk budget
 }
 
 var _ Client = (*Fake)(nil)
 
 // NewFake returns an empty in-memory client.
 func NewFake() *Fake {
-	return &Fake{disks: make(map[string]Disk), usage: make(map[string]int64), budgets: make(map[string]int64)}
+	return NewFakeWithMountPrefix(DefaultMountPrefix)
+}
+
+// NewFakeWithMountPrefix returns an empty in-memory client whose VirtualPath
+// values mirror a control plane configured with ORLOP_MOUNT_PREFIX.
+func NewFakeWithMountPrefix(mountPrefix string) *Fake {
+	return &Fake{
+		mountPrefix: mountPrefix,
+		disks:       make(map[string]Disk),
+		usage:       make(map[string]int64),
+		budgets:     make(map[string]int64),
+	}
 }
 
 // AllocateDisk implements Client.
@@ -32,7 +44,7 @@ func (f *Fake) AllocateDisk(_ context.Context, agentID, _ string, grantBytes int
 	d := Disk{
 		AgentID:     agentID,
 		Handle:      EntityType + ":" + agentID,
-		VirtualPath: MountPath(agentID),
+		VirtualPath: MountPathWithPrefix(f.mountPrefix, agentID),
 		QuotaBytes:  grantBytes,
 	}
 	f.disks[agentID] = d

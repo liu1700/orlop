@@ -360,7 +360,7 @@ components:
           description: Opaque allocation handle.
         virtual_path:
           type: string
-          description: Stable mount path, e.g. /mnt/orlop/agents/<id>.
+          description: Authoritative agent-visible mount path, derived from ORLOP_MOUNT_PREFIX (default /mnt/orlop), e.g. /mnt/orlop/agents/<id>.
     AccountBudget:
       type: object
       properties:

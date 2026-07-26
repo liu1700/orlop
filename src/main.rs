@@ -20,7 +20,7 @@ use orlop::util;
 #[derive(Parser)]
 #[command(name = "orlop")]
 #[command(about = "Orlop — cross-agent portable disk")]
-#[command(version)]
+#[command(version = env!("ORLOP_BUILD_VERSION"))]
 struct Cli {
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,

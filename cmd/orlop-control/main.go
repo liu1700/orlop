@@ -64,6 +64,9 @@ type config struct {
 	// InitialGrantBytes is the elastic disk size a registered agent is granted at
 	// provision when the caller passes no quota_bytes. ORLOP_INITIAL_GRANT_BYTES.
 	InitialGrantBytes int64
+	// MountPrefix is the agent-visible prefix used to compute entity
+	// virtual_path values. ORLOP_MOUNT_PREFIX; default /mnt/orlop.
+	MountPrefix string
 	// ServerCertFQDN is the only name POST /control/sign-server-cert will issue a
 	// self-provisioned orlop-server cert for (CN + DNS SAN). Defaults to the
 	// in-cluster Service name `orlop-server`. ORLOP_SERVER_FQDN.
@@ -111,6 +114,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	mountPrefix, err := normalizeMountPrefix(os.Getenv("ORLOP_MOUNT_PREFIX"))
+	if err != nil {
+		return config{}, err
+	}
 	serverCertTTL, err := parseDurationEnv(envKeyWithLegacy("ORLOP_SERVER_CERT_TTL", "ORLOP_DATAGW_SERVER_CERT_TTL"), defaultServerCertTTL)
 	if err != nil {
 		return config{}, err
@@ -132,6 +139,7 @@ func loadConfig() (config, error) {
 		CookieDomain:          os.Getenv("ORLOP_COOKIE_DOMAIN"),
 		ControlPlaneToken:     os.Getenv("ORLOP_CONTROL_PLANE_TOKEN"),
 		InitialGrantBytes:     initialGrantBytes,
+		MountPrefix:           mountPrefix,
 		ServerCertFQDN:        getenv(envKeyWithLegacy("ORLOP_SERVER_FQDN", "ORLOP_DATAGW_SERVER_FQDN"), defaultServerCertFQDN),
 		ServerCertTTL:         serverCertTTL,
 		APITokenTTL:           apiTokenTTL,
@@ -588,7 +596,7 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	// DB-backed queries; the enroll-token minter additionally needs devAuth.
 	if deps.devAuth != nil && deps.store != nil {
 		mountEntities(router, RequireServiceToken(cfg.ControlPlaneToken),
-			newEntityHandlers(logger, deps.store, deps.devAuth.IssueAgentEnrollToken, deps.allocations, deps.serverResize, deps.allocations, deps.agentPurger, cfg.InitialGrantBytes))
+			newEntityHandlers(logger, deps.store, deps.devAuth.IssueAgentEnrollToken, deps.allocations, deps.serverResize, deps.allocations, deps.agentPurger, cfg.InitialGrantBytes, cfg.MountPrefix))
 	}
 	// POST /v1/admin/purge-sweep: on-demand erase of revoked-but-unpurged
 	// allocations' backend data. Same service-token gate as /v1/entities.

@@ -37,6 +37,7 @@ The control-plane HTTP API and the operator CLI are the **same binary**, so
 | Entrypoint | `orlop-control` — no args starts the server; `migrate`, `server`, `token`, `user`, `ca` are subcommands |
 | Default CMD | none (no args → serve) |
 | Required env | `DATABASE_URL` (`postgres://…` or `sqlite:/data/orlop.db`); `ORLOP_CONTROL_PLANE_TOKEN` (shared service token the data plane presents back); `ORLOP_SERVER_FQDN`; and either `ORLOP_SECRETS_BACKEND=postgres` or `ORLOP_SECRETS_DIR` (filesystem CA backend) |
+| Optional env | `ORLOP_MOUNT_PREFIX` controls the agent-visible `virtual_path` returned by entity APIs; default `/mnt/orlop` |
 | Volumes | none declared. Stateless with Postgres **and** `ORLOP_SECRETS_BACKEND=postgres`; with SQLite or the filesystem CA backend, give it a writable volume (owned by uid `65532`) for the DB file and `ORLOP_SECRETS_DIR` |
 
 Run `orlop-control migrate up` before serving (e.g. a Kubernetes initContainer);

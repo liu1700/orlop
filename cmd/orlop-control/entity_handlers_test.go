@@ -177,7 +177,7 @@ func entityRouterWithPurger(q entityQuerier, token string, mint enrollTokenMinte
 		purgeAPI = fakePurgeAPI{}
 	}
 	mountEntities(r, RequireServiceToken(token),
-		newEntityHandlers(slog.New(slog.NewTextHandler(io.Discard, nil)), q, mint, resize, nil, purge, purgeAPI, agentDiskInitialGrantBytes))
+		newEntityHandlers(slog.New(slog.NewTextHandler(io.Discard, nil)), q, mint, resize, nil, purge, purgeAPI, agentDiskInitialGrantBytes, defaultMountPrefix))
 	return r
 }
 
@@ -300,6 +300,47 @@ func TestProvisionEntity_HappyPath(t *testing.T) {
 	// The allocation is stamped with the per-agent tenant so a re-parent never moves data.
 	if q.upserted.TenantID != "a_"+testAgentID {
 		t.Errorf("upsert tenant_id = %q; want a_%s", q.upserted.TenantID, testAgentID)
+	}
+}
+
+func TestProvisionEntity_CustomMountPrefix(t *testing.T) {
+	q := newFakeEntityQuerier()
+	r := chi.NewRouter()
+	mountEntities(r, RequireServiceToken("svc"),
+		newEntityHandlers(
+			slog.New(slog.NewTextHandler(io.Discard, nil)),
+			q,
+			(&recordingMinter{}).mint,
+			&fakeResizer{},
+			nil,
+			nil,
+			nil,
+			agentDiskInitialGrantBytes,
+			"/mnt/plori",
+		))
+
+	body := `{"entity_type":"agent","entity_id":"` + testAgentID + `","owner_id":"` + testOwnerID + `"}`
+	rec := doEntity(t, r, http.MethodPost, "/v1/entities", "Bearer svc", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got entityResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if want := "/mnt/plori/agents/" + testAgentID; got.VirtualPath != want {
+		t.Errorf("virtual_path = %q; want %q", got.VirtualPath, want)
+	}
+
+	rec = doEntity(t, r, http.MethodGet, "/v1/entities/agent/"+testAgentID, "Bearer svc", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve status = %d; want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if want := "/mnt/plori/agents/" + testAgentID; got.VirtualPath != want {
+		t.Errorf("resolved virtual_path = %q; want %q", got.VirtualPath, want)
 	}
 }
 
