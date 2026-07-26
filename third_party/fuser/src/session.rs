@@ -56,13 +56,22 @@ pub struct SessionGate {
     changed: Condvar,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RegisteredThread(libc::pthread_t);
+
+// SAFETY: pthread_t is an opaque thread identifier specifically designed to
+// be passed to pthread_kill from another thread. Some libc implementations
+// represent it as a raw pointer, which is not Send by default even though the
+// POSIX operation is thread-safe.
+unsafe impl Send for RegisteredThread {}
+
 #[derive(Debug, Default)]
 struct GateState {
     pause_requested: bool,
     parked: bool,
     reading: bool,
     dispatching: bool,
-    thread: Option<libc::pthread_t>,
+    thread: Option<RegisteredThread>,
     protocol: Option<(u32, u32)>,
 }
 
@@ -110,7 +119,7 @@ impl SessionGate {
         if state.reading {
             // SAFETY: `thread` is registered by the live run_with_gate thread,
             // and SIGUSR2 has a process-wide no-op handler installed in new().
-            let result = unsafe { libc::pthread_kill(thread, libc::SIGUSR2) };
+            let result = unsafe { libc::pthread_kill(thread.0, libc::SIGUSR2) };
             if result != 0 {
                 state.pause_requested = false;
                 return Err(io::Error::from_raw_os_error(result));
@@ -159,7 +168,7 @@ impl SessionGate {
     fn register_current_thread(&self) {
         let mut state = self.state.lock().unwrap();
         // SAFETY: pthread_self has no preconditions.
-        state.thread = Some(unsafe { libc::pthread_self() });
+        state.thread = Some(RegisteredThread(unsafe { libc::pthread_self() }));
         self.changed.notify_all();
     }
 
