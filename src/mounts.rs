@@ -39,6 +39,10 @@ pub struct OrlopMount {
 #[derive(Clone, Debug)]
 struct MountRecord {
     mount_id: u64,
+    /// Minor of the `major:minor` device field. FUSE superblocks live on an
+    /// anonymous device (major 0), and the kernel names the FUSE control
+    /// directory `/sys/fs/fuse/connections/<minor>` after it.
+    device_minor: Option<u32>,
     mountpoint: PathBuf,
     filesystem: String,
     source: String,
@@ -119,6 +123,47 @@ pub fn inspect(path: &Path) -> Result<OrlopMount> {
         let _ = path;
         anyhow::bail!("mount inspection is currently supported on Linux only")
     }
+}
+
+/// FUSE-connection device minor of the Orlop mount at `path`, resolved from
+/// `/proc/self/mountinfo`. The kernel names the FUSE control directory
+/// `/sys/fs/fuse/connections/<minor>/` after this value, so it is what the
+/// eviction path needs to write to `<minor>/abort`. Fail-closed like
+/// [`inspect`]: any non-Orlop layer at the path is an error, so a caller can
+/// never abort somebody else's FUSE connection.
+#[cfg(target_os = "linux")]
+pub fn orlop_fuse_device_minor(path: &Path) -> Result<u32> {
+    topmost_orlop_device_minor(&read_mountinfo()?, path)
+}
+
+/// Pure core of [`orlop_fuse_device_minor`]: the device minor of the topmost
+/// (last-listed) mount-table record at `path`, required to be an Orlop mount
+/// all the way down.
+#[cfg(any(target_os = "linux", test))]
+fn topmost_orlop_device_minor(records: &[MountRecord], path: &Path) -> Result<u32> {
+    let at_path: Vec<&MountRecord> = records
+        .iter()
+        .filter(|record| record.mountpoint == path)
+        .collect();
+    if at_path.is_empty() {
+        anyhow::bail!("{} is not a mountpoint in this namespace", path.display());
+    }
+    if at_path.iter().any(|record| !record.is_orlop()) {
+        anyhow::bail!(
+            "{} has a non-Orlop filesystem in its mount stack",
+            path.display()
+        );
+    }
+    // Later mountinfo lines stack on top of earlier ones at the same path.
+    at_path
+        .last()
+        .and_then(|record| record.device_minor)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "mountinfo record for {} has no parseable device minor",
+                path.display()
+            )
+        })
 }
 
 /// Lazy-detach every stale, topmost Orlop FUSE mount in this namespace.
@@ -247,11 +292,16 @@ fn parse_mountinfo(bytes: &[u8]) -> Result<Vec<MountRecord>> {
             .context("mountinfo mount id is not UTF-8")?
             .parse::<u64>()
             .with_context(|| format!("invalid mount id on mountinfo line {}", line_no + 1))?;
+        let device_minor = std::str::from_utf8(fields[2])
+            .ok()
+            .and_then(|dev| dev.split_once(':'))
+            .and_then(|(_, minor)| minor.parse::<u32>().ok());
         let mountpoint = path_from_mountinfo_field(fields[4]);
         let filesystem = String::from_utf8_lossy(fields[separator + 1]).into_owned();
         let source = String::from_utf8_lossy(fields[separator + 2]).into_owned();
         records.push(MountRecord {
             mount_id,
+            device_minor,
             mountpoint,
             filesystem,
             source,
@@ -323,7 +373,7 @@ fn is_concurrent_unmount_errno(err: &std::io::Error) -> bool {
 mod tests {
     use super::{
         is_concurrent_unmount_errno, parse_mountinfo, path_from_mountinfo_field,
-        probe_with_timeout, safe_to_detach, MountState,
+        probe_with_timeout, safe_to_detach, topmost_orlop_device_minor, MountState,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -370,6 +420,39 @@ mod tests {
         .unwrap();
         assert!(!safe_to_detach(&mixed, Path::new("/workspace")));
         assert!(!safe_to_detach(&mixed, Path::new("/missing")));
+    }
+
+    #[test]
+    fn parses_device_minor_from_the_device_field() {
+        let records = parse_mountinfo(b"9 1 0:51 / /workspace rw - fuse.orlop orlop rw\n").unwrap();
+        assert_eq!(records[0].device_minor, Some(51));
+    }
+
+    #[test]
+    fn device_minor_of_topmost_orlop_layer_wins() {
+        let records = parse_mountinfo(
+            b"12 1 0:12 / /workspace rw - fuse orlop rw\n\
+              19 1 0:19 / /workspace rw - fuse orlop rw\n",
+        )
+        .unwrap();
+        assert_eq!(
+            topmost_orlop_device_minor(&records, Path::new("/workspace")).unwrap(),
+            19
+        );
+    }
+
+    #[test]
+    fn device_minor_fails_closed_on_mixed_or_missing_mounts() {
+        let mixed = parse_mountinfo(
+            b"12 1 0:12 / /workspace rw - fuse orlop rw\n\
+              19 1 0:19 / /workspace rw - ext4 /dev/vda1 rw\n",
+        )
+        .unwrap();
+        assert!(topmost_orlop_device_minor(&mixed, Path::new("/workspace")).is_err());
+        assert!(topmost_orlop_device_minor(&mixed, Path::new("/missing")).is_err());
+
+        let foreign = parse_mountinfo(b"9 1 0:9 / /workspace rw - fuse.sshfs sshfs rw\n").unwrap();
+        assert!(topmost_orlop_device_minor(&foreign, Path::new("/workspace")).is_err());
     }
 
     #[test]

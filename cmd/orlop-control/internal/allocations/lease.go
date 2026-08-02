@@ -13,14 +13,22 @@ import (
 )
 
 // AcquireMountLease atomically claims the allocation for agentID and sets a fresh mount
-// lease, UNCONDITIONALLY taking over any existing lease (only a revoked/missing allocation
-// fails, mapped to ErrRevoked/ErrNotFound). An allocation belongs to a single orlop agent,
-// so callers the handler authorized (owning user + agent-scoped cert) are always that
-// agent; a one-shot pod re-mounts with a fresh enrollment every turn and must take over
-// the prior pod's lease — including one a crashed pod leaked, without waiting out the TTL.
-// Mount exclusivity is enforced by the handler's ownership check + the data-plane cert.
-func (s *Service) AcquireMountLease(ctx context.Context, allocationID, agentID pgtype.UUID, ttl time.Duration) (Allocation, error) {
-	row, err := s.store.AcquireMountLease(ctx, toUUID(allocationID), toUUID(agentID), ttl)
+// lease. An allocation belongs to a single orlop agent, so callers the handler authorized
+// (owning user + agent-scoped cert) are always that agent; a one-shot pod re-mounts with
+// a fresh enrollment every turn and claims freely once the prior lease is released or
+// expired. A lease that is still LIVE for a DIFFERENT enrollment is NOT taken over unless
+// force is set: the incumbent is refreshing and mid-write, so a silent takeover turns a
+// caller bug (concurrent double-mount) into silent data loss (issue #93) — the refusal is
+// reported as *LeaseLiveError carrying the incumbent's bound_at/lease_expires_at. force
+// is the caller's explicit assertion that the incumbent's host is gone (crash recovery,
+// dashboard take-over), skipping the TTL wait; a forced takeover of a live lease is
+// audit-logged. Mount exclusivity is otherwise enforced by the handler's ownership check
+// + the data-plane cert.
+func (s *Service) AcquireMountLease(ctx context.Context, allocationID, agentID pgtype.UUID, ttl time.Duration, force bool) (Allocation, error) {
+	if force {
+		s.logLiveTakeover(ctx, allocationID, agentID)
+	}
+	row, err := s.store.AcquireMountLease(ctx, toUUID(allocationID), toUUID(agentID), ttl, force)
 	if err == nil {
 		return fromStorage(row), nil
 	}
@@ -28,6 +36,29 @@ func (s *Service) AcquireMountLease(ctx context.Context, allocationID, agentID p
 		return Allocation{}, fmt.Errorf("acquire: %w", err)
 	}
 	return Allocation{}, s.classifyLeaseMiss(ctx, allocationID, agentID, true)
+}
+
+// logLiveTakeover records that a forced acquire is about to displace a live
+// lease held by a different enrollment, so a double-mount is diagnosable from
+// control-plane logs in minutes instead of from FUSE logs after the fact
+// (issue #93). Best-effort and read-before-update (a benign race): a lookup
+// failure only costs the log line, never the acquire.
+func (s *Service) logLiveTakeover(ctx context.Context, allocationID, agentID pgtype.UUID) {
+	cur, err := s.store.GetAllocation(ctx, toUUID(allocationID))
+	if err != nil {
+		return
+	}
+	agent := toUUID(agentID)
+	if cur.LeaseExpiresAt == nil || !cur.LeaseExpiresAt.After(time.Now()) ||
+		cur.BoundAgentID == nil || *cur.BoundAgentID == agent {
+		return
+	}
+	s.logger.Warn("mount_lease_forced_takeover",
+		"allocation_id", toUUID(allocationID).String(),
+		"incumbent_agent_id", cur.BoundAgentID.String(),
+		"new_agent_id", agent.String(),
+		"incumbent_lease_remaining", time.Until(*cur.LeaseExpiresAt).Round(time.Millisecond).String(),
+	)
 }
 
 // classifyLeaseMiss reads the current row to map a zero-rows update to the
@@ -49,6 +80,12 @@ func (s *Service) classifyLeaseMiss(ctx context.Context, allocationID, agentID p
 	}
 	if cur.LeaseExpiresAt != nil && cur.LeaseExpiresAt.After(time.Now()) {
 		if cur.BoundAgentID == nil || *cur.BoundAgentID != agent {
+			if acquired {
+				// The guarded acquire refused to displace a live lease held
+				// by a different enrollment (issue #93). Surface who holds it
+				// so the caller can decide whether to force.
+				return &LeaseLiveError{BoundAt: cur.BoundAt, LeaseExpiresAt: *cur.LeaseExpiresAt}
+			}
 			return ErrWrongAgent
 		}
 		if acquired {

@@ -87,8 +87,10 @@ type AllocationOps interface {
 	SumActiveAllocationBytes(ctx context.Context, userID uuid.UUID) (int64, error)
 	ListPurgePendingAllocations(ctx context.Context, limit int32) ([]PurgePendingAllocation, error)
 
-	// Mount leases.
-	AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (Allocation, error)
+	// Mount leases. AcquireMountLease with force=false refuses to take over a
+	// live lease held by a different enrollment (zero rows → ErrNotFound, the
+	// caller classifies); force=true is the explicit takeover assertion.
+	AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, force bool) (Allocation, error)
 	RefreshMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (Allocation, error)
 	ReleaseMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID) (Allocation, error)
 	ForceReleaseMountLease(ctx context.Context, allocID, userID uuid.UUID) error

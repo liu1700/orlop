@@ -38,7 +38,27 @@ var (
 	ErrLeaseLost      = errors.New("allocations: lease expired; re-acquire required")
 	ErrRevoked        = errors.New("allocations: revoked")
 	ErrNotFound       = errors.New("allocations: not found")
+
+	// ErrLeaseLive is the errors.Is target for *LeaseLiveError.
+	ErrLeaseLive = errors.New("allocations: lease is live for a different agent")
 )
+
+// LeaseLiveError reports an acquire refused because the lease is still live
+// for a different enrollment (issue #93). It carries the incumbent's binding
+// details so the handler can return them with the 409, letting the caller
+// decide whether the incumbent is really gone before retrying with force.
+// Matches ErrLeaseLive under errors.Is.
+type LeaseLiveError struct {
+	BoundAt        *time.Time
+	LeaseExpiresAt time.Time
+}
+
+func (e *LeaseLiveError) Error() string {
+	return "allocations: lease is live for a different agent until " +
+		e.LeaseExpiresAt.UTC().Format(time.RFC3339)
+}
+
+func (e *LeaseLiveError) Is(target error) bool { return target == ErrLeaseLive }
 
 // Allocation is the public projection of a disk_allocations row.
 type Allocation struct {

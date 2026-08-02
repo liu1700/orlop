@@ -133,11 +133,12 @@ func (s *Store) ListPurgePendingAllocations(ctx context.Context, limit int32) ([
 
 // --- mount leases ---
 
-func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (storage.Allocation, error) {
+func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, force bool) (storage.Allocation, error) {
 	row, err := s.q.AcquireMountLease(ctx, sqlcdb.AcquireMountLeaseParams{
 		ID:           pgUUID(allocID),
 		BoundAgentID: pgUUID(agentEnrollmentID),
 		Ttl:          ttlInterval(ttl),
+		Force:        force,
 	})
 	if err != nil {
 		return storage.Allocation{}, mapErr(err)

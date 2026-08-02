@@ -62,7 +62,7 @@ Successful responses are JSON with `Content-Type: application/json`.
 | `401 Unauthorized` | missing/invalid/expired credential (`invalid_token`, `invalid_client`) |
 | `403 Forbidden` | authenticated but not allowed (`access_denied`: suspended tenant/user, tenant not allowed, missing agent scope) |
 | `404 Not Found` | unknown resource |
-| `409 Conflict` | mount or capacity conflict (`wrong_agent`, `already_mounted`, `insufficient_capacity`) |
+| `409 Conflict` | mount or capacity conflict (`wrong_agent`, `already_mounted`, `lease_live`, `insufficient_capacity`). `lease_live` means the acquire would displace a mount lease that is still live for a different enrollment; its body carries the incumbent's `bound_at` and `lease_expires_at`, and the caller may retry with `{"force": true}` to take over |
 | `410 Gone` | revoked allocation or lost lease (`revoked`, `lease_lost`) |
 | `429 Too Many Requests` | rate limited (`rate_limited`) |
 | `503 Service Unavailable` | transient; retry. `POST /agent/enroll` adds `Retry-After: 60` when CA material or server placement is not yet ready |
@@ -146,7 +146,7 @@ The set of mounted routes depends on configuration:
 | GET | `/allocations` | admin session cookie | dashboard: list the user's disk allocations |
 | GET | `/allocations/{id}/usage` | admin session cookie | dashboard: per-allocation usage |
 | POST | `/allocations/{id}/revoke` | admin session cookie | revoke an allocation |
-| POST | `/allocations/{id}/mount` | agent identity | acquire the exclusive mount lease |
+| POST | `/allocations/{id}/mount` | agent identity | acquire the exclusive mount lease. Refuses to displace a live lease held by a different enrollment with `409 lease_live` unless the body sets `"force": true` |
 | POST | `/allocations/{id}/mount/refresh` | agent identity | extend the mount lease |
 | DELETE | `/allocations/{id}/mount` | agent identity | release the mount lease |
 | POST | `/allocations/{id}/unmount` | admin session cookie | owner-forced unmount |

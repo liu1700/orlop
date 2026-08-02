@@ -12,7 +12,7 @@ use serde::Deserialize;
 use orlop::agents_md;
 use orlop::audit;
 use orlop::backend::{self, build_stores, TlsIdentity};
-use orlop::config::{Config, HostedConfig, MountConfig};
+use orlop::config::{Config, EvictionAction, HostedConfig, MountConfig};
 use orlop::enroll::{self, EnrolledCert};
 use orlop::login;
 use orlop::util;
@@ -58,6 +58,24 @@ enum Command {
         /// --config and --credentials are ignored in this mode.
         #[arg(long)]
         from_env: bool,
+        /// Take over the mount lease even if another mount's lease is still
+        /// live (the control plane otherwise refuses with 409 lease_live).
+        /// Pass this only when the other mount's host is known to be gone
+        /// (crash recovery) or being deliberately displaced — the displaced
+        /// mount loses its filesystem mid-write. ORLOP_MOUNT_TAKEOVER=1 is
+        /// the env equivalent for --from-env pods.
+        #[arg(long)]
+        takeover: bool,
+        /// What to do with the mountpoint when the mount lease is lost
+        /// involuntarily (revoked, expired, or taken over by another agent).
+        /// "abort" kills the FUSE connection so workload I/O fails loudly with
+        /// ENOTCONN instead of silently landing in the directory underneath;
+        /// "unmount" restores the old clean-unmount behavior. Defaults: abort
+        /// for --from-env (hosted/agent) mounts, unmount otherwise; the
+        /// ORLOP_ON_EVICTION env var and the config's `on_eviction` key are
+        /// consulted in between.
+        #[arg(long, value_name = "abort|unmount")]
+        on_eviction: Option<orlop::config::EvictionAction>,
         /// Attach this CLI's management state to an existing live Orlop FUSE
         /// mount. Linux only; cannot revive a dead FUSE connection.
         #[arg(long, value_name = "PATH")]
@@ -214,6 +232,8 @@ fn main() -> anyhow::Result<()> {
             no_inject,
             credentials,
             from_env,
+            takeover,
+            on_eviction,
             adopt,
             replace_with,
         } => {
@@ -272,12 +292,14 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            let takeover = *takeover || takeover_from_env()?;
+
             if *from_env {
                 // In-pod mounter: env vars carry everything (agent id, mount
                 // point, control-plane URL, enroll token). Always foreground —
                 // the pod supervises this PID — so we skip the daemonize dance
                 // and reuse run_mount_payload via a synthesized hosted config.
-                return run_env_mount(*no_inject);
+                return run_env_mount(*no_inject, *on_eviction, takeover);
             }
 
             let creds_override = credentials.as_deref();
@@ -300,10 +322,30 @@ fn main() -> anyhow::Result<()> {
                 .or_else(|| cfg.mountpoint.clone())
                 .ok_or_else(|| anyhow!("mountpoint is required in config or --mountpoint"))?;
 
+            // Resolve the effective eviction behavior once, up front, so the
+            // foreground path, the daemon path, and any handoff successor
+            // (which receives this config serialized) all see one decision.
+            let cfg = Config {
+                on_eviction: Some(resolve_eviction_action(
+                    *on_eviction,
+                    cfg.on_eviction,
+                    false,
+                )?),
+                ..cfg
+            };
+
             if *foreground {
                 // Existing path — block in this process until SIGINT/SIGTERM.
                 // cwd is still the parent's cwd here, so no original_cwd needed.
-                return run_mount_payload(&cfg, mountpoint, creds_override, *no_inject, None, None);
+                return run_mount_payload(
+                    &cfg,
+                    mountpoint,
+                    creds_override,
+                    *no_inject,
+                    takeover,
+                    None,
+                    None,
+                );
             }
 
             // --- Daemon path ---
@@ -432,6 +474,7 @@ fn main() -> anyhow::Result<()> {
                         mountpoint.clone(),
                         creds_override,
                         *no_inject,
+                        takeover,
                         Some(ready_cb),
                         original_cwd.clone(),
                     );
@@ -893,6 +936,10 @@ struct MountLeaseClient {
     base_url: String,
     allocation_id: String,
     agent_fingerprint: String,
+    /// Acquire with `{"force": true}`: displace a lease that is still live for
+    /// a different enrollment (the control plane otherwise answers 409
+    /// lease_live). Only affects acquire; refresh/release never send it.
+    takeover: bool,
 }
 
 #[derive(Deserialize)]
@@ -915,6 +962,8 @@ impl MountLeaseManager {
         agent_fingerprint: String,
         tls: TlsIdentity,
         mountpoint: PathBuf,
+        on_eviction: EvictionAction,
+        takeover: bool,
     ) -> anyhow::Result<Self> {
         Self::acquire_with_release(
             control_plane_url,
@@ -922,20 +971,30 @@ impl MountLeaseManager {
             agent_fingerprint,
             tls,
             mountpoint,
+            on_eviction,
+            takeover,
             true,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn acquire_with_release(
         control_plane_url: String,
         allocation_id: String,
         agent_fingerprint: String,
         tls: TlsIdentity,
         mountpoint: PathBuf,
+        on_eviction: EvictionAction,
+        takeover: bool,
         release_on_drop: bool,
     ) -> anyhow::Result<Self> {
-        let client =
-            MountLeaseClient::new(control_plane_url, allocation_id, agent_fingerprint, tls)?;
+        let client = MountLeaseClient::new(
+            control_plane_url,
+            allocation_id,
+            agent_fingerprint,
+            tls,
+            takeover,
+        )?;
         let lease = client.acquire()?;
         eprintln!(
             "acquired mount lease until {}",
@@ -947,7 +1006,7 @@ impl MountLeaseManager {
         let revoked = Arc::new(AtomicBool::new(false));
         let thread_revoked = revoked.clone();
         let handle = thread::spawn(move || {
-            mount_lease_refresh_loop(&rx, thread_client, mountpoint, thread_revoked);
+            mount_lease_refresh_loop(&rx, thread_client, mountpoint, thread_revoked, on_eviction);
         });
         Ok(Self {
             client,
@@ -982,6 +1041,7 @@ impl MountLeaseClient {
         allocation_id: String,
         agent_fingerprint: String,
         tls: TlsIdentity,
+        takeover: bool,
     ) -> anyhow::Result<Self> {
         let identity =
             reqwest::Identity::from_pem(&tls.pem_bundle()).context("parse client TLS identity")?;
@@ -995,22 +1055,34 @@ impl MountLeaseClient {
             base_url: control_plane_url.trim_end_matches('/').to_string(),
             allocation_id,
             agent_fingerprint,
+            takeover,
         })
     }
 
     fn acquire(&self) -> anyhow::Result<MountLeaseResp> {
-        self.post_lease("", "acquire")
+        let mut body = self.body();
+        // Only include the key when set: an older control plane decodes the
+        // lease body with DisallowUnknownFields and would 400 on it.
+        if self.takeover {
+            body["force"] = serde_json::Value::Bool(true);
+        }
+        self.post_lease("", "acquire", &body)
     }
 
     fn refresh(&self) -> anyhow::Result<MountLeaseResp> {
-        self.post_lease("/refresh", "refresh")
+        self.post_lease("/refresh", "refresh", &self.body())
     }
 
-    fn post_lease(&self, suffix: &str, op: &str) -> anyhow::Result<MountLeaseResp> {
+    fn post_lease(
+        &self,
+        suffix: &str,
+        op: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<MountLeaseResp> {
         let resp = self
             .client
             .post(self.url(suffix))
-            .json(&self.body())
+            .json(body)
             .send()
             .with_context(|| format!("POST {}", self.url(suffix)))?;
         self.decode_lease_response(resp, op)
@@ -1061,6 +1133,16 @@ impl MountLeaseClient {
 /// terminal ("revoked" / "lease lost" / "already mounted by another agent"
 /// → unmount). See `mount_lease_refresh_loop` for the matching strings.
 fn classify_lease_error(status: StatusCode, body: &str, op: &str) -> anyhow::Error {
+    if status == StatusCode::CONFLICT && body.contains("lease_live") {
+        // Acquire-time refusal (issue #93): the incumbent's lease is still
+        // live and being refreshed, so this is almost certainly a concurrent
+        // double-mount. Only occurs on acquire, so it fails the mount at
+        // startup rather than tearing one down.
+        return anyhow::anyhow!(
+            "allocation is mounted by another agent and its lease is still live; \
+             wait for it to release (or expire), or re-run with --takeover to displace it"
+        );
+    }
     if status == StatusCode::CONFLICT && body.contains("already_mounted") {
         return anyhow::anyhow!("allocation is already mounted by another agent");
     }
@@ -1086,6 +1168,7 @@ fn mount_lease_refresh_loop(
     client: MountLeaseClient,
     mountpoint: PathBuf,
     revoked: Arc<AtomicBool>,
+    on_eviction: EvictionAction,
 ) {
     loop {
         if stop.recv_timeout(Duration::from_secs(30)).is_ok() {
@@ -1102,23 +1185,42 @@ fn mount_lease_refresh_loop(
                 let msg = err.to_string();
                 // "already mounted by another agent" comes from a Take over —
                 // the dashboard handed our lease to a different device. Same
-                // fatal treatment as a revoke: drop the now-useless mount
-                // cleanly instead of spinning warnings forever (#155).
+                // fatal treatment as a revoke: stop serving a filesystem we no
+                // longer own instead of spinning warnings forever (#155).
                 if msg.contains("revoked")
                     || msg.contains("lease lost")
                     || msg.contains("already mounted by another agent")
                 {
                     revoked.store(true, Ordering::Relaxed);
-                    eprintln!(
-                        "{msg}; signaling daemon to unmount {}",
-                        mountpoint.display()
-                    );
-                    // Signal ourselves — MountedFs's signal handler runs Drop which
-                    // releases the lease and unmounts cleanly. Works in both daemon
-                    // and --foreground modes because both install the SIGTERM handler
-                    // (see src/mount.rs MountedFs::wait).
-                    orlop::daemon::raise_signal(libc::SIGTERM);
-                    return;
+                    match on_eviction {
+                        // This is an INVOLUNTARY eviction: a clean unmount
+                        // would expose whatever the mountpoint was covering
+                        // (in a container an empty writable dir), and a
+                        // still-running workload would silently write into it
+                        // (#92). Abort the FUSE connection and exit without
+                        // running Drop, so all I/O fails with ENOTCONN.
+                        EvictionAction::Abort => {
+                            eprintln!(
+                                "{msg}; aborting mount at {} so workload I/O fails instead of \
+                                 landing in the directory underneath (--on-eviction=unmount \
+                                 restores the previous behavior)",
+                                mountpoint.display()
+                            );
+                            orlop::mount::evict_abort(&mountpoint);
+                        }
+                        EvictionAction::Unmount => {
+                            eprintln!(
+                                "{msg}; signaling daemon to unmount {}",
+                                mountpoint.display()
+                            );
+                            // Signal ourselves — MountedFs's signal handler runs Drop which
+                            // releases the lease and unmounts cleanly. Works in both daemon
+                            // and --foreground modes because both install the SIGTERM handler
+                            // (see src/mount.rs MountedFs::wait).
+                            orlop::daemon::raise_signal(libc::SIGTERM);
+                            return;
+                        }
+                    }
                 }
                 eprintln!("warning: mount lease refresh failed: {err:#}");
             }
@@ -1424,6 +1526,52 @@ impl EnvMountSpec {
     }
 }
 
+/// `ORLOP_MOUNT_TAKEOVER=1|true` is the env equivalent of `--takeover` for
+/// `--from-env` pods: force-take-over a mount lease that is still live for a
+/// different enrollment. A malformed value is a hard error — this flag decides
+/// whether another mount loses its filesystem mid-write.
+fn takeover_from_env() -> anyhow::Result<bool> {
+    match std::env::var("ORLOP_MOUNT_TAKEOVER") {
+        Ok(value) => match value.trim() {
+            "" | "0" | "false" => Ok(false),
+            "1" | "true" => Ok(true),
+            other => Err(anyhow!(
+                "ORLOP_MOUNT_TAKEOVER: invalid value {other:?} (use 1/true or 0/false)"
+            )),
+        },
+        Err(_) => Ok(false),
+    }
+}
+
+/// Effective eviction behavior for this mount, resolved in precedence order:
+/// `--on-eviction` flag, then the `ORLOP_ON_EVICTION` env var, then the
+/// config's `on_eviction` key, then the mode default — `abort` for hosted
+/// agent (`--from-env`) mounts, whose unattended workload must never silently
+/// write into the directory a clean unmount would expose (issue #92), and
+/// `unmount` for interactive mounts, where the dashboard take-over flow
+/// intentionally frees the mountpoint. A malformed env value is a hard error:
+/// guessing here silently changes what happens to the user's data.
+fn resolve_eviction_action(
+    flag: Option<EvictionAction>,
+    from_config: Option<EvictionAction>,
+    hosted_agent_mount: bool,
+) -> anyhow::Result<EvictionAction> {
+    if let Some(action) = flag {
+        return Ok(action);
+    }
+    if let Some(value) = std::env::var_os("ORLOP_ON_EVICTION") {
+        return value
+            .to_string_lossy()
+            .parse()
+            .map_err(|e: String| anyhow!("ORLOP_ON_EVICTION: {e}"));
+    }
+    Ok(from_config.unwrap_or(if hosted_agent_mount {
+        EvictionAction::Abort
+    } else {
+        EvictionAction::Unmount
+    }))
+}
+
 /// `orlop mount --from-env` entry point: synthesizes a hosted `Config` +
 /// on-disk `Credentials` from [`EnvMountSpec`] and routes through the standard
 /// `run_mount_payload` engine, including `CertManager` renewal (re-enrolls
@@ -1431,7 +1579,11 @@ impl EnvMountSpec {
 /// hot-swap a renewed cert — rustls captured the identity at dial time, so it
 /// takes effect on the next dial. Intentional: the common one-shot pod exits
 /// before the renewal ever fires.
-fn run_env_mount(no_inject: bool) -> anyhow::Result<()> {
+fn run_env_mount(
+    no_inject: bool,
+    on_eviction: Option<EvictionAction>,
+    takeover: bool,
+) -> anyhow::Result<()> {
     let spec = EnvMountSpec::from_env()?;
 
     // Isolated cert dir: honor ORLOP_CERT_DIR, else a fresh tempdir. The
@@ -1492,6 +1644,10 @@ fn run_env_mount(no_inject: bool) -> anyhow::Result<()> {
             mount_root: Some(format!("/{}", spec.agent_id)),
         }),
         chunk_cache: Default::default(),
+        // Hosted agent mount: an involuntary eviction aborts the FUSE
+        // connection by default so the unattended workload gets ENOTCONN
+        // instead of silently writing into the exposed scratch dir (#92).
+        on_eviction: Some(resolve_eviction_action(on_eviction, None, true)?),
     };
 
     run_mount_payload(
@@ -1499,6 +1655,7 @@ fn run_env_mount(no_inject: bool) -> anyhow::Result<()> {
         spec.mount_point,
         Some(creds_path.as_path()),
         no_inject,
+        takeover,
         None,
         None,
     )
@@ -1528,6 +1685,7 @@ fn run_mount_payload(
     mountpoint: PathBuf,
     creds_override: Option<&Path>,
     no_inject: bool,
+    takeover: bool,
     ready_signal: Option<ReadySignal>,
     original_cwd: Option<PathBuf>, // parent's cwd before daemonize chdir'd to /
 ) -> anyhow::Result<()> {
@@ -1599,6 +1757,8 @@ fn run_mount_payload(
                     enrolled.cert_serial.clone(),
                     tls.clone(),
                     mountpoint.clone(),
+                    cfg.on_eviction.unwrap_or(EvictionAction::Unmount),
+                    takeover,
                 )?)
             };
             let addr = enrolled.server_addr.clone();
@@ -1869,6 +2029,12 @@ fn prepare_handoff_successor(
                 enrolled.cert_serial.clone(),
                 tls.clone(),
                 runtime.mountpoint.clone(),
+                // A predecessor built before on_eviction existed serialized no
+                // value; keep its era's behavior (clean unmount) in that case.
+                cfg.on_eviction.unwrap_or(EvictionAction::Unmount),
+                // The successor re-acquires under the SAME enrollment (the
+                // transferred cert), which a live lease never blocks.
+                false,
                 false,
             )?)
         };
@@ -1954,6 +2120,7 @@ fn release_hosted_mount_lease(
         allocation_id,
         agent_fingerprint,
         tls,
+        false, // release never needs takeover
     )?;
     client.release()
 }
@@ -2150,6 +2317,20 @@ mod lease_error_classification {
     }
 
     #[test]
+    fn conflict_lease_live_names_the_takeover_flag() {
+        let e = classify_lease_error(
+            StatusCode::CONFLICT,
+            r#"{"error":"lease_live","lease_expires_at":"2026-08-02T21:13:35Z"}"#,
+            "acquire",
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("--takeover"), "msg = {msg}");
+        // Must not match a refresh-terminal substring: lease_live is an
+        // acquire-time refusal, not a reason to tear a running mount down.
+        assert!(!msg.contains("already mounted by another agent"), "msg = {msg}");
+    }
+
+    #[test]
     fn gone_revoked_is_terminal() {
         let e = classify_lease_error(StatusCode::GONE, r#"{"error":"revoked"}"#, "refresh");
         assert!(e.to_string().contains("revoked"));
@@ -2186,5 +2367,42 @@ mod lease_error_classification {
                 "transient {msg:?} accidentally classified as terminal ({terminal})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod eviction_action_resolution {
+    use super::*;
+
+    // These run without ORLOP_ON_EVICTION set (nothing in the test suite sets
+    // it); env-var precedence sits between the flag and the config value.
+
+    #[test]
+    fn flag_wins_over_config() {
+        let action = resolve_eviction_action(
+            Some(EvictionAction::Unmount),
+            Some(EvictionAction::Abort),
+            true,
+        )
+        .unwrap();
+        assert_eq!(action, EvictionAction::Unmount);
+    }
+
+    #[test]
+    fn config_wins_over_mode_default() {
+        let action = resolve_eviction_action(None, Some(EvictionAction::Abort), false).unwrap();
+        assert_eq!(action, EvictionAction::Abort);
+    }
+
+    #[test]
+    fn hosted_agent_mounts_default_to_abort_interactive_to_unmount() {
+        assert_eq!(
+            resolve_eviction_action(None, None, true).unwrap(),
+            EvictionAction::Abort
+        );
+        assert_eq!(
+            resolve_eviction_action(None, None, false).unwrap(),
+            EvictionAction::Unmount
+        );
     }
 }
