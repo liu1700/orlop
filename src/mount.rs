@@ -444,6 +444,68 @@ pub fn probe_mount(mountpoint: &Path, readonly: bool) -> Result<()> {
     Ok(())
 }
 
+/// Exit status of a mount process that lost its lease involuntarily and
+/// aborted the mount (sysexits.h EX_UNAVAILABLE), so supervisors can tell an
+/// eviction from a crash.
+pub const EVICTION_EXIT_CODE: i32 = 69;
+
+/// Involuntary-eviction teardown: leave the mountpoint UNUSABLE instead of
+/// cleanly unmounted, then exit the process.
+///
+/// A clean unmount restores whatever the mountpoint was covering — under a
+/// container typically an empty writable directory — so a still-running
+/// workload keeps "successfully" writing files that never reach the disk
+/// (issue #92). This path does the opposite of `unmount`:
+///
+/// - Linux: abort the FUSE connection via
+///   `/sys/fs/fuse/connections/<minor>/abort` so every in-flight and
+///   subsequent syscall on the mountpoint fails with ENOTCONN — enforced by
+///   the kernel, impossible for the workload to mistake for success.
+/// - Then exit WITHOUT running destructors: `MountedFs::Drop` (and fuser's
+///   own mount guard) would run the clean unmount this path exists to avoid.
+///   On Linux, process exit closes `/dev/fuse`, which also aborts the
+///   connection, so the sysfs write failing (or macOS, which has no abort
+///   control) still ends with a dead mount rather than an exposed directory:
+///   the macOS NFS server dies with the process and the kernel's `soft` NFS
+///   mount turns subsequent I/O into errors after its retries.
+///
+/// The stale mountpoint left behind is deliberate; reclaim it out of band
+/// with `orlop unmount --stale` (Linux) or `umount -f` (macOS).
+pub fn evict_abort(mountpoint: &Path) -> ! {
+    #[cfg(target_os = "linux")]
+    match abort_fuse_connection(mountpoint) {
+        Ok(minor) => eprintln!(
+            "aborted FUSE connection {minor} for {}; subsequent I/O fails with ENOTCONN",
+            mountpoint.display()
+        ),
+        Err(e) => eprintln!(
+            "warning: FUSE abort via sysfs failed for {}: {e:#}; exiting without unmount \
+             (closing /dev/fuse aborts the connection as well)",
+            mountpoint.display()
+        ),
+    }
+    #[cfg(not(target_os = "linux"))]
+    eprintln!(
+        "leaving {} mounted without a server; I/O will fail instead of landing \
+         in the directory underneath (clean up with `umount -f`)",
+        mountpoint.display()
+    );
+    std::process::exit(EVICTION_EXIT_CODE);
+}
+
+/// Abort the kernel side of the Orlop FUSE connection serving `mountpoint`.
+/// Returns the connection's device minor on success. Resolution goes through
+/// `/proc/self/mountinfo` (no I/O on the possibly-wedged mount itself) and
+/// fails closed unless every mount-table layer at the path is an Orlop mount,
+/// so this can never abort an unrelated FUSE filesystem.
+#[cfg(target_os = "linux")]
+pub fn abort_fuse_connection(mountpoint: &Path) -> Result<u32> {
+    let minor = crate::mounts::orlop_fuse_device_minor(mountpoint)?;
+    let ctl = format!("/sys/fs/fuse/connections/{minor}/abort");
+    std::fs::write(&ctl, "1").with_context(|| format!("write {ctl}"))?;
+    Ok(minor)
+}
+
 /// Run the platform-appropriate kernel-side unmount. Used by both
 /// `Command::Unmount` and `MountedFs::Drop`.
 pub fn unmount(mountpoint: &Path) -> Result<()> {

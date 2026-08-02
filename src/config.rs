@@ -22,6 +22,43 @@ pub struct Config {
     pub hosted: Option<HostedConfig>,
     #[serde(default)]
     pub chunk_cache: ChunkCacheConfig,
+    /// What to do with the mountpoint when the mount lease is lost
+    /// involuntarily (revoked, expired, or taken over by another agent).
+    /// `None` → mode default: `abort` for `--from-env` (hosted/agent) mounts,
+    /// `unmount` for interactive ones. See [`EvictionAction`].
+    #[serde(default)]
+    pub on_eviction: Option<EvictionAction>,
+}
+
+/// Teardown behavior for an INVOLUNTARY eviction (lease revoked/lost/taken
+/// over), as opposed to a voluntary `orlop unmount`.
+///
+/// `Unmount` (the historical behavior) runs a clean unmount, which restores
+/// whatever the mountpoint was covering — under a container typically an
+/// empty writable scratch dir, so a still-running workload keeps "succeeding"
+/// at writes that go nowhere (issue #92). `Abort` instead kills the FUSE
+/// connection and exits without unmounting, so every subsequent syscall on
+/// the mountpoint fails loudly with ENOTCONN. The stale mountpoint must then
+/// be cleaned up out of band (`orlop unmount --stale`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionAction {
+    Abort,
+    Unmount,
+}
+
+impl std::str::FromStr for EvictionAction {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "abort" => Ok(Self::Abort),
+            "unmount" => Ok(Self::Unmount),
+            other => Err(format!(
+                "invalid eviction action {other:?}: expected \"abort\" or \"unmount\""
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -191,6 +228,28 @@ mounts:
     fn repository_example_configs_load() {
         Config::load(Path::new("config.example.yaml")).unwrap();
         Config::load(Path::new("config.full.yaml")).unwrap();
+    }
+
+    #[test]
+    fn on_eviction_defaults_to_none_and_parses_both_values() {
+        let cfg: Config = serde_yaml::from_str("mountpoint: /mnt/orlop\n").unwrap();
+        assert_eq!(cfg.on_eviction, None);
+
+        let cfg: Config =
+            serde_yaml::from_str("mountpoint: /mnt/orlop\non_eviction: abort\n").unwrap();
+        assert_eq!(cfg.on_eviction, Some(EvictionAction::Abort));
+
+        let cfg: Config =
+            serde_yaml::from_str("mountpoint: /mnt/orlop\non_eviction: unmount\n").unwrap();
+        assert_eq!(cfg.on_eviction, Some(EvictionAction::Unmount));
+    }
+
+    #[test]
+    fn eviction_action_from_str_round_trips_and_rejects_garbage() {
+        assert_eq!("abort".parse(), Ok(EvictionAction::Abort));
+        assert_eq!("unmount".parse(), Ok(EvictionAction::Unmount));
+        assert!("Abort".parse::<EvictionAction>().is_err());
+        assert!("".parse::<EvictionAction>().is_err());
     }
 
     #[test]
