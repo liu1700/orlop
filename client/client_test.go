@@ -19,6 +19,27 @@ const (
 	ownerID = "99999999-9999-9999-9999-999999999999"
 )
 
+func TestNewHTTPClientHasBoundedDefault(t *testing.T) {
+	c := client.New("https://orlop-control.example", "tok")
+	if c.HTTP == nil {
+		t.Fatal("HTTP = nil; want a configured client")
+	}
+	if c.HTTP == http.DefaultClient {
+		t.Fatal("HTTP = http.DefaultClient; want a dedicated client")
+	}
+	if c.HTTP.Timeout != client.DefaultHTTPTimeout {
+		t.Fatalf("HTTP.Timeout = %s; want %s", c.HTTP.Timeout, client.DefaultHTTPTimeout)
+	}
+	if client.DefaultHTTPTimeout != 30*time.Second {
+		t.Fatalf("DefaultHTTPTimeout = %s; want 30s", client.DefaultHTTPTimeout)
+	}
+
+	other := client.New("https://orlop-control.example", "tok")
+	if c.HTTP == other.HTTP {
+		t.Fatal("New reused its http.Client; want per-client configuration")
+	}
+}
+
 func TestHTTPClientAllocateResolve(t *testing.T) {
 	var gotAuth string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -149,6 +149,10 @@ disk, err := c.AllocateDisk(ctx, agentID, ownerID, 1<<30)
 token, err := c.MintEnrollToken(ctx, agentID) // hand this to the sandbox
 ```
 
+`client.New` uses a dedicated HTTP client with a 30-second request timeout. Set
+`c.HTTP` to your own `*http.Client` when a different timeout or transport is
+required.
+
 A `client.Fake` in-memory implementation is provided for consumer tests.
 
 ## Documentation
