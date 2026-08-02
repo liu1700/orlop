@@ -300,11 +300,12 @@ func TestListForUserExcludesRevokedAndOtherUsers(t *testing.T) {
 	}
 }
 
-// AcquireMountLease unconditionally takes over: an allocation is single-agent, so the
-// handler's ownership check (not the lease row) provides exclusivity. A second acquire —
-// here by a second enrollment of the same owner, the way a one-shot pod re-mounts with a
-// fresh cert — takes the lease over rather than erroring.
-func TestAcquireMountLeaseTakesOver(t *testing.T) {
+// A live lease held by a different enrollment blocks a plain acquire with a
+// *LeaseLiveError carrying the incumbent's binding details, and force is the explicit
+// takeover assertion (issue #93): a concurrent double-mount gets a loud 409 instead of
+// silently corrupting the first mount, while crash recovery/dashboard take-over — the
+// callers who KNOW the incumbent's host is gone — pass force and skip the TTL wait.
+func TestAcquireMountLeaseLiveTakeoverNeedsForce(t *testing.T) {
 	svc, pool := withSvc(t)
 	ctx := context.Background()
 	user := seedUser(t, pool, "alice@acme.example", 10*GiB)
@@ -315,12 +316,30 @@ func TestAcquireMountLeaseTakesOver(t *testing.T) {
 	if _, err := svc.Bind(ctx, a.ID, user.ID, agent1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcquireMountLease(ctx, a.ID, agent1, allocations.LeaseTTL); err != nil {
+	first, err := svc.AcquireMountLease(ctx, a.ID, agent1, allocations.LeaseTTL, false)
+	if err != nil {
 		t.Fatalf("agent1 acquire: %v", err)
 	}
-	got, err := svc.AcquireMountLease(ctx, a.ID, agent2, allocations.LeaseTTL)
+
+	_, err = svc.AcquireMountLease(ctx, a.ID, agent2, allocations.LeaseTTL, false)
+	if !errors.Is(err, allocations.ErrLeaseLive) {
+		t.Fatalf("live takeover without force: got %v, want ErrLeaseLive", err)
+	}
+	var live *allocations.LeaseLiveError
+	if !errors.As(err, &live) {
+		t.Fatalf("expected *LeaseLiveError, got %T", err)
+	}
+	if !live.LeaseExpiresAt.Equal(*first.LeaseExpiresAt) {
+		t.Fatalf("LeaseLiveError expiry: got %v want %v", live.LeaseExpiresAt, first.LeaseExpiresAt)
+	}
+	// The incumbent's lease is untouched by the refused attempt: it can still refresh.
+	if _, err := svc.RefreshMountLease(ctx, a.ID, agent1, allocations.LeaseTTL); err != nil {
+		t.Fatalf("incumbent refresh after refused takeover: %v", err)
+	}
+
+	got, err := svc.AcquireMountLease(ctx, a.ID, agent2, allocations.LeaseTTL, true)
 	if err != nil {
-		t.Fatalf("second acquire should take over, got %v", err)
+		t.Fatalf("forced takeover: %v", err)
 	}
 	if got.BoundAgentID == nil || got.BoundAgentID.Bytes != agent2.Bytes {
 		t.Fatalf("BoundAgentID after takeover: got %v want %v", got.BoundAgentID, agent2)
@@ -338,11 +357,11 @@ func TestAcquireMountLeaseSameAgentRecoversAfterExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, 100*time.Millisecond); err != nil {
+	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, 100*time.Millisecond, false); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	time.Sleep(250 * time.Millisecond)
-	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL); err != nil {
+	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL, false); err != nil {
 		t.Fatalf("re-acquire after expiry: %v", err)
 	}
 }
@@ -360,13 +379,13 @@ func TestAcquireMountLeaseSameAgentTakesOverLiveLease(t *testing.T) {
 	if _, err := svc.Bind(ctx, a.ID, user.ID, agent); err != nil {
 		t.Fatal(err)
 	}
-	first, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL)
+	first, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL, false)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	// No wait — the lease is still live. The same agent must re-acquire (takeover),
 	// not get ErrAlreadyMounted.
-	second, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL)
+	second, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL, false)
 	if err != nil {
 		t.Fatalf("same-agent re-acquire of a live lease: got %v, want success (takeover)", err)
 	}
@@ -389,11 +408,11 @@ func TestAcquireMountLeaseDifferentAgentCanTakeOverAfterExpiry(t *testing.T) {
 	if _, err := svc.Bind(ctx, a.ID, user.ID, agent1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcquireMountLease(ctx, a.ID, agent1, 100*time.Millisecond); err != nil {
+	if _, err := svc.AcquireMountLease(ctx, a.ID, agent1, 100*time.Millisecond, false); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(250 * time.Millisecond)
-	got, err := svc.AcquireMountLease(ctx, a.ID, agent2, allocations.LeaseTTL)
+	got, err := svc.AcquireMountLease(ctx, a.ID, agent2, allocations.LeaseTTL, false)
 	if err != nil {
 		t.Fatalf("agent2 takeover: %v", err)
 	}
@@ -412,7 +431,7 @@ func TestRefreshMountLeaseExtends(t *testing.T) {
 	if _, err := svc.Bind(ctx, a.ID, user.ID, agent); err != nil {
 		t.Fatal(err)
 	}
-	first, err := svc.AcquireMountLease(ctx, a.ID, agent, 1*time.Second)
+	first, err := svc.AcquireMountLease(ctx, a.ID, agent, 1*time.Second, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +456,7 @@ func TestRefreshMountLeaseAfterExpiryFails(t *testing.T) {
 	if _, err := svc.Bind(ctx, a.ID, user.ID, agent); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, 100*time.Millisecond); err != nil {
+	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, 100*time.Millisecond, false); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(250 * time.Millisecond)
@@ -458,7 +477,7 @@ func TestRevokeWhileMountedRefreshFails(t *testing.T) {
 	if _, err := svc.Bind(ctx, a.ID, user.ID, agent); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL); err != nil {
+	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.Revoke(ctx, a.ID, user.ID); err != nil {
@@ -480,7 +499,7 @@ func TestReleaseFreesForRebinding(t *testing.T) {
 	if _, err := svc.Bind(ctx, a.ID, user.ID, agent1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcquireMountLease(ctx, a.ID, agent1, allocations.LeaseTTL); err != nil {
+	if _, err := svc.AcquireMountLease(ctx, a.ID, agent1, allocations.LeaseTTL, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.ReleaseMountLease(ctx, a.ID, agent1); err != nil {
@@ -491,7 +510,7 @@ func TestReleaseFreesForRebinding(t *testing.T) {
 	if _, err := svc.Bind(ctx, a.ID, user.ID, agent2); err != nil {
 		t.Fatalf("rebind to agent2: %v", err)
 	}
-	if _, err := svc.AcquireMountLease(ctx, a.ID, agent2, allocations.LeaseTTL); err != nil {
+	if _, err := svc.AcquireMountLease(ctx, a.ID, agent2, allocations.LeaseTTL, false); err != nil {
 		t.Fatalf("agent2 acquire: %v", err)
 	}
 
@@ -520,7 +539,7 @@ func TestReleaseMountLeaseRevokesCert(t *testing.T) {
 	if _, err := svc.Bind(ctx, a.ID, user.ID, agent); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL); err != nil {
+	if _, err := svc.AcquireMountLease(ctx, a.ID, agent, allocations.LeaseTTL, false); err != nil {
 		t.Fatal(err)
 	}
 	enr, err := q.GetAgentEnrollment(ctx, agent)

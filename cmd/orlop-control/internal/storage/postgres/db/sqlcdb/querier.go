@@ -11,14 +11,18 @@ import (
 )
 
 type Querier interface {
-	// An authorized mount unconditionally takes over the lease (only a revoked/missing
-	// allocation fails). An allocation belongs to a single orlop agent, so any caller the
-	// handler authorized (owning user + agent-scoped cert) IS that agent; a one-shot pod
-	// re-mounts with a FRESH enrollment ($2 is an FK into agent_enrollments, so it changes
-	// every turn) and must be able to take over the prior pod's lease — including one a
-	// crashed/forcibly-killed pod leaked, without waiting out the TTL. Mount exclusivity is
-	// enforced by the handler's ownership check + the data-plane agent cert, and the acquire
-	// handler fences any stale server-side session so the new mount's hex is accepted.
+	// Claim the allocation for $2 and set a fresh mount lease. An allocation belongs to a
+	// single orlop agent, so any caller the handler authorized (owning user + agent-scoped
+	// cert) IS that agent; a one-shot pod re-mounts with a FRESH enrollment ($2 is an FK
+	// into agent_enrollments, so it changes every turn) and takes over freely once the
+	// prior lease is released or expired. What it may NOT do without force is take over a
+	// lease that is still LIVE for a different enrollment: that incumbent is refreshing and
+	// mid-write, so a silent takeover turns a caller bug (concurrent double-mount) into
+	// silent data loss (issue #93). force=true is the explicit crash-recovery / take-over
+	// assertion — the caller states the incumbent's host is gone, skipping the TTL wait.
+	// Mount exclusivity is otherwise enforced by the handler's ownership check + the
+	// data-plane agent cert, and the acquire handler fences any stale server-side session
+	// so the new mount's hex is accepted.
 	AcquireMountLease(ctx context.Context, arg AcquireMountLeaseParams) (DiskAllocation, error)
 	// Record a revoked cert serial (issue #5). Idempotent: a serial already on the
 	// deny-list is left untouched (the first revocation's reason/expiry win).

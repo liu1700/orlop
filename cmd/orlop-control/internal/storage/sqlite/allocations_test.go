@@ -122,13 +122,13 @@ func TestMountLease(t *testing.T) {
 	agent2 := seedEnrollment(t, s, u.ID, "AGENT2")
 	ttl := time.Minute
 
-	acq, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl)
+	acq, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl, false)
 	if err != nil || acq.BoundAgentID == nil || *acq.BoundAgentID != agent1 || acq.LeaseExpiresAt == nil {
 		t.Fatalf("acquire = %+v, err %v", acq, err)
 	}
 	boundAt := acq.BoundAt
 	// Same-agent re-acquire preserves bound_at.
-	reacq, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl)
+	reacq, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl, false)
 	if err != nil || reacq.BoundAt == nil || boundAt == nil || !reacq.BoundAt.Equal(*boundAt) {
 		t.Fatalf("re-acquire bound_at changed: %+v vs %+v (err %v)", reacq.BoundAt, boundAt, err)
 	}
@@ -136,8 +136,16 @@ func TestMountLease(t *testing.T) {
 	if _, err := s.RefreshMountLease(ctx, a.ID, agent1, ttl); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	// Takeover by a different agent resets bound_at.
-	if to, err := s.AcquireMountLease(ctx, a.ID, agent2, ttl); err != nil || to.BoundAgentID == nil || *to.BoundAgentID != agent2 {
+	// A different agent cannot take over the live lease without force (#93)...
+	if _, err := s.AcquireMountLease(ctx, a.ID, agent2, ttl, false); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("live takeover without force = %v, want ErrNotFound (zero rows)", err)
+	}
+	// ...and the incumbent is untouched by the refused attempt.
+	if cur, err := s.GetAllocation(ctx, a.ID); err != nil || cur.BoundAgentID == nil || *cur.BoundAgentID != agent1 {
+		t.Fatalf("after refused takeover = %+v, err %v (want still agent1)", cur, err)
+	}
+	// Forced takeover by a different agent succeeds and resets bound_at.
+	if to, err := s.AcquireMountLease(ctx, a.ID, agent2, ttl, true); err != nil || to.BoundAgentID == nil || *to.BoundAgentID != agent2 {
 		t.Fatalf("takeover = %+v, err %v", to, err)
 	}
 	// The displaced agent can no longer refresh.
@@ -151,8 +159,8 @@ func TestMountLease(t *testing.T) {
 	if _, err := s.RefreshMountLease(ctx, a.ID, agent2, ttl); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("refresh after release = %v, want ErrNotFound", err)
 	}
-	// Force-release after a re-acquire; wrong user fails.
-	if _, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl); err != nil {
+	// A released lease is claimable by a different agent without force.
+	if _, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl, false); err != nil {
 		t.Fatalf("re-acquire: %v", err)
 	}
 	if err := s.ForceReleaseMountLease(ctx, a.ID, uuid.New()); !errors.Is(err, storage.ErrNotFound) {

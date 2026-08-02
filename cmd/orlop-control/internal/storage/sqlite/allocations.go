@@ -142,19 +142,24 @@ func (s *Store) ListPurgePendingAllocations(ctx context.Context, limit int32) ([
 
 // --- mount leases ---
 
-func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (storage.Allocation, error) {
+func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, force bool) (storage.Allocation, error) {
 	now := time.Now()
-	// Unconditional takeover (only revoked/missing fails); bound_at is preserved
-	// for a same-agent re-mount, reset otherwise. The CASE sees the pre-update
-	// bound_agent_id.
+	// bound_at is preserved for a same-agent re-mount, reset otherwise. The
+	// CASE sees the pre-update bound_agent_id. Without force, a live lease
+	// held by a DIFFERENT enrollment blocks the takeover (issue #93); a
+	// released/expired lease — including one a crashed pod leaked — is
+	// claimable freely, and force is the explicit crash-recovery override.
 	return scanAllocation(s.db.QueryRowContext(ctx,
 		`UPDATE disk_allocations
 		    SET bound_agent_id   = ?,
 		        bound_at         = CASE WHEN bound_agent_id = ? THEN bound_at ELSE ? END,
 		        lease_expires_at = ?
 		  WHERE id = ? AND revoked_at IS NULL
+		    AND (? OR bound_agent_id IS NULL OR bound_agent_id = ?
+		         OR lease_expires_at IS NULL OR lease_expires_at <= ?)
 		  RETURNING `+allocationColumns,
-		agentEnrollmentID, agentEnrollmentID, micros(now), micros(now.Add(ttl)), allocID))
+		agentEnrollmentID, agentEnrollmentID, micros(now), micros(now.Add(ttl)), allocID,
+		force, agentEnrollmentID, micros(now)))
 }
 
 func (s *Store) RefreshMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (storage.Allocation, error) {

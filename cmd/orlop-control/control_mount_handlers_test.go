@@ -135,6 +135,70 @@ func TestMountLeaseAcquireConflictRefreshAndRelease(t *testing.T) {
 	}
 }
 
+// A DIFFERENT enrollment acquiring while the incumbent's lease is still live gets a
+// distinct 409 lease_live carrying the incumbent's expiry, and succeeds only with an
+// explicit {"force": true} (issue #93). The incumbent keeps refreshing until then.
+func TestMountLeaseLiveTakeoverRequiresForce(t *testing.T) {
+	pool := httpOpenTestPool(t)
+	srv, svc := httpStartServer(t, pool)
+	cookie, _ := httpSeedAdmin(t, pool, svc)
+	userID := dashGetUserID(t, cookie, srv.URL)
+	asvc := dashAllocSvc(pool)
+	allocation, err := asvc.Allocate(context.Background(), userID, dashGiB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent1, fp1 := mountSeedAgent(t, pool, userID)
+	_, fp2 := mountSeedAgent(t, pool, userID)
+	mountBindAgentID(t, pool, allocation.ID)
+	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent1, allocations.LeaseTTL, false); err != nil {
+		t.Fatal(err)
+	}
+	url := srv.URL + "/api/allocations/" + uuidString(allocation.ID) + "/mount"
+
+	resp, err := http.Post(url, "application/json", mountBody(fp2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("live takeover without force status = %d body = %s (want 409)", resp.StatusCode, body)
+	}
+	var conflict struct {
+		Error          string `json:"error"`
+		LeaseExpiresAt string `json:"lease_expires_at"`
+		BoundAt        string `json:"bound_at"`
+	}
+	if err := json.Unmarshal(body, &conflict); err != nil {
+		t.Fatalf("decode 409 body %s: %v", body, err)
+	}
+	if conflict.Error != "lease_live" || conflict.LeaseExpiresAt == "" || conflict.BoundAt == "" {
+		t.Fatalf("409 body = %s (want error=lease_live with lease_expires_at and bound_at)", body)
+	}
+
+	// The incumbent still owns the lease.
+	refresh, err := http.Post(url+"/refresh", "application/json", mountBody(fp1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refresh.Body.Close()
+	if refresh.StatusCode != http.StatusOK {
+		t.Fatalf("incumbent refresh after refused takeover status = %d", refresh.StatusCode)
+	}
+
+	forced, _ := json.Marshal(map[string]any{"agent_fingerprint": fp2, "force": true})
+	resp, err = http.Post(url, "application/json", bytes.NewReader(forced))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("forced takeover status = %d body = %s", resp.StatusCode, body)
+	}
+}
+
 func TestMountLeaseExpiredLeaseCanMoveAgents(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	srv, svc := httpStartServer(t, pool)
@@ -150,7 +214,7 @@ func TestMountLeaseExpiredLeaseCanMoveAgents(t *testing.T) {
 	// A second enrollment of the owning user takes the lease over (the way a one-shot pod
 	// re-mounts with a fresh cert). The allocation must be agent-bound to be mountable.
 	mountBindAgentID(t, pool, allocation.ID)
-	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent1, 50*time.Millisecond); err != nil {
+	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent1, 50*time.Millisecond, false); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(80 * time.Millisecond)
@@ -182,7 +246,7 @@ func TestUnmountByOwnerClearsLease(t *testing.T) {
 	if _, err := asvc.Bind(context.Background(), alloc.ID, userID, agentID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := asvc.AcquireMountLease(context.Background(), alloc.ID, agentID, allocations.LeaseTTL); err != nil {
+	if _, err := asvc.AcquireMountLease(context.Background(), alloc.ID, agentID, allocations.LeaseTTL, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -302,7 +366,7 @@ func TestMountLeaseRefreshRevokedReturnsGone(t *testing.T) {
 	}
 	agent, fp := mountSeedAgent(t, pool, userID)
 	mountBindAgentID(t, pool, allocation.ID)
-	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent, allocations.LeaseTTL); err != nil {
+	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent, allocations.LeaseTTL, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := asvc.Revoke(context.Background(), allocation.ID, userID); err != nil {
