@@ -19,7 +19,14 @@ import (
 // docs/control-plane.md.
 const APIVersion = "1"
 
-const apiVersionHeader = "Orlop-API-Version"
+const (
+	apiVersionHeader = "Orlop-API-Version"
+
+	// DefaultHTTPTimeout bounds the total duration of requests made by clients
+	// returned from New. Callers can replace HTTPClient.HTTP when they need a
+	// different timeout or custom transport.
+	DefaultHTTPTimeout = 30 * time.Second
+)
 
 // APIVersionError reports that the control plane advertised a control API major
 // version this SDK was not built against. When you see it, the SDK and server
@@ -37,7 +44,8 @@ func (e *APIVersionError) Error() string {
 
 // HTTPClient talks to a running orlop control plane (orlop-control) over its
 // REST API. Construct it with New. The zero value is not usable; set HTTP to
-// override the default http.Client (e.g. for timeouts or a custom transport).
+// override the default http.Client (e.g. for a different timeout or custom
+// transport).
 type HTTPClient struct {
 	BaseURL string
 	Token   string
@@ -48,16 +56,20 @@ var _ Client = (*HTTPClient)(nil)
 
 // New returns a client for the given orlop-control base URL and service bearer
 // token. The token authorizes control-plane operations and is never exposed to
-// agents.
+// agents. Requests are bounded by DefaultHTTPTimeout unless HTTP is replaced.
 func New(baseURL, token string) *HTTPClient {
-	return &HTTPClient{BaseURL: baseURL, Token: token, HTTP: http.DefaultClient}
+	return &HTTPClient{
+		BaseURL: baseURL,
+		Token:   token,
+		HTTP:    &http.Client{Timeout: DefaultHTTPTimeout},
+	}
 }
 
 func (c *HTTPClient) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
-	return http.DefaultClient
+	return &http.Client{Timeout: DefaultHTTPTimeout}
 }
 
 func (c *HTTPClient) do(ctx context.Context, op, method, path string, body, out any) error {
