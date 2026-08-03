@@ -21,6 +21,8 @@ func TestClassifyArgs(t *testing.T) {
 		{"server subcommand", []string{"server", "register"}, actionSubcommand, "server"},
 		{"token subcommand", []string{"token", "issue"}, actionSubcommand, "token"},
 		{"ca subcommand", []string{"ca"}, actionSubcommand, "ca"},
+		{"mount lease TTL flag starts server", []string{"--mount-lease-ttl=20s"}, actionRunServer, ""},
+		{"mount lease TTL split flag starts server", []string{"--mount-lease-ttl", "20s"}, actionRunServer, ""},
 		{"unknown flag does not start server", []string{"--port=9090"}, actionUnknown, "--port=9090"},
 		{"unknown verb", []string{"bogus"}, actionUnknown, "bogus"},
 		{"bare dash", []string{"-"}, actionUnknown, "-"},

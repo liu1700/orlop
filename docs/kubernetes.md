@@ -96,6 +96,7 @@ derives each from a single source, so they cannot drift:
 |---|---|
 | `PORT` | `control.port` (`8080`) |
 | `ORLOP_MOUNT_PREFIX` | `control.mountPrefix` (`/mnt/orlop`) |
+| `ORLOP_MOUNT_LEASE_TTL` | `control.mountLeaseTTL` (`60s`) |
 | `DATABASE_URL` | Secret `database-url` |
 | `ORLOP_SECRETS_BACKEND` | `postgres` |
 | `ORLOP_SECRETS_ENC_KEY` | Secret `secrets-enc-key` (the chart requires it for the in-Postgres CA backend) |

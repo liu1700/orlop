@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +33,11 @@ import (
 )
 
 const shutdownTimeout = 10 * time.Second
+
+// A shorter lease leaves too little room for the client's one-second minimum
+// refresh interval, a retry, and network transit. Service-level tests may
+// still exercise smaller TTLs by calling the allocations package directly.
+const minimumMountLeaseTTL = 4 * time.Second
 
 type config struct {
 	Addr        string
@@ -77,6 +83,10 @@ type config struct {
 	// APITokenTTL, when > 0, sets an expiry on newly minted orlop_ API tokens.
 	// 0 (default) means tokens never expire. ORLOP_API_TOKEN_TTL (e.g. "2160h").
 	APITokenTTL time.Duration
+	// MountLeaseTTL is the server-owned liveness window for a mounted client.
+	// It is a renewable heartbeat lease, not a credential lifetime.
+	// ORLOP_MOUNT_LEASE_TTL or --mount-lease-ttl; default 60s.
+	MountLeaseTTL time.Duration
 
 	// Mode B host-identity verifier (docs/design-identity.md §3). When
 	// IdentityAudience is set, orlop-control verifies a host-issued signed JWT
@@ -100,7 +110,7 @@ type config struct {
 	CAAllowDynamicTenants bool
 }
 
-func loadConfig() (config, error) {
+func loadConfig(args ...string) (config, error) {
 	port := getenv("PORT", "8080")
 	metricsAddr := ":9090"
 	if value, ok := os.LookupEnv("ORLOP_METRICS_ADDR"); ok {
@@ -126,7 +136,11 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	return config{
+	mountLeaseTTL, err := parseDurationEnv("ORLOP_MOUNT_LEASE_TTL", allocations.DefaultMountLeaseTTL)
+	if err != nil {
+		return config{}, err
+	}
+	cfg := config{
 		Addr:                  ":" + port,
 		MetricsAddr:           metricsAddr,
 		DatabaseURL:           os.Getenv("DATABASE_URL"),
@@ -143,6 +157,7 @@ func loadConfig() (config, error) {
 		ServerCertFQDN:        getenv(envKeyWithLegacy("ORLOP_SERVER_FQDN", "ORLOP_DATAGW_SERVER_FQDN"), defaultServerCertFQDN),
 		ServerCertTTL:         serverCertTTL,
 		APITokenTTL:           apiTokenTTL,
+		MountLeaseTTL:         mountLeaseTTL,
 
 		IdentityIssuer:          os.Getenv("ORLOP_IDENTITY_ISSUER"),
 		IdentityAudience:        os.Getenv("ORLOP_IDENTITY_AUDIENCE"),
@@ -152,7 +167,26 @@ func loadConfig() (config, error) {
 
 		CATenantAllowlist:     os.Getenv("ORLOP_CA_TENANT_ALLOWLIST"),
 		CAAllowDynamicTenants: allowDynamicTenants,
-	}, nil
+	}
+
+	// Command-line flags override environment values, following the same
+	// precedence as the existing subcommand flags. Keep the service flag set
+	// intentionally small: classifyArgs still rejects every unknown leading
+	// flag instead of accidentally booting a server after a typo.
+	fs := flag.NewFlagSet("orlop-control", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.DurationVar(&cfg.MountLeaseTTL, "mount-lease-ttl", cfg.MountLeaseTTL,
+		"mount lease lifetime (overrides ORLOP_MOUNT_LEASE_TTL)")
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+	if fs.NArg() != 0 {
+		return config{}, fmt.Errorf("unexpected server argument %q", fs.Arg(0))
+	}
+	if cfg.MountLeaseTTL < minimumMountLeaseTTL {
+		return config{}, fmt.Errorf("mount lease TTL must be at least %s", minimumMountLeaseTTL)
+	}
+	return cfg, nil
 }
 
 // parseBoolEnv parses a boolean env var. An unset/blank value yields fallback;
@@ -309,6 +343,11 @@ func classifyArgs(args []string) (cliAction, string) {
 	case "help", "-help", "--help", "-h":
 		return actionHelp, ""
 	}
+	if args[0] == "-mount-lease-ttl" || args[0] == "--mount-lease-ttl" ||
+		strings.HasPrefix(args[0], "-mount-lease-ttl=") ||
+		strings.HasPrefix(args[0], "--mount-lease-ttl=") {
+		return actionRunServer, ""
+	}
 	if _, ok := subcommands[args[0]]; ok {
 		return actionSubcommand, args[0]
 	}
@@ -319,7 +358,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprint(w, `orlop-control — Orlop control plane
 
 Usage:
-  orlop-control                start the control-plane server (configured via env: PORT, DATABASE_URL, ORLOP_*)
+  orlop-control [--mount-lease-ttl duration]
+                               start the control-plane server (env: PORT, DATABASE_URL, ORLOP_*)
   orlop-control server ...     manage the data-plane server pool (e.g. "server register")
   orlop-control token ...      mint and manage enroll / API tokens
   orlop-control user ...       manage users
@@ -361,7 +401,7 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	cfg, err := loadConfig()
+	cfg, err := loadConfig(os.Args[1:]...)
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
@@ -534,6 +574,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	logger.Info("starting orlop-control",
 		"addr", cfg.Addr,
 		"metrics_addr", cfg.MetricsAddr,
+		"mount_lease_ttl", cfg.MountLeaseTTL.String(),
 		"database_url_configured", cfg.DatabaseURL != "",
 		"device_flow_enabled", deps.devAuth != nil,
 		"dashboard_enabled", deps.devAuth != nil && deps.store != nil && deps.allocations != nil,
@@ -570,6 +611,9 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	if deps.metrics == nil {
 		deps.metrics = newControlMetrics()
 	}
+	if cfg.MountLeaseTTL <= 0 {
+		cfg.MountLeaseTTL = allocations.DefaultMountLeaseTTL
+	}
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(middleware.RealIP)
@@ -584,8 +628,8 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 		mountAdminSession(router, newDevAuthHandlers(logger, deps.devAuth, deps.cookieDomain))
 	}
 	if deps.devAuth != nil && deps.store != nil && deps.allocations != nil {
-		mountDashboard(router, newDashboardHandlers(logger, deps.devAuth, deps.store, deps.allocations, deps.serverUsage, deps.mountLeaseFencer))
-		mountLeaseRoutes(router, newMountLeaseHandlers(logger, deps.allocations, deps.store, deps.devAuth, deps.mountLeaseFencer))
+		mountDashboard(router, newDashboardHandlers(logger, deps.devAuth, deps.store, deps.allocations, deps.serverUsage, deps.mountLeaseFencer, cfg.MountLeaseTTL))
+		mountLeaseRoutes(router, newMountLeaseHandlers(logger, deps.allocations, deps.store, deps.devAuth, deps.mountLeaseFencer, cfg.MountLeaseTTL))
 	}
 	if deps.devAuth != nil && deps.store != nil {
 		mountAPITokens(router, newAPITokenHandlers(logger, deps.devAuth, deps.store, cfg.APITokenTTL))

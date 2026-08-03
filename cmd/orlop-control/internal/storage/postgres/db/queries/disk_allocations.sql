@@ -96,6 +96,11 @@ UPDATE disk_allocations
 RETURNING *;
 
 -- name: RefreshMountLease :one
+-- Expiry remains a hard boundary (issue #95): after it, the holder must go
+-- through AcquireMountLease so renewal follows the same takeover rules as any
+-- other claimant. Matching bound_agent_id only proves that no takeover has
+-- committed yet; without the expiry guard, a stale refresh can win a race
+-- against a waiter and resurrect ownership after its promised deadline.
 UPDATE disk_allocations
    SET lease_expires_at = now() + sqlc.arg(ttl)::interval
  WHERE id = $1

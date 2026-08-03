@@ -33,7 +33,7 @@ func TestForceReleaseMountLeaseClearsActiveLease(t *testing.T) {
 	if _, err := svc.Bind(ctx, alloc.ID, user.ID, agent); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcquireMountLease(ctx, alloc.ID, agent, allocations.LeaseTTL, false); err != nil {
+	if _, err := svc.AcquireMountLease(ctx, alloc.ID, agent, allocations.DefaultMountLeaseTTL, false); err != nil {
 		t.Fatal(err)
 	}
 

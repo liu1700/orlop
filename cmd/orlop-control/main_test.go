@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 )
 
 func TestHealthz(t *testing.T) {
@@ -59,6 +61,37 @@ func TestLoadConfigInitialGrant(t *testing.T) {
 	t.Setenv("ORLOP_INITIAL_GRANT_BYTES", "2147483648") // 2 GiB
 	if cfg := mustLoadConfig(t); cfg.InitialGrantBytes != 2<<30 {
 		t.Errorf("initial grant = %d, want %d", cfg.InitialGrantBytes, int64(2<<30))
+	}
+}
+
+func TestLoadConfigMountLeaseTTL(t *testing.T) {
+	if cfg := mustLoadConfig(t); cfg.MountLeaseTTL != allocations.DefaultMountLeaseTTL {
+		t.Fatalf("default mount lease TTL = %s, want %s", cfg.MountLeaseTTL, allocations.DefaultMountLeaseTTL)
+	}
+
+	t.Setenv("ORLOP_MOUNT_LEASE_TTL", "20s")
+	cfg := mustLoadConfig(t)
+	if cfg.MountLeaseTTL != 20*time.Second {
+		t.Fatalf("env mount lease TTL = %s, want 20s", cfg.MountLeaseTTL)
+	}
+
+	cfg, err := loadConfig("--mount-lease-ttl=45s")
+	if err != nil {
+		t.Fatalf("flag override: %v", err)
+	}
+	if cfg.MountLeaseTTL != 45*time.Second {
+		t.Fatalf("flag mount lease TTL = %s, want 45s", cfg.MountLeaseTTL)
+	}
+}
+
+func TestLoadConfigRejectsUnsafeMountLeaseTTL(t *testing.T) {
+	for _, value := range []string{"0s", "3s", "not-a-duration"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("ORLOP_MOUNT_LEASE_TTL", value)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("ORLOP_MOUNT_LEASE_TTL=%q should fail configuration", value)
+			}
+		})
 	}
 }
 

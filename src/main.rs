@@ -955,6 +955,11 @@ struct MountLeaseManager {
     release_on_drop: bool,
 }
 
+// Avoid a hot loop when an expiry is very close (or the client clock is ahead
+// of the control plane). The server rejects unsafe TTLs that do not leave
+// several of these intervals for refresh and retry.
+const MIN_MOUNT_LEASE_REFRESH_WAIT: Duration = Duration::from_secs(1);
+
 impl MountLeaseManager {
     fn acquire(
         control_plane_url: String,
@@ -1006,7 +1011,14 @@ impl MountLeaseManager {
         let revoked = Arc::new(AtomicBool::new(false));
         let thread_revoked = revoked.clone();
         let handle = thread::spawn(move || {
-            mount_lease_refresh_loop(&rx, thread_client, mountpoint, thread_revoked, on_eviction);
+            mount_lease_refresh_loop(
+                &rx,
+                thread_client,
+                mountpoint,
+                thread_revoked,
+                on_eviction,
+                lease.expires_at,
+            );
         });
         Ok(Self {
             client,
@@ -1155,7 +1167,7 @@ fn classify_lease_error(status: StatusCode, body: &str, op: &str) -> anyhow::Err
     // 401 invalid_client on /mount/refresh means the allocation row or
     // agent enrollment is gone — not transient. Mapping it onto the
     // existing "lease lost" terminal path makes the refresh loop exit and
-    // unmount instead of polling every 30s forever (staging hit this with
+    // unmount instead of polling forever (staging hit this with
     // 119 401s/hour against a deleted allocation).
     if status == StatusCode::UNAUTHORIZED && body.contains("invalid_client") {
         return anyhow::anyhow!("mount lease lost");
@@ -1169,17 +1181,18 @@ fn mount_lease_refresh_loop(
     mountpoint: PathBuf,
     revoked: Arc<AtomicBool>,
     on_eviction: EvictionAction,
+    mut expires_at: chrono::DateTime<chrono::Utc>,
 ) {
     loop {
-        if stop.recv_timeout(Duration::from_secs(30)).is_ok() {
-            return;
+        let wait = mount_lease_refresh_wait(expires_at, chrono::Utc::now());
+        match stop.recv_timeout(wait) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         match client.refresh() {
             Ok(lease) => {
-                eprintln!(
-                    "refreshed mount lease until {}",
-                    lease.expires_at.to_rfc3339()
-                );
+                expires_at = lease.expires_at;
+                eprintln!("refreshed mount lease until {}", expires_at.to_rfc3339());
             }
             Err(err) => {
                 let msg = err.to_string();
@@ -1226,6 +1239,19 @@ fn mount_lease_refresh_loop(
             }
         }
     }
+}
+
+/// Schedule at half the remaining server-authoritative lease window. Reusing
+/// expires_at from every response removes the unsafe shared 60s/30s constants:
+/// a control plane configured with a shorter or longer TTL automatically moves
+/// the client cadence with it. Near/past expiry, retry no faster than once per
+/// second rather than spinning.
+fn mount_lease_refresh_wait(
+    expires_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    let remaining = (expires_at - now).to_std().unwrap_or(Duration::ZERO);
+    std::cmp::max(remaining / 2, MIN_MOUNT_LEASE_REFRESH_WAIT)
 }
 
 impl CertManager {
@@ -2327,7 +2353,10 @@ mod lease_error_classification {
         assert!(msg.contains("--takeover"), "msg = {msg}");
         // Must not match a refresh-terminal substring: lease_live is an
         // acquire-time refusal, not a reason to tear a running mount down.
-        assert!(!msg.contains("already mounted by another agent"), "msg = {msg}");
+        assert!(
+            !msg.contains("already mounted by another agent"),
+            "msg = {msg}"
+        );
     }
 
     #[test]
@@ -2367,6 +2396,41 @@ mod lease_error_classification {
                 "transient {msg:?} accidentally classified as terminal ({terminal})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mount_lease_refresh_timing {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(second: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 8, 2, 12, 0, second)
+            .unwrap()
+    }
+
+    #[test]
+    fn uses_half_of_each_authoritative_window() {
+        let now = at(0);
+        assert_eq!(
+            mount_lease_refresh_wait(at(20), now),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            mount_lease_refresh_wait(at(40), now),
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn floors_near_or_past_expiry_at_one_second() {
+        let now = at(10);
+        assert_eq!(
+            mount_lease_refresh_wait(at(11), now),
+            Duration::from_secs(1)
+        );
+        assert_eq!(mount_lease_refresh_wait(at(9), now), Duration::from_secs(1));
     }
 }
 

@@ -111,7 +111,8 @@ func (s *Service) classifyLeaseMiss(ctx context.Context, allocationID, agentID p
 
 // RefreshMountLease extends the lease for the agent that already holds it.
 // Returns ErrLeaseLost if the lease has already expired (caller must call
-// AcquireMountLease again), ErrWrongAgent if a different agent holds the
+// AcquireMountLease again, preserving expiry as the takeover serialization
+// boundary), ErrWrongAgent if a different agent holds the
 // binding, ErrRevoked if the allocation was revoked, or ErrNotFound if the
 // allocation id is unknown.
 func (s *Service) RefreshMountLease(ctx context.Context, allocationID, agentID pgtype.UUID, ttl time.Duration) (Allocation, error) {

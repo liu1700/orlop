@@ -52,6 +52,9 @@ database:
 control:
   replicas: 1
   port: 8080
+  # Renewable mount heartbeat window. This is not a token or certificate TTL;
+  # clients refresh automatically at half the server-returned remaining time.
+  mountLeaseTTL: 60s
   # Agent-visible path prefix returned as entity virtual_path.
   mountPrefix: /mnt/orlop
   # Metrics are served on a separate listener so they do not share the

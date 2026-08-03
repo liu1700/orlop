@@ -164,6 +164,10 @@ func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentI
 
 func (s *Store) RefreshMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (storage.Allocation, error) {
 	now := time.Now()
+	// Expiry is a hard boundary (issue #95): a late holder must re-acquire so
+	// it follows the same takeover rules as every other claimant. Without the
+	// expiry guard a stale refresh can beat a waiter and resurrect ownership
+	// after its promised deadline.
 	return scanAllocation(s.db.QueryRowContext(ctx,
 		`UPDATE disk_allocations SET lease_expires_at = ?
 		  WHERE id = ? AND bound_agent_id = ? AND revoked_at IS NULL

@@ -28,7 +28,7 @@ type tenantUsageClient interface {
 // allocation so the displaced agent's writes start failing immediately. nil
 // implementations are tolerated (no fence call), which keeps the dashboard
 // usable on dev setups without a serverapi client — at the cost of preserving
-// the ~30 s data-correctness window from #175.
+// the data-correctness window until the client's next lease refresh from #175.
 type mountLeaseFencer interface {
 	FenceAllocation(ctx context.Context, tenantID, allocationID string) error
 }
@@ -48,16 +48,17 @@ type dashboardStore interface {
 // reads. All routes are gated on the admin-session cookie set by the
 // device-flow login.
 type dashboardHandlers struct {
-	logger  *slog.Logger
-	devAuth *devauth.Service
-	store   dashboardStore
-	alloc   *allocations.Service
-	usage   tenantUsageClient // nil when the server admin client is not configured (no SecretsDir)
-	fencer  mountLeaseFencer  // nil when no serverapi client; revoke skips the fence call
+	logger   *slog.Logger
+	devAuth  *devauth.Service
+	store    dashboardStore
+	alloc    *allocations.Service
+	usage    tenantUsageClient // nil when the server admin client is not configured (no SecretsDir)
+	fencer   mountLeaseFencer  // nil when no serverapi client; revoke skips the fence call
+	leaseTTL time.Duration
 }
 
-func newDashboardHandlers(logger *slog.Logger, svc *devauth.Service, store dashboardStore, alloc *allocations.Service, usage tenantUsageClient, fencer mountLeaseFencer) *dashboardHandlers {
-	return &dashboardHandlers{logger: logger, devAuth: svc, store: store, alloc: alloc, usage: usage, fencer: fencer}
+func newDashboardHandlers(logger *slog.Logger, svc *devauth.Service, store dashboardStore, alloc *allocations.Service, usage tenantUsageClient, fencer mountLeaseFencer, leaseTTL time.Duration) *dashboardHandlers {
+	return &dashboardHandlers{logger: logger, devAuth: svc, store: store, alloc: alloc, usage: usage, fencer: fencer, leaseTTL: leaseTTL}
 }
 
 var _ dashboardStore = (*postgres.Store)(nil)
@@ -132,9 +133,9 @@ func (h *dashboardHandlers) handleListAllocations(w http.ResponseWriter, r *http
 	// Mounted = bound AND lease refreshed recently enough that the agent is
 	// still alive. Without the horizon a freshly-dead client (lease acquired
 	// but process crashed) would show Mounted until the full TTL elapses.
-	// Horizon = now + TTL/2 (30 s with the current 60 s TTL), matching the
-	// agent's refresh cadence.
-	mountedHorizon := now.Add(allocations.LeaseTTL / 2)
+	// Horizon = now + TTL/2, matching the agent's server-directed refresh
+	// cadence for any configured mount-lease TTL.
+	mountedHorizon := now.Add(h.leaseTTL / 2)
 	for _, a := range rows {
 		dto := allocationDTO{
 			ID:          uuidString(a.ID),
