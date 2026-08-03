@@ -118,7 +118,7 @@ func TestDashboardListAllocationsShape(t *testing.T) {
 	if _, err := asvc.Bind(context.Background(), mounted.ID, userID, agentID); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
-	if _, err := asvc.AcquireMountLease(context.Background(), mounted.ID, agentID, allocations.LeaseTTL, false); err != nil {
+	if _, err := asvc.AcquireMountLease(context.Background(), mounted.ID, agentID, allocations.DefaultMountLeaseTTL, false); err != nil {
 		t.Fatalf("acquire lease: %v", err)
 	}
 
@@ -336,7 +336,7 @@ type testAllocationDTO struct {
 
 // dashboardResponseForLease returns an HTTP response for GET /api/allocations
 // where the single allocation is bound + has a lease whose expiry is set to
-// leaseExpiresAt via a direct SQL UPDATE (bypassing LeaseTTL).
+// leaseExpiresAt via a direct SQL UPDATE (bypassing the configured lease TTL).
 func dashboardResponseForLease(t *testing.T, leaseExpiresAt time.Time) *http.Response {
 	t.Helper()
 	pool := httpOpenTestPool(t)
@@ -355,7 +355,7 @@ func dashboardResponseForLease(t *testing.T, leaseExpiresAt time.Time) *http.Res
 	}
 	// Acquire a real lease first (satisfies the DB constraint), then overwrite
 	// lease_expires_at with the exact time we need to test the threshold.
-	if _, err := asvc.AcquireMountLease(context.Background(), a.ID, agentID, allocations.LeaseTTL, false); err != nil {
+	if _, err := asvc.AcquireMountLease(context.Background(), a.ID, agentID, allocations.DefaultMountLeaseTTL, false); err != nil {
 		t.Fatalf("acquire lease: %v", err)
 	}
 	if _, err := pool.Exec(context.Background(),

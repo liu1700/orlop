@@ -151,7 +151,7 @@ func TestMountLeaseLiveTakeoverRequiresForce(t *testing.T) {
 	agent1, fp1 := mountSeedAgent(t, pool, userID)
 	_, fp2 := mountSeedAgent(t, pool, userID)
 	mountBindAgentID(t, pool, allocation.ID)
-	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent1, allocations.LeaseTTL, false); err != nil {
+	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent1, allocations.DefaultMountLeaseTTL, false); err != nil {
 		t.Fatal(err)
 	}
 	url := srv.URL + "/api/allocations/" + uuidString(allocation.ID) + "/mount"
@@ -246,7 +246,7 @@ func TestUnmountByOwnerClearsLease(t *testing.T) {
 	if _, err := asvc.Bind(context.Background(), alloc.ID, userID, agentID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := asvc.AcquireMountLease(context.Background(), alloc.ID, agentID, allocations.LeaseTTL, false); err != nil {
+	if _, err := asvc.AcquireMountLease(context.Background(), alloc.ID, agentID, allocations.DefaultMountLeaseTTL, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -366,7 +366,7 @@ func TestMountLeaseRefreshRevokedReturnsGone(t *testing.T) {
 	}
 	agent, fp := mountSeedAgent(t, pool, userID)
 	mountBindAgentID(t, pool, allocation.ID)
-	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent, allocations.LeaseTTL, false); err != nil {
+	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent, allocations.DefaultMountLeaseTTL, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := asvc.Revoke(context.Background(), allocation.ID, userID); err != nil {

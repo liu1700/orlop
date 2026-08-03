@@ -276,6 +276,7 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 | `ORLOP_COOKIE_DOMAIN` | Domain for the admin session cookie. |
 | `ORLOP_CONTROL_PLANE_TOKEN` | Shared service token gating the `/v1/entities`, `/v1/admin`, `/v1/tenants`, and `/control/sign-server-cert` routes. Empty ⇒ those routes reject every request (fail closed). |
 | `ORLOP_API_TOKEN_TTL` | Expiry for newly minted `orlop_…` API tokens (e.g. `2160h`). `0` (default) ⇒ never expire. |
+| `ORLOP_MOUNT_LEASE_TTL` | Renewable mount-liveness window. Default `60s`; minimum `4s`. This is not a token or key lifetime: a healthy client refreshes automatically at half the remaining `expires_at` window returned by the server. `--mount-lease-ttl` overrides the environment value. Increase it to tolerate longer control-plane outages; decrease it so a crashed client's leaked lease becomes claimable sooner. |
 | `ORLOP_INITIAL_GRANT_BYTES` | Disk granted at provision when the request specifies no explicit size. Default 1 GiB. |
 | `ORLOP_MOUNT_PREFIX` | Agent-visible prefix used to compute entity `virtual_path` values. Must be an absolute POSIX path. Default `/mnt/orlop`; an entity for agent `<id>` reports `<prefix>/agents/<id>`. |
 | `ORLOP_SERVER_FQDN` | The only name `POST /control/sign-server-cert` will issue a server cert for. Default `orlop-server`. |
@@ -293,6 +294,18 @@ A well-signed token whose tenant is not on the allowlist returns `403`
 fails boot rather than silently falling back: a typo on a security toggle must
 not quietly leave the permissive default in force. Set it to `false` to restrict
 bootstrap to `ORLOP_CA_TENANT_ALLOWLIST` only.
+
+Mount leases, credentials, and keys have separate lifecycles. The mount lease
+above is a continuously renewed liveness heartbeat. Agent enroll tokens last
+about 10 minutes and are single-use; agent mTLS leaf certificates last one hour,
+and the mount client renews them before expiry. `orlop_…` API tokens do not
+expire by default unless `ORLOP_API_TOKEN_TTL` is configured. A client cannot
+extend the server's mount-lease policy, but it automatically follows whichever
+TTL the server returns.
+
+For a rolling upgrade, update all mount clients before setting the TTL at or
+below 30 seconds. Older clients use a fixed 30-second refresh interval; the
+default 60-second server TTL remains backward-compatible while clients roll.
 
 The datagateway-era names `ORLOP_DATAGW_SERVER_FQDN`, `ORLOP_DATAGW_SERVER_CERT_TTL`,
 `ORLOP_DATAGW_SERVICE_TOKEN`, `ORLOP_DATAGW_MAX_SESSIONS`, and

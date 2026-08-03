@@ -23,9 +23,11 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
 
-// LeaseTTL is the server-side mount-lease window. The agent (#62) refreshes
-// at half this interval. Hardcoded to keep moving parts to a minimum.
-const LeaseTTL = 60 * time.Second
+// DefaultMountLeaseTTL is the default server-side mount-lease window. The
+// running control plane may override it; clients derive their refresh cadence
+// from the authoritative expires_at returned by acquire/refresh, so there is
+// no matching client-side constant to keep in sync (issue #95).
+const DefaultMountLeaseTTL = 60 * time.Second
 
 // Sentinel errors. Callers map these to HTTP status codes; raw text never
 // leaks to clients.

@@ -31,15 +31,16 @@ type mountLeaseStore interface {
 }
 
 type mountLeaseHandlers struct {
-	logger  *slog.Logger
-	alloc   *allocations.Service
-	store   mountLeaseStore
-	devAuth *devauth.Service
-	fencer  mountLeaseFencer
+	logger   *slog.Logger
+	alloc    *allocations.Service
+	store    mountLeaseStore
+	devAuth  *devauth.Service
+	fencer   mountLeaseFencer
+	leaseTTL time.Duration
 }
 
-func newMountLeaseHandlers(logger *slog.Logger, alloc *allocations.Service, store mountLeaseStore, dev *devauth.Service, fencer mountLeaseFencer) *mountLeaseHandlers {
-	return &mountLeaseHandlers{logger: logger, alloc: alloc, store: store, devAuth: dev, fencer: fencer}
+func newMountLeaseHandlers(logger *slog.Logger, alloc *allocations.Service, store mountLeaseStore, dev *devauth.Service, fencer mountLeaseFencer, leaseTTL time.Duration) *mountLeaseHandlers {
+	return &mountLeaseHandlers{logger: logger, alloc: alloc, store: store, devAuth: dev, fencer: fencer, leaseTTL: leaseTTL}
 }
 
 var _ mountLeaseStore = (*postgres.Store)(nil)
@@ -67,7 +68,7 @@ func (h *mountLeaseHandlers) handleAcquireMount(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	a, err := h.alloc.AcquireMountLease(r.Context(), allocID, agentID, allocations.LeaseTTL, force)
+	a, err := h.alloc.AcquireMountLease(r.Context(), allocID, agentID, h.leaseTTL, force)
 	if err != nil {
 		h.writeLeaseError(w, r, "acquire", allocID, agentID, err)
 		return
@@ -81,7 +82,7 @@ func (h *mountLeaseHandlers) handleAcquireMount(w http.ResponseWriter, r *http.R
 	fenceAllocationBestEffort(r.Context(), h.logger, h.store, h.fencer, allocID, "acquire")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"lease_id":   uuidString(a.ID),
-		"expires_at": a.LeaseExpiresAt.UTC().Format(time.RFC3339),
+		"expires_at": a.LeaseExpiresAt.UTC().Format(time.RFC3339Nano),
 	})
 }
 
@@ -90,13 +91,13 @@ func (h *mountLeaseHandlers) handleRefreshMount(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	a, err := h.alloc.RefreshMountLease(r.Context(), allocID, agentID, allocations.LeaseTTL)
+	a, err := h.alloc.RefreshMountLease(r.Context(), allocID, agentID, h.leaseTTL)
 	if err != nil {
 		h.writeLeaseError(w, r, "refresh", allocID, agentID, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"expires_at": a.LeaseExpiresAt.UTC().Format(time.RFC3339),
+		"expires_at": a.LeaseExpiresAt.UTC().Format(time.RFC3339Nano),
 	})
 }
 
