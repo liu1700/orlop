@@ -39,6 +39,10 @@ type Querier interface {
 	// to decide between a per-agent subtree purge (other agents share the tenant
 	// dir) and a whole-tenant unregister (this was the last one).
 	CountActiveAllocationsForUser(ctx context.Context, userID pgtype.UUID) (int64, error)
+	// Count every revoked allocation that has not completed the durable purge
+	// transition. This intentionally mirrors the allocator invariant rather than
+	// the sweeper's current batch eligibility filters.
+	CountPurgePendingAllocations(ctx context.Context) (int64, error)
 	CreateAPIToken(ctx context.Context, arg CreateAPITokenParams) (CreateAPITokenRow, error)
 	CreateAccessToken(ctx context.Context, arg CreateAccessTokenParams) (AccessToken, error)
 	CreateAgentEnrollment(ctx context.Context, arg CreateAgentEnrollmentParams) (AgentEnrollment, error)
@@ -91,6 +95,10 @@ type Querier interface {
 	// tenant (never enrolled, ops_addr NULL) has no server-side data and is
 	// marked purged without a data-plane call.
 	ListPurgePendingAllocations(ctx context.Context, limit int32) ([]ListPurgePendingAllocationsRow, error)
+	// Small projection used by the Prometheus collector. Keep the stable database
+	// id as the only label; addresses and status may change and would create stale
+	// time series.
+	ListServerPoolCapacity(ctx context.Context) ([]ListServerPoolCapacityRow, error)
 	// CAS-claim the purge of a revoked allocation: only one caller transitions
 	// purged_at from NULL, so exactly one releases the pool reservation. Fails
 	// (zero rows) when the allocation is not revoked yet or already purged.
@@ -108,6 +116,11 @@ type Querier interface {
 	// buffer returns to 'available'. Operator-set 'unavailable' servers are left
 	// untouched.
 	ReconcileServerStatus(ctx context.Context, bufferFraction float64) error
+	// Expiry remains a hard boundary (issue #95): after it, the holder must go
+	// through AcquireMountLease so renewal follows the same takeover rules as any
+	// other claimant. Matching bound_agent_id only proves that no takeover has
+	// committed yet; without the expiry guard, a stale refresh can win a race
+	// against a waiter and resurrect ownership after its promised deadline.
 	RefreshMountLease(ctx context.Context, arg RefreshMountLeaseParams) (DiskAllocation, error)
 	ReleaseCapacity(ctx context.Context, arg ReleaseCapacityParams) (ServerPool, error)
 	ReleaseMountLease(ctx context.Context, arg ReleaseMountLeaseParams) (DiskAllocation, error)

@@ -611,6 +611,9 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	if deps.metrics == nil {
 		deps.metrics = newControlMetrics()
 	}
+	if deps.store != nil {
+		deps.metrics.setCapacityStore(deps.store)
+	}
 	if cfg.MountLeaseTTL <= 0 {
 		cfg.MountLeaseTTL = allocations.DefaultMountLeaseTTL
 	}

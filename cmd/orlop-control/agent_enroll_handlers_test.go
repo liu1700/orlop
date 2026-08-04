@@ -283,6 +283,53 @@ func TestAgentEnrollReturns503WhenServerVMInactive(t *testing.T) {
 	}
 }
 
+func TestAgentEnrollReportsPoolExhaustionAsNoCapacity(t *testing.T) {
+	pool := httpOpenTestPool(t)
+	q := sqlcdb.New(pool)
+	ctx := context.Background()
+	const tenantID = "acme-full"
+	if _, err := q.CreateTenant(ctx, sqlcdb.CreateTenantParams{ID: tenantID, Name: "Acme Full"}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := q.CreateUser(ctx, sqlcdb.CreateUserParams{Email: "full@example.com", TenantID: tenantID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocation := seedAgentAllocation(t, q, user.ID, tenantID, "agent-acme-full")
+	const token = "no-capacity-token"
+	if _, err := q.CreateAccessToken(ctx, sqlcdb.CreateAccessTokenParams{
+		TokenHash:    sha256Hex(token),
+		Purpose:      devauth.PurposeAgentEnroll,
+		UserID:       user.ID,
+		TenantID:     tenantID,
+		ExpiresAt:    pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+		AllocationID: allocation.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No server_pool row exists, so the initial placement is capacity-bound.
+	srv := startEnrollServer(t, pool, newEnrollCA(t, tenantID), nil)
+	resp := postEnroll(t, srv.URL, token)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 503; body = %s", resp.StatusCode, body)
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error != "no_capacity" {
+		t.Fatalf("error = %q, want no_capacity", body.Error)
+	}
+	if got := resp.Header.Get("Retry-After"); got == "" {
+		t.Fatal("Retry-After header missing")
+	}
+}
+
 func TestAgentEnrollRateLimit(t *testing.T) {
 	pool := httpOpenTestPool(t)
 	q := sqlcdb.New(pool)
