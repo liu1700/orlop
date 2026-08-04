@@ -169,3 +169,10 @@ LIMIT $1;
 -- dir) and a whole-tenant unregister (this was the last one).
 SELECT count(*) FROM disk_allocations
 WHERE user_id = $1 AND revoked_at IS NULL;
+
+-- name: CountPurgePendingAllocations :one
+-- Count every revoked allocation that has not completed the durable purge
+-- transition. This intentionally mirrors the allocator invariant rather than
+-- the sweeper's current batch eligibility filters.
+SELECT count(*) FROM disk_allocations
+WHERE revoked_at IS NOT NULL AND purged_at IS NULL;

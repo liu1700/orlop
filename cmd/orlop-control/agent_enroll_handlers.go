@@ -158,7 +158,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 		vm, vmErr := h.store.GetServerVMByTenant(r.Context(), ident.TenantID)
 		if vmErr == nil {
 			if vm.Status != serverStatusActive {
-				writeRetryableEnrollError(w, "server_vm_unavailable")
+				writeRetryableEnrollError(w, r, "server_vm_unavailable")
 				return
 			}
 			serverAddr = vm.DataAddr
@@ -168,7 +168,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 			return
 		} else if allocation == nil {
 			// No existing placement and no allocation — cannot place, keep prior 503 behaviour.
-			writeRetryableEnrollError(w, "server_vm_unavailable")
+			writeRetryableEnrollError(w, r, "server_vm_unavailable")
 			return
 		} else {
 			// The tenant nests under its account's owner tenant (u_<owner>), and the
@@ -178,7 +178,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 			placed, placementErr := h.allocations.Reserve(r.Context(), h.serverAPI, ident.TenantID, ownerTenant, tenant.Name, allocation.SizeBytes)
 			if errors.Is(placementErr, allocations.ErrNoCapacity) {
 				h.logger.Info("agent_enroll_no_capacity", "tenant_id", ident.TenantID)
-				writeRetryableEnrollError(w, "server_vm_unavailable")
+				writeRetryableEnrollError(w, r, "no_capacity")
 				return
 			}
 			if placementErr != nil {
@@ -205,7 +205,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			h.logger.Error("agent_ca_bootstrap_failed", "error", err, "tenant_id", ident.TenantID)
-			writeRetryableEnrollError(w, "tenant_ca_unavailable")
+			writeRetryableEnrollError(w, r, "tenant_ca_unavailable")
 			return
 		}
 		h.logger.Info("agent_ca_bootstrapped", "tenant_id", ident.TenantID)
@@ -226,7 +226,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 	certPEM, keyPEM, chainPEM, serial, err := h.ca.MintAgentCert(ident.TenantID, userID, agentID, agentCertTTL)
 	if err != nil {
 		h.logger.Error("agent_cert_mint_failed", "error", err, "tenant_id", ident.TenantID, "user_id", userID)
-		writeRetryableEnrollError(w, "tenant_ca_unavailable")
+		writeRetryableEnrollError(w, r, "tenant_ca_unavailable")
 		return
 	}
 	leaf, err := ca.DecodeCertPEM(certPEM)
@@ -277,7 +277,8 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-func writeRetryableEnrollError(w http.ResponseWriter, code string) {
+func writeRetryableEnrollError(w http.ResponseWriter, r *http.Request, code string) {
+	setControlOutcome(r, code)
 	w.Header().Set("Retry-After", enrollRetryAfter)
 	writeOAuthError(w, http.StatusServiceUnavailable, code, "")
 }

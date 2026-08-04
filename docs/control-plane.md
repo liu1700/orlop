@@ -233,7 +233,9 @@ On a valid request the control plane:
 
 Retryable failures (tenant CA not yet available, or server placement pending)
 return `503` with `Retry-After: 60` so a sidecar can retry without burning the
-(still-unspent) enroll token.
+(still-unspent) enroll token. Pool exhaustion uses the wire error
+`no_capacity`; other placement failures use `server_vm_unavailable`, so an
+operator is not sent to debug a healthy data-plane VM when the pool is full.
 
 ### `GET /v1/whoami`
 
@@ -259,6 +261,23 @@ Success (`200`):
 A well-signed token whose tenant is not on the allowlist returns `403`
 (`access_denied / tenant_not_allowed`); anything the verifier rejects returns
 `401` (`invalid_token`).
+
+## Control-plane metrics
+
+`orlop-control` exposes Prometheus metrics on the separate
+`ORLOP_METRICS_ADDR` listener. Capacity gauges are read from the configured
+storage backend on every scrape, so they remain correct across restarts and
+out-of-band repairs:
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `orlop_server_pool_free_bytes` | gauge | `server_id` |
+| `orlop_server_pool_total_bytes` | gauge | `server_id` |
+| `orlop_allocations_purge_pending` | gauge | none |
+| `orlop_enroll_total` | counter | `outcome` (including `no_capacity`, `server_vm_unavailable`, and `tenant_ca_unavailable`) |
+
+Alert on low free/total ratio and on a purge-pending gauge that remains nonzero
+or grows across sweeper intervals.
 
 ## Service environment variables
 

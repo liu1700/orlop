@@ -122,6 +122,21 @@ func (q *Queries) CountActiveAllocationsForUser(ctx context.Context, userID pgty
 	return count, err
 }
 
+const countPurgePendingAllocations = `-- name: CountPurgePendingAllocations :one
+SELECT count(*) FROM disk_allocations
+WHERE revoked_at IS NOT NULL AND purged_at IS NULL
+`
+
+// Count every revoked allocation that has not completed the durable purge
+// transition. This intentionally mirrors the allocator invariant rather than
+// the sweeper's current batch eligibility filters.
+func (q *Queries) CountPurgePendingAllocations(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countPurgePendingAllocations)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const forceReleaseMountLease = `-- name: ForceReleaseMountLease :one
 UPDATE disk_allocations
    SET bound_agent_id   = NULL,
@@ -409,6 +424,11 @@ type RefreshMountLeaseParams struct {
 	Ttl          pgtype.Interval
 }
 
+// Expiry remains a hard boundary (issue #95): after it, the holder must go
+// through AcquireMountLease so renewal follows the same takeover rules as any
+// other claimant. Matching bound_agent_id only proves that no takeover has
+// committed yet; without the expiry guard, a stale refresh can win a race
+// against a waiter and resurrect ownership after its promised deadline.
 func (q *Queries) RefreshMountLease(ctx context.Context, arg RefreshMountLeaseParams) (DiskAllocation, error) {
 	row := q.db.QueryRow(ctx, refreshMountLease, arg.ID, arg.BoundAgentID, arg.Ttl)
 	var i DiskAllocation

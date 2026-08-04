@@ -45,6 +45,7 @@ type Store interface {
 	SessionStore
 	AllocationStore
 	RevocationStore
+	CapacityMetricsStore
 	APITokenStore
 	ProvisioningStore
 	TenantStore

@@ -31,6 +31,41 @@ func (q *Queries) GetServerPoolByDataAddr(ctx context.Context, dataAddr string) 
 	return i, err
 }
 
+const listServerPoolCapacity = `-- name: ListServerPoolCapacity :many
+SELECT id, total_bytes, free_bytes
+FROM server_pool
+ORDER BY id
+`
+
+type ListServerPoolCapacityRow struct {
+	ID         pgtype.UUID
+	TotalBytes int64
+	FreeBytes  int64
+}
+
+// Small projection used by the Prometheus collector. Keep the stable database
+// id as the only label; addresses and status may change and would create stale
+// time series.
+func (q *Queries) ListServerPoolCapacity(ctx context.Context) ([]ListServerPoolCapacityRow, error) {
+	rows, err := q.db.Query(ctx, listServerPoolCapacity)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListServerPoolCapacityRow{}
+	for rows.Next() {
+		var i ListServerPoolCapacityRow
+		if err := rows.Scan(&i.ID, &i.TotalBytes, &i.FreeBytes); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const pickBestAvailableServer = `-- name: PickBestAvailableServer :one
 SELECT id, data_addr, ops_addr, total_bytes, free_bytes, status, created_at, updated_at FROM server_pool
 WHERE status = 'available' AND free_bytes >= $1

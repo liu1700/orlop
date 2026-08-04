@@ -23,6 +23,14 @@ RETURNING *;
 -- name: GetServerPoolByDataAddr :one
 SELECT * FROM server_pool WHERE data_addr = $1;
 
+-- name: ListServerPoolCapacity :many
+-- Small projection used by the Prometheus collector. Keep the stable database
+-- id as the only label; addresses and status may change and would create stale
+-- time series.
+SELECT id, total_bytes, free_bytes
+FROM server_pool
+ORDER BY id;
+
 -- name: UpsertServerPool :one
 INSERT INTO server_pool (data_addr, ops_addr, total_bytes, free_bytes, status)
 VALUES ($1, $2, $3, $4, COALESCE(NULLIF(sqlc.arg(status)::text, ''), 'available'))
