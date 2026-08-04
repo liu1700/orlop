@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -17,6 +19,8 @@ const (
 	purgeSweepDefaultLimit = 100
 	purgeSweepMaxLimit     = 500
 )
+
+var errPurgeDataPlaneUnavailable = errors.New("no data-plane admin client configured")
 
 // purgePendingLister is the one query the sweep needs; an interface so the
 // handler tests can stub it.
@@ -56,13 +60,40 @@ type purgeSweepResponse struct {
 	Failed  int `json:"failed"`
 }
 
+// Run performs one reconciliation immediately, then repeats on interval until
+// shutdown. The immediate pass bounds recovery after a control-plane restart;
+// the ticker is the level-triggered backstop for inline purge edges that were
+// missed because of a crash or transient data-plane failure.
+func (h *purgeSweepHandlers) Run(ctx context.Context, interval time.Duration) {
+	if interval <= 0 || h.api == nil {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	h.runScheduledSweep(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.runScheduledSweep(ctx)
+		}
+	}
+}
+
+func (h *purgeSweepHandlers) runScheduledSweep(ctx context.Context) {
+	if _, err := h.sweep(ctx, purgeSweepMaxLimit); err != nil && ctx.Err() == nil {
+		h.logger.Warn("purge_sweep_reconcile_failed", "error", err)
+	}
+}
+
 // handleSweep drains up to `limit` pending purges (default 100, cap 500) and
 // reports what it did. Failures are logged per-allocation and left pending —
 // rerunning the sweep retries them. POST /v1/admin/purge-sweep?limit=N.
 func (h *purgeSweepHandlers) handleSweep(w http.ResponseWriter, r *http.Request) {
 	if h.api == nil {
 		writeOAuthError(w, http.StatusServiceUnavailable, "server_error",
-			"no data-plane admin client configured")
+			errPurgeDataPlaneUnavailable.Error())
 		return
 	}
 
@@ -76,19 +107,30 @@ func (h *purgeSweepHandlers) handleSweep(w http.ResponseWriter, r *http.Request)
 		limit = min(n, purgeSweepMaxLimit)
 	}
 
-	rows, err := h.queries.ListPurgePendingAllocations(r.Context(), int32(limit))
+	resp, err := h.sweep(r.Context(), int(limit))
 	if err != nil {
 		h.logger.Error("purge_sweep_list_failed", "error", err)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *purgeSweepHandlers) sweep(ctx context.Context, limit int) (purgeSweepResponse, error) {
+	if h.api == nil {
+		return purgeSweepResponse{}, errPurgeDataPlaneUnavailable
+	}
+	rows, err := h.queries.ListPurgePendingAllocations(ctx, int32(limit))
+	if err != nil {
+		return purgeSweepResponse{}, err
+	}
 
 	resp := purgeSweepResponse{Pending: len(rows)}
 	for _, row := range rows {
-		if r.Context().Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
-		if err := h.purge.PurgeAllocation(r.Context(), h.api, fromUUID(row.AllocationID)); err != nil {
+		if err := h.purge.PurgeAllocation(ctx, h.api, fromUUID(row.AllocationID)); err != nil {
 			resp.Failed++
 			h.logger.Error("purge_sweep_allocation_failed",
 				"allocation_id", row.AllocationID.String(),
@@ -101,7 +143,7 @@ func (h *purgeSweepHandlers) handleSweep(w http.ResponseWriter, r *http.Request)
 
 	h.logger.Info("purge_sweep_complete",
 		"pending", resp.Pending, "purged", resp.Purged, "failed", resp.Failed)
-	writeJSON(w, http.StatusOK, resp)
+	return resp, nil
 }
 
 // ensure the production types satisfy the handler interfaces.

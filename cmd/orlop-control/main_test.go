@@ -84,6 +84,37 @@ func TestLoadConfigMountLeaseTTL(t *testing.T) {
 	}
 }
 
+func TestLoadConfigPurgeSweepInterval(t *testing.T) {
+	if cfg := mustLoadConfig(t); cfg.PurgeSweepInterval != defaultPurgeSweepInterval {
+		t.Fatalf("default purge sweep interval = %s, want %s", cfg.PurgeSweepInterval, defaultPurgeSweepInterval)
+	}
+
+	t.Setenv("ORLOP_PURGE_SWEEP_INTERVAL", "2m")
+	if cfg := mustLoadConfig(t); cfg.PurgeSweepInterval != 2*time.Minute {
+		t.Fatalf("purge sweep interval = %s, want 2m", cfg.PurgeSweepInterval)
+	}
+
+	for _, disabled := range []string{"0", "0s"} {
+		t.Run("disabled_"+disabled, func(t *testing.T) {
+			t.Setenv("ORLOP_PURGE_SWEEP_INTERVAL", disabled)
+			if cfg := mustLoadConfig(t); cfg.PurgeSweepInterval != 0 {
+				t.Fatalf("disabled interval = %s, want 0", cfg.PurgeSweepInterval)
+			}
+		})
+	}
+}
+
+func TestLoadConfigRejectsInvalidPurgeSweepInterval(t *testing.T) {
+	for _, value := range []string{"-1s", "not-a-duration"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("ORLOP_PURGE_SWEEP_INTERVAL", value)
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("ORLOP_PURGE_SWEEP_INTERVAL=%q should fail configuration", value)
+			}
+		})
+	}
+}
+
 func TestLoadConfigRejectsUnsafeMountLeaseTTL(t *testing.T) {
 	for _, value := range []string{"0s", "3s", "not-a-duration"} {
 		t.Run(value, func(t *testing.T) {
