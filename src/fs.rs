@@ -1904,7 +1904,15 @@ impl Filesystem for GatewayFs {
                 let store = &*self.mounts[mount_idx].store;
                 match handle.lock().flush(store) {
                     Ok(stats) => self.refresh_after_flush(ino, stats.bytes),
-                    Err(e) => eprintln!("warning: release flush failed for {path}: {e:#}"),
+                    // Say outright that the bytes are gone. FUSE gives us no way
+                    // to tell the application (release ignores reply errors on
+                    // Linux), so this line is the only record that a write was
+                    // lost, and "flush failed" alone read as retryable noise for
+                    // long enough to corrupt a benchmark round (#111).
+                    Err(e) => eprintln!(
+                        "warning: release flush failed for {path}: {e:#} \
+                         -- buffered data was DISCARDED and the file on disk is stale"
+                    ),
                 }
             }
         }
