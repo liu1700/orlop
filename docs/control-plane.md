@@ -352,7 +352,10 @@ passed.
 
 `token issue` is the standalone enroll path: it prints `ORLOP_AGENT_ID`,
 `ORLOP_MOUNT_POINT`, `ORLOP_CONTROL_PLANE`, and `ORLOP_ENROLL_TOKEN`, which feed
-`orlop mount --from-env`. Possession of `DATABASE_URL` is the operator credential
+`orlop mount --from-env`. For retry-safe Kubernetes mounts, use a projected
+ServiceAccount token via `ORLOP_SA_TOKEN_PATH` plus an agent-scoped mint endpoint
+in `ORLOP_REFRESH_URL`; every process attempt then obtains a fresh one-shot
+token. Possession of `DATABASE_URL` is the operator credential
 for `token issue`, `server register`, `user seed`, and `ca init`.
 
 ## Local development

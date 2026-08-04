@@ -2,7 +2,8 @@
 #
 # The controller that renders this pod must:
 #   1. set nodeName and a unique host targetPath for the volume,
-#   2. inject a fresh, single-use enroll token on every pod replacement,
+#   2. configure the projected workload token + agent-scoped exchange endpoint
+#      below (or inject a fresh ORLOP_ENROLL_TOKEN on every process attempt),
 #   3. reconcile one pod per desired mount independently of the CSI node-plugin
 #      pod, and
 #   4. delete/recreate this pod (not restart its consumed token) after failure.
@@ -33,11 +34,10 @@ spec:
           value: AGENT_ID
         - name: ORLOP_CONTROL_PLANE
           value: https://orlop-control.example
-        - name: ORLOP_ENROLL_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: orlop-enroll-AGENT_ID
-              key: token
+        - name: ORLOP_SA_TOKEN_PATH
+          value: /var/run/secrets/orlop/token
+        - name: ORLOP_REFRESH_URL
+          value: https://YOUR_EXCHANGE_ENDPOINT/v1/agents/AGENT_ID/enroll-token
         - name: ORLOP_MOUNT_POINT
           value: /mnt/orlop
       securityContext:
@@ -61,6 +61,9 @@ spec:
         - name: target
           mountPath: /mnt/orlop
           mountPropagation: Bidirectional
+        - name: workload-identity
+          mountPath: /var/run/secrets/orlop
+          readOnly: true
   volumes:
     - name: fuse
       hostPath:
@@ -70,3 +73,10 @@ spec:
       hostPath:
         path: /var/lib/orlop/mounts/AGENT_ID
         type: DirectoryOrCreate
+    - name: workload-identity
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: orlop-control
+              expirationSeconds: 600

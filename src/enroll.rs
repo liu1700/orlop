@@ -60,6 +60,46 @@ struct EnrollResp {
     size_bytes: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct EnrollTokenResp {
+    token: String,
+}
+
+/// Exchange a workload credential for a fresh, one-shot enroll token. Hosted
+/// mount pods call this once per process attempt, so a token consumed by an
+/// earlier successful enrollment can never wedge kubelet's next retry.
+pub fn mint_enroll_token(
+    refresh_url: &str,
+    workload_token: &str,
+) -> anyhow::Result<String> {
+    if workload_token.trim().is_empty() {
+        bail!("workload identity token is empty");
+    }
+    let client = util::http_client(Duration::from_secs(30))?;
+    let resp = client
+        .post(refresh_url)
+        .bearer_auth(workload_token.trim())
+        .send()
+        .with_context(|| format!("POST {refresh_url}"))?;
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        bail!("enroll-token mint returned {status}: {body}");
+    }
+    parse_enroll_token_response(&body)
+}
+
+/// Parse the mint response separately so malformed/empty success bodies are
+/// covered without relying on a live control plane.
+pub fn parse_enroll_token_response(body: &str) -> anyhow::Result<String> {
+    let parsed: EnrollTokenResp =
+        serde_json::from_str(body).context("decode enroll-token mint response")?;
+    if parsed.token.trim().is_empty() {
+        bail!("enroll-token mint response contained an empty token");
+    }
+    Ok(parsed.token)
+}
+
 /// POST `/agent/enroll` with the agent's stored credentials, persist the
 /// returned PEMs to `cert_dir`, and return metadata for the dial.
 pub fn enroll(creds: &Credentials, cert_dir: &Path) -> anyhow::Result<EnrolledCert> {

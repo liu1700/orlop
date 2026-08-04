@@ -51,9 +51,10 @@ enum Command {
         #[arg(long)]
         credentials: Option<PathBuf>,
         /// In-pod env-driven mount. Reads ORLOP_AGENT_ID, ORLOP_MOUNT_POINT,
-        /// ORLOP_CONTROL_PLANE and ORLOP_ENROLL_TOKEN from the environment,
-        /// trades the enroll token for a short-lived (1h) client cert via
-        /// `/agent/enroll`, and mounts over the existing mTLS data path. Runs
+        /// ORLOP_CONTROL_PLANE and either ORLOP_ENROLL_TOKEN or the resilient
+        /// ORLOP_SA_TOKEN_PATH + ORLOP_REFRESH_URL workload-identity pair. The
+        /// latter mints a fresh enroll token per process attempt. Trades it for
+        /// a short-lived (1h) client cert via `/agent/enroll` and mounts. Runs
         /// in the foreground (the pod is the process supervisor); --mountpoint,
         /// --config and --credentials are ignored in this mode.
         #[arg(long)]
@@ -1373,7 +1374,7 @@ fn cert_renewal_loop(
 
 /// Env var holding the path to the pod's projected ServiceAccount token file.
 const ENV_SA_TOKEN_PATH: &str = "ORLOP_SA_TOKEN_PATH";
-/// Env var holding the control-plane enroll-token refresh URL.
+/// Env var holding the control-plane workload-identity → enroll-token URL.
 const ENV_REFRESH_URL: &str = "ORLOP_REFRESH_URL";
 
 /// Best-effort enroll-token refresh for the long-lived in-pod mounter.
@@ -1421,18 +1422,7 @@ fn refresh_enroll_token(
         anyhow::bail!("SA token file {sa_path} is empty");
     }
 
-    let client = util::http_client(Duration::from_secs(30))?;
-    let resp = client
-        .post(refresh_url)
-        .bearer_auth(sa_token)
-        .send()
-        .with_context(|| format!("POST {refresh_url}"))?;
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
-    if !status.is_success() {
-        anyhow::bail!("enroll-token refresh returned {status}: {body}");
-    }
-    let fresh_token = parse_refresh_response(&body)?;
+    let fresh_token = enroll::mint_enroll_token(refresh_url, sa_token)?;
 
     // Rewrite credentials.json so the next re-enrollment uses the fresh token,
     // preserving the control-plane URL from the current credentials.
@@ -1445,21 +1435,6 @@ fn refresh_enroll_token(
     *tokens = login::TokenManager::load(creds_path)?;
     eprintln!("refreshed enroll token via projected ServiceAccount token");
     Ok(())
-}
-
-/// Parse the control-plane enroll-token refresh response body, returning the
-/// fresh enroll token. Pure (no I/O) so it is unit-tested directly.
-fn parse_refresh_response(body: &str) -> anyhow::Result<String> {
-    #[derive(Deserialize)]
-    struct RefreshResp {
-        token: String,
-    }
-    let parsed: RefreshResp =
-        serde_json::from_str(body).context("decode enroll-token refresh response")?;
-    if parsed.token.trim().is_empty() {
-        anyhow::bail!("enroll-token refresh response contained an empty token");
-    }
-    Ok(parsed.token)
 }
 
 fn renewal_wait(expires_at: chrono::DateTime<chrono::Utc>, failures: u32) -> Duration {
@@ -1509,18 +1484,18 @@ fn auth_state_invalid(err: &anyhow::Error) -> bool {
 
 /// Parsed `orlop mount --from-env` inputs — the in-pod mounter's env contract
 /// (documented in docs/container-images.md): ORLOP_AGENT_ID, ORLOP_MOUNT_POINT,
-/// ORLOP_CONTROL_PLANE and ORLOP_ENROLL_TOKEN are required; ORLOP_CERT_DIR is
-/// optional (pins the cert location, e.g. a tmpfs — default is a fresh
-/// per-process tempdir). There is no config file and no separate auth step:
-/// the enroll token IS the identity, traded for a 1h client cert by
-/// `/agent/enroll`. `agent_id` is informational, surfaced in logs so pod logs
-/// tie a mount to an agent.
+/// ORLOP_CONTROL_PLANE plus either ORLOP_ENROLL_TOKEN or the workload-identity
+/// pair ORLOP_SA_TOKEN_PATH + ORLOP_REFRESH_URL are required. The latter is the
+/// resilient pod mode: every process attempt mints a fresh one-shot token.
+/// ORLOP_CERT_DIR is optional (default: a fresh per-process tempdir).
 #[derive(Debug, Clone, PartialEq)]
 struct EnvMountSpec {
     agent_id: String,
     mount_point: PathBuf,
     control_plane: String,
-    enroll_token: String,
+    enroll_token: Option<String>,
+    sa_token_path: Option<String>,
+    refresh_url: Option<String>,
     cert_dir: Option<PathBuf>,
 }
 
@@ -1536,11 +1511,26 @@ impl EnvMountSpec {
                 )),
             }
         }
+        let enroll_token = getter("ORLOP_ENROLL_TOKEN").filter(|v| !v.trim().is_empty());
+        let sa_token_path = getter(ENV_SA_TOKEN_PATH).filter(|v| !v.trim().is_empty());
+        let refresh_url = getter(ENV_REFRESH_URL).filter(|v| !v.trim().is_empty());
+        if sa_token_path.is_some() != refresh_url.is_some() {
+            return Err(anyhow!(
+                "{ENV_SA_TOKEN_PATH} and {ENV_REFRESH_URL} must be set together for `orlop mount --from-env`"
+            ));
+        }
+        if enroll_token.is_none() && sa_token_path.is_none() {
+            return Err(anyhow!(
+                "ORLOP_ENROLL_TOKEN or both {ENV_SA_TOKEN_PATH} and {ENV_REFRESH_URL} are required for `orlop mount --from-env`"
+            ));
+        }
         Ok(Self {
             agent_id: required(&getter, "ORLOP_AGENT_ID")?,
             mount_point: PathBuf::from(required(&getter, "ORLOP_MOUNT_POINT")?),
             control_plane: required(&getter, "ORLOP_CONTROL_PLANE")?,
-            enroll_token: required(&getter, "ORLOP_ENROLL_TOKEN")?,
+            enroll_token,
+            sa_token_path,
+            refresh_url,
             cert_dir: getter("ORLOP_CERT_DIR")
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from),
@@ -1612,6 +1602,24 @@ fn run_env_mount(
 ) -> anyhow::Result<()> {
     let spec = EnvMountSpec::from_env()?;
 
+    // Credential-per-attempt: when workload identity is configured, mint a
+    // fresh one-shot token before every mount process invocation. Do not fall
+    // back to the possibly-consumed injected token on mint failure; returning
+    // an error lets kubelet retry without converting a transient outage into a
+    // permanent 401 loop.
+    let enroll_token = match (&spec.sa_token_path, &spec.refresh_url) {
+        (Some(sa_path), Some(refresh_url)) => {
+            let workload_token = std::fs::read_to_string(sa_path)
+                .with_context(|| format!("read workload identity token {sa_path}"))?;
+            enroll::mint_enroll_token(refresh_url, &workload_token)
+                .context("mint fresh enroll token for mount attempt")?
+        }
+        _ => spec
+            .enroll_token
+            .clone()
+            .expect("EnvMountSpec validated an enroll credential"),
+    };
+
     // Isolated cert dir: honor ORLOP_CERT_DIR, else a fresh tempdir. The
     // TempDir guard (when used) must outlive the blocking mount below, so
     // bind it for the whole function. cert.pem/key.pem/ca.pem + the synthesized
@@ -1634,7 +1642,7 @@ fn run_env_mount(
     // Persist the enroll token as credentials.json so the standard hosted
     // path (enroll_for_mount -> token_manager_for_hosted -> require_credentials_with)
     // and the CertManager renewal loop both load it without any separate auth step.
-    let creds = login::Credentials::for_enroll(spec.control_plane.clone(), spec.enroll_token);
+    let creds = login::Credentials::for_enroll(spec.control_plane.clone(), enroll_token);
     let creds_path = cert_dir.join("credentials.json");
     login::save(&creds_path, &creds)
         .with_context(|| format!("write credentials to {}", creds_path.display()))?;
@@ -2216,7 +2224,9 @@ mod env_mount {
         assert_eq!(spec.agent_id, "agent-123");
         assert_eq!(spec.mount_point, PathBuf::from("/mnt/orlop"));
         assert_eq!(spec.control_plane, "https://control.example");
-        assert_eq!(spec.enroll_token, "enr_tok_abc");
+        assert_eq!(spec.enroll_token.as_deref(), Some("enr_tok_abc"));
+        assert_eq!(spec.sa_token_path, None);
+        assert_eq!(spec.refresh_url, None);
         // ORLOP_CERT_DIR unset -> tempdir path chosen at run time.
         assert_eq!(spec.cert_dir, None);
     }
@@ -2235,7 +2245,6 @@ mod env_mount {
             "ORLOP_AGENT_ID",
             "ORLOP_MOUNT_POINT",
             "ORLOP_CONTROL_PLANE",
-            "ORLOP_ENROLL_TOKEN",
         ] {
             let mut map = full();
             map.remove(missing);
@@ -2258,22 +2267,41 @@ mod env_mount {
     }
 
     #[test]
+    fn from_env_accepts_workload_identity_without_prefetched_token() {
+        let mut map = full();
+        map.remove("ORLOP_ENROLL_TOKEN");
+        map.insert(ENV_SA_TOKEN_PATH, "/var/run/secrets/orlop/token");
+        map.insert(ENV_REFRESH_URL, "https://control.example/v1/enroll-token");
+        let spec = EnvMountSpec::from_env_with(getter(&map)).unwrap();
+        assert_eq!(spec.enroll_token, None);
+        assert_eq!(spec.sa_token_path.as_deref(), Some("/var/run/secrets/orlop/token"));
+    }
+
+    #[test]
+    fn from_env_rejects_half_configured_workload_identity() {
+        let mut map = full();
+        map.insert(ENV_SA_TOKEN_PATH, "/var/run/secrets/orlop/token");
+        let err = EnvMountSpec::from_env_with(getter(&map)).unwrap_err();
+        assert!(err.to_string().contains(ENV_REFRESH_URL));
+    }
+
+    #[test]
     fn parse_refresh_response_extracts_token() {
         let tok =
-            parse_refresh_response(r#"{"token":"enr_fresh","expires_at":"2026-06-04T12:00:00Z"}"#)
+            enroll::parse_enroll_token_response(r#"{"token":"enr_fresh","expires_at":"2026-06-04T12:00:00Z"}"#)
                 .unwrap();
         assert_eq!(tok, "enr_fresh");
         // expires_at is ignored; token-only body is also fine.
-        let tok2 = parse_refresh_response(r#"{"token":"enr2"}"#).unwrap();
+        let tok2 = enroll::parse_enroll_token_response(r#"{"token":"enr2"}"#).unwrap();
         assert_eq!(tok2, "enr2");
     }
 
     #[test]
     fn parse_refresh_response_rejects_empty_or_malformed() {
-        assert!(parse_refresh_response(r#"{"token":""}"#).is_err());
-        assert!(parse_refresh_response(r#"{"token":"  "}"#).is_err());
-        assert!(parse_refresh_response(r#"{}"#).is_err()); // missing token field
-        assert!(parse_refresh_response("not json").is_err());
+        assert!(enroll::parse_enroll_token_response(r#"{"token":""}"#).is_err());
+        assert!(enroll::parse_enroll_token_response(r#"{"token":"  "}"#).is_err());
+        assert!(enroll::parse_enroll_token_response(r#"{}"#).is_err()); // missing token field
+        assert!(enroll::parse_enroll_token_response("not json").is_err());
     }
 
     #[test]

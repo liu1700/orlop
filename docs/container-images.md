@@ -81,7 +81,7 @@ COPY --from=ghcr.io/liu1700/orlop-mount:vX.Y.Z \
 | Ports | none (outbound only) |
 | Entrypoint | `orlop` — pass a subcommand, e.g. `orlop mount …` |
 | Devices | needs `/dev/fuse` and `CAP_SYS_ADMIN` for the FUSE mount |
-| Env-driven mount | `orlop mount --from-env` (designed for pods) requires `ORLOP_AGENT_ID`, `ORLOP_CONTROL_PLANE`, `ORLOP_ENROLL_TOKEN`, `ORLOP_MOUNT_POINT`; `ORLOP_CERT_DIR`, `ORLOP_ON_EVICTION`, and `ORLOP_MOUNT_TAKEOVER` are optional |
+| Env-driven mount | `orlop mount --from-env` (designed for pods) requires `ORLOP_AGENT_ID`, `ORLOP_CONTROL_PLANE`, `ORLOP_MOUNT_POINT`, plus either `ORLOP_ENROLL_TOKEN` or both `ORLOP_SA_TOKEN_PATH` and `ORLOP_REFRESH_URL`; workload identity is preferred because each process retry mints a fresh one-shot token. `ORLOP_CERT_DIR`, `ORLOP_ON_EVICTION`, and `ORLOP_MOUNT_TAKEOVER` are optional |
 | Lease takeover | acquiring the mount lease while another mount's lease is still live fails with `409 lease_live`. A spawner that knows the previous pod is gone (crash recovery) sets `ORLOP_MOUNT_TAKEOVER=1` (or passes `--takeover`) to displace it without waiting out the lease TTL |
 | Eviction behavior | when the mount lease is lost involuntarily (revoked, expired, taken over), `--from-env` mounts default to `--on-eviction=abort`: the FUSE connection is aborted so workload I/O fails with `ENOTCONN` instead of silently writing into the directory the unmount would expose. Set `ORLOP_ON_EVICTION=unmount` (or `--on-eviction=unmount`) for the old clean-unmount behavior |
 | Config-driven mount | `orlop mount --config <file> [--credentials <file>]` reads no env; defaults to `~/.config/orlop/config.yaml` and `~/.config/orlop/credentials.json` |
