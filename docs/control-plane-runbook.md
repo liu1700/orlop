@@ -209,7 +209,9 @@ orlop-control server register \
     --total-bytes $((10 * 1024 * 1024 * 1024))
 ```
 
-`/agent/enroll` places each agent onto a server drawn from the placement pool.
+`/agent/enroll` places each account onto a server drawn from the placement pool;
+all later agents for that account reuse the placement. Pool capacity is reserved
+once per account/server for the shared account budget, not once per agent.
 With an empty pool, enroll has nowhere to put a disk and returns `503`, so
 register at least one server. The command upserts the pool row keyed on
 `--data-addr`; re-run it to update the ops address, capacity, or status.
@@ -218,7 +220,7 @@ register at least one server. The command upserts the pool row keyed on
 | --------------- | -------------------------------------------------------------------------------- | ---------------- |
 | `--data-addr`   | address agents dial for the data plane; must match the server's cert SAN (`tls.fqdn`) | `localhost:8443` |
 | `--ops-addr`    | address the control plane dials for the server's ops API over mTLS               | `localhost:7878` |
-| `--total-bytes` | pool capacity that agent allocations are placed against                          | 10 GiB           |
+| `--total-bytes` | pool capacity that account budgets are placed against                            | 10 GiB           |
 | `--status`      | pool status; only `available` servers are picked for placement                   | `available`      |
 
 On a single local node both addresses use the same host, so one self-provisioned

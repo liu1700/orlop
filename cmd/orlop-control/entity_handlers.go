@@ -115,6 +115,7 @@ type entityHandlers struct {
 // *allocations.Service; an interface so the handler tests can stub it.
 type allocationResizer interface {
 	Resize(ctx context.Context, api allocations.TenantResizer, allocationID, userID pgtype.UUID, newSizeBytes int64) (allocations.Allocation, error)
+	ResizeOwnerCapacity(ctx context.Context, userID uuid.UUID, newSizeBytes int64) error
 }
 
 // allocationPurger erases a revoked allocation's backend data (per-agent
@@ -592,6 +593,15 @@ func (h *entityHandlers) handleSetAccountBudget(w http.ResponseWriter, r *http.R
 	allocs, err := h.queries.ListAllocationsForUser(r.Context(), ownerUUID)
 	if err != nil {
 		h.logger.Error("account_budget_list_allocations_failed", "error", err, "owner_id", owner)
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+	if err := h.resize.ResizeOwnerCapacity(r.Context(), ownerUUID, req.DiskBytes); err != nil {
+		if errors.Is(err, allocations.ErrNoCapacity) {
+			writeOAuthError(w, http.StatusServiceUnavailable, "no_capacity", "")
+			return
+		}
+		h.logger.Error("account_budget_resize_capacity_failed", "error", err, "owner_id", owner)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 		return
 	}

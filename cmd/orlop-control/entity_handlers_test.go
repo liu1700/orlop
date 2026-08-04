@@ -142,11 +142,12 @@ func (m *recordingMinter) mint(_ context.Context, userID pgtype.UUID, tenantID s
 // returns a canned allocation, so the handler tests need neither a live
 // allocations.Service nor a orlop-server.
 type fakeResizer struct {
-	called   bool
-	gotAlloc pgtype.UUID
-	gotUser  pgtype.UUID
-	gotSize  int64
-	err      error
+	called            bool
+	gotAlloc          pgtype.UUID
+	gotUser           pgtype.UUID
+	gotSize           int64
+	err               error
+	ownerResizeCalled bool
 }
 
 func (f *fakeResizer) Resize(_ context.Context, _ allocations.TenantResizer, allocationID, userID pgtype.UUID, newSizeBytes int64) (allocations.Allocation, error) {
@@ -156,6 +157,11 @@ func (f *fakeResizer) Resize(_ context.Context, _ allocations.TenantResizer, all
 		return allocations.Allocation{}, f.err
 	}
 	return allocations.Allocation{ID: allocationID, UserID: userID, SizeBytes: newSizeBytes}, nil
+}
+
+func (f *fakeResizer) ResizeOwnerCapacity(_ context.Context, _ uuid.UUID, _ int64) error {
+	f.ownerResizeCalled = true
+	return f.err
 }
 
 func entityRouter(q entityQuerier, token string) http.Handler {

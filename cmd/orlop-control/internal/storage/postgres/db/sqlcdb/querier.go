@@ -39,6 +39,7 @@ type Querier interface {
 	// to decide between a per-agent subtree purge (other agents share the tenant
 	// dir) and a whole-tenant unregister (this was the last one).
 	CountActiveAllocationsForUser(ctx context.Context, userID pgtype.UUID) (int64, error)
+	CountPlacedAllocationsForUserOnServer(ctx context.Context, arg CountPlacedAllocationsForUserOnServerParams) (int64, error)
 	// Count every revoked allocation that has not completed the durable purge
 	// transition. This intentionally mirrors the allocator invariant rather than
 	// the sweeper's current batch eligibility filters.
@@ -46,9 +47,11 @@ type Querier interface {
 	CreateAPIToken(ctx context.Context, arg CreateAPITokenParams) (CreateAPITokenRow, error)
 	CreateAccessToken(ctx context.Context, arg CreateAccessTokenParams) (AccessToken, error)
 	CreateAgentEnrollment(ctx context.Context, arg CreateAgentEnrollmentParams) (AgentEnrollment, error)
+	CreateOwnerCapacityReservation(ctx context.Context, arg CreateOwnerCapacityReservationParams) error
 	CreateServerVM(ctx context.Context, arg CreateServerVMParams) (ServerVm, error)
 	CreateTenant(ctx context.Context, arg CreateTenantParams) (Tenant, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
+	DeleteOwnerCapacityReservation(ctx context.Context, arg DeleteOwnerCapacityReservationParams) (int64, error)
 	// Remove a tenant's placement after its data-plane tenant was unregistered
 	// (last-allocation purge). The next enroll for this tenant re-Reserves a
 	// placement from the pool.
@@ -90,6 +93,7 @@ type Querier interface {
 	// tenant — the push targets for the deny-list reconcile.
 	ListActiveServerOpsAddrs(ctx context.Context) ([]string, error)
 	ListAllocationsForUser(ctx context.Context, userID pgtype.UUID) ([]DiskAllocation, error)
+	ListOwnerCapacityReservations(ctx context.Context, userID pgtype.UUID) ([]ListOwnerCapacityReservationsRow, error)
 	// The purge sweeper's work queue: revoked agent allocations whose backend
 	// data has not been erased yet. LEFT JOINs the placement chain — an unplaced
 	// tenant (never enrolled, ops_addr NULL) has no server-side data and is
@@ -140,6 +144,7 @@ type Querier interface {
 	// control-plane's stored disk handle stays valid. Used by the entity disk PATCH path
 	// to flip an anonymous agent's 128 MiB disk to the expandable registered size.
 	UpdateAllocationSize(ctx context.Context, arg UpdateAllocationSizeParams) (DiskAllocation, error)
+	UpdateOwnerCapacityReservationSize(ctx context.Context, arg UpdateOwnerCapacityReservationSizeParams) error
 	// Idempotent per-agent provisioning. The partial unique index
 	// disk_allocations_agent_active_idx (agent_id) WHERE revoked_at IS NULL
 	// guarantees at most one live allocation per agent (orlop agent ids are

@@ -4,7 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
@@ -27,13 +28,13 @@ type ServerAdmin interface {
 }
 
 // Reserve places a tenant on a orlop-server VM and records the binding in
-// server_vms. Idempotent — if a server_vms row already exists for tenantID,
-// returns its data_addr without touching the pool or calling the admin API.
+// server_vms. Pool capacity is debited once per owner/server; later agents for
+// the owner reuse that reservation. Idempotent — if a server_vms row already
+// exists for tenantID, returns its data_addr without touching the pool or API.
 //
 // Errors:
 //   - ErrNoCapacity if no server_pool row has free_bytes >= sizeBytes.
-//   - Wrapped error for admin-API or DB failures (compensating release
-//     happens automatically before returning).
+//   - Wrapped error for admin-API or DB failures.
 //
 // ownerTenantID is the account tenant (u_<owner>) this tenant belongs to; the server
 // nests the tenant dir under it and puts the shared account quota on the owner dir.
@@ -41,6 +42,7 @@ type ServerAdmin interface {
 func (s *Service) Reserve(
 	ctx context.Context,
 	api ServerAdmin,
+	ownerUserID uuid.UUID,
 	tenantID, ownerTenantID, name string,
 	sizeBytes int64,
 ) (dataAddr string, err error) {
@@ -54,31 +56,42 @@ func (s *Service) Reserve(
 		return "", fmt.Errorf("allocations: get server vm: %w", err)
 	}
 
-	// --- Phase 1: capacity reservation inside a transaction ---
+	// --- Phase 1: serialize this owner's first placement and reserve once. ---
 	tx, err := s.store.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("allocations: begin tx: %w", err)
 	}
 
-	chosen, err := tx.PickBestAvailableServer(ctx, sizeBytes)
-	if errors.Is(err, storage.ErrNotFound) {
-		_ = tx.Rollback(ctx)
-		return "", ErrNoCapacity
+	defer tx.Rollback(ctx) // no-op after Commit
+	if _, err := tx.GetUserForUpdate(ctx, ownerUserID); err != nil {
+		return "", fmt.Errorf("allocations: lock owner: %w", err)
 	}
+	reservations, err := tx.ListOwnerCapacityReservations(ctx, ownerUserID)
 	if err != nil {
-		_ = tx.Rollback(ctx)
-		return "", fmt.Errorf("allocations: pick server: %w", err)
+		return "", fmt.Errorf("allocations: list owner reservations: %w", err)
 	}
-
-	err = tx.ReserveCapacity(ctx, chosen.ID, sizeBytes)
-	if errors.Is(err, storage.ErrNotFound) {
-		// Lost a race with another reservation on this server.
-		_ = tx.Rollback(ctx)
-		return "", ErrNoCapacity
-	}
-	if err != nil {
-		_ = tx.Rollback(ctx)
-		return "", fmt.Errorf("allocations: reserve capacity: %w", err)
+	var chosen storage.ChosenServer
+	if len(reservations) > 0 {
+		// Keep an account's agents together. This matches the shared owner-dir
+		// quota and avoids creating another reservation on another server.
+		r := reservations[0]
+		chosen = storage.ChosenServer{ID: r.ServerID, DataAddr: r.DataAddr, OpsAddr: r.OpsAddr}
+	} else {
+		chosen, err = tx.PickBestAvailableServer(ctx, sizeBytes)
+		if errors.Is(err, storage.ErrNotFound) {
+			return "", ErrNoCapacity
+		}
+		if err != nil {
+			return "", fmt.Errorf("allocations: pick server: %w", err)
+		}
+		if err = tx.ReserveCapacity(ctx, chosen.ID, sizeBytes); errors.Is(err, storage.ErrNotFound) {
+			return "", ErrNoCapacity
+		} else if err != nil {
+			return "", fmt.Errorf("allocations: reserve capacity: %w", err)
+		}
+		if err = tx.CreateOwnerCapacityReservation(ctx, ownerUserID, chosen.ID, sizeBytes); err != nil {
+			return "", fmt.Errorf("allocations: record owner reservation: %w", err)
+		}
 	}
 
 	// Commit the capacity decrement before making the network call. Keeping
@@ -88,26 +101,11 @@ func (s *Service) Reserve(
 		return "", fmt.Errorf("allocations: commit reservation: %w", err)
 	}
 
-	compensate := func(reason string, compErr error) {
-		// Compensating release — use a fresh context so a cancelled parent
-		// (e.g. client disconnect) does not prevent capacity from being restored.
-		compensateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if rErr := s.store.ReleaseCapacity(compensateCtx, chosen.ID, sizeBytes); rErr != nil {
-			s.logger.Error("allocations_reserve_compensate_failed",
-				"tenant_id", tenantID,
-				"server_id", chosen.ID,
-				"reason", reason,
-				"original_error", compErr,
-				"release_error", rErr,
-			)
-		}
-	}
-
 	// --- Phase 2: register tenant on the chosen server (ops listener) ---
 	_, err = api.RegisterTenant(ctx, chosen.OpsAddr, tenantID, ownerTenantID, name, sizeBytes)
 	if err != nil {
-		compensate("admin_api", err)
+		// Keep the owner reservation. The allocation still owns this budget and
+		// a retry must reuse the same server instead of leaking another debit.
 		return "", fmt.Errorf("allocations: register tenant on %s: %w", chosen.OpsAddr, err)
 	}
 
@@ -120,15 +118,12 @@ func (s *Service) Reserve(
 	if err != nil {
 		// A concurrent Reserve won the race (unique violation on tenant_id).
 		if errors.Is(err, storage.ErrAlreadyExists) {
-			// Release our reservation and return the winner's data_addr.
-			compensate("unique_violation", err)
 			winner, getErr := s.store.GetServerVMByTenant(ctx, tenantID)
 			if getErr != nil {
 				return "", fmt.Errorf("allocations: get winner server vm: %w", getErr)
 			}
 			return winner.DataAddr, nil
 		}
-		compensate("create_server_vm", err)
 		return "", fmt.Errorf("allocations: create server vm: %w", err)
 	}
 

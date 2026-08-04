@@ -175,7 +175,7 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 			// shared account quota — allocation.SizeBytes carries the account budget —
 			// is applied to the owner dir, capping all the account's agents together.
 			ownerTenant := tenantIDForOwner(allocation.UserID.String())
-			placed, placementErr := h.allocations.Reserve(r.Context(), h.serverAPI, ident.TenantID, ownerTenant, tenant.Name, allocation.SizeBytes)
+			placed, placementErr := h.allocations.Reserve(r.Context(), h.serverAPI, allocation.UserID, ident.TenantID, ownerTenant, tenant.Name, allocation.SizeBytes)
 			if errors.Is(placementErr, allocations.ErrNoCapacity) {
 				h.logger.Info("agent_enroll_no_capacity", "tenant_id", ident.TenantID)
 				writeRetryableEnrollError(w, r, "no_capacity")

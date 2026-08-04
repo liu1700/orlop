@@ -85,6 +85,13 @@ type DiskAllocation struct {
 	TenantID       pgtype.Text
 }
 
+type OwnerCapacityReservation struct {
+	UserID    pgtype.UUID
+	ServerID  pgtype.UUID
+	SizeBytes int64
+	CreatedAt pgtype.Timestamptz
+}
+
 type ServerPool struct {
 	ID         pgtype.UUID
 	DataAddr   string
