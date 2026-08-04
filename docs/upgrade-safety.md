@@ -17,6 +17,7 @@ check the control plane runs at boot.
 | v0.1.0 | HEAD | Postgres |
 | v0.2.0 | HEAD | Postgres, SQLite |
 | v0.2.1 | HEAD | Postgres, SQLite |
+| v0.5.1 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -63,6 +64,13 @@ The minimal correct in-place upgrade, against an existing database:
 orlop-control migrate up          # reads DATABASE_URL, or pass --database-url
 # then start the new control-plane binary as usual
 ```
+
+Before upgrading to v0.5.2, take a database backup. Migration
+`0011_owner_capacity_reservations.sql` backfills one reservation per
+owner/server pair and recalculates each server's free capacity, repairing the
+legacy per-agent over-reservation. The migration is safe to retry, but the old
+v0.5.1 allocator does not understand the new ledger: after migrating, restore
+the backup before rolling the control plane back to v0.5.1.
 
 | Do | Don't |
 |---|---|
