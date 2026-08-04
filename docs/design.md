@@ -123,7 +123,7 @@ These are the mount client's commands for working with a disk (it also has
 | Command | What it does |
 |---|---|
 | `orlop mount` | Mounts the remote disk at the configured mountpoint and blocks until unmounted. Linux = FUSE, macOS = localhost NFSv3. |
-| `orlop mount --from-env` | In-sandbox mount. Reads `ORLOP_AGENT_ID`, `ORLOP_MOUNT_POINT`, `ORLOP_CONTROL_PLANE`, `ORLOP_ENROLL_TOKEN`; trades the enroll token for a 1h client cert at `/agent/enroll`; runs in the foreground (the pod supervises the process). |
+| `orlop mount --from-env` | In-sandbox mount. Reads the agent, mount point, and control-plane env plus either a pre-minted `ORLOP_ENROLL_TOKEN` or `ORLOP_SA_TOKEN_PATH` + `ORLOP_REFRESH_URL`. Workload-identity mode mints a fresh one-shot token per process attempt, trades it for a 1h client cert at `/agent/enroll`, and runs in the foreground. |
 | `orlop mount ls [--json]` | Linux: enumerates Orlop mounts from `/proc/self/mountinfo`, including stacked and stale (`ENOTCONN`) mounts. |
 | `orlop unmount [target]` | Unmounts; releases the lease and discards the local client cert. |
 | `orlop unmount --stale` | Linux: lazy-detaches stale Orlop FUSE mounts in the current mount namespace, one stacked layer at a time. |

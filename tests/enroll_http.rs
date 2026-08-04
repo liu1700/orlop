@@ -48,6 +48,8 @@ enum Behaviour {
     RetryThenSuccess,
     /// Always 503.
     AlwaysUnavailable,
+    /// Workload-identity mint endpoint returns a fresh one-shot token.
+    MintSuccess,
 }
 
 struct Server {
@@ -138,7 +140,12 @@ fn start(behaviour: Behaviour) -> Server {
             reader.read_exact(&mut body).ok();
         }
 
-        if method != "POST" || path != "/agent/enroll" {
+        let expected_path = if matches!(behaviour, Behaviour::MintSuccess) {
+            "/v1/enroll-token"
+        } else {
+            "/agent/enroll"
+        };
+        if method != "POST" || path != expected_path {
             stream
                 .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                 .ok();
@@ -161,6 +168,14 @@ fn start(behaviour: Behaviour) -> Server {
                 "Retry-After: 1\r\n",
                 String::new(),
             ),
+            Behaviour::MintSuccess => (
+                "200 OK",
+                "",
+                format!(
+                    r#"{{"token":"enr_fresh_{}","expires_at":"2026-08-04T02:00:00Z"}}"#,
+                    n + 1
+                ),
+            ),
         };
 
         let response = format!(
@@ -177,6 +192,42 @@ fn start(behaviour: Behaviour) -> Server {
         last_authorization: last_auth,
         _join: join,
     }
+}
+
+#[test]
+fn workload_identity_mints_a_different_token_for_each_attempt() {
+    let srv = start(Behaviour::MintSuccess);
+    let url = format!("http://{}/v1/enroll-token", srv.addr);
+    let first = enroll::mint_enroll_token(
+        &url,
+        "projected-sa-token",
+    )
+    .expect("mint first token");
+    // Model kubelet invoking a new mount process after the first process spent
+    // its one-shot token and then failed later in mount setup.
+    let second = enroll::mint_enroll_token(
+        &url,
+        "projected-sa-token",
+    )
+    .expect("mint retry token");
+    assert_eq!(first, "enr_fresh_1");
+    assert_eq!(second, "enr_fresh_2");
+    assert_ne!(first, second);
+    assert_eq!(srv.request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        srv.last_authorization.lock().as_deref(),
+        Some("Bearer projected-sa-token")
+    );
+}
+
+#[test]
+fn workload_identity_mint_rejects_empty_credential_without_network() {
+    let err = enroll::mint_enroll_token(
+        "http://127.0.0.1:1/v1/enroll-token",
+        "   ",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("empty"));
 }
 
 fn creds(addr: &str) -> Credentials {

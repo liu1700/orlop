@@ -173,10 +173,13 @@ FUSE process itself. A plugin rollout then leaves the mount pod and its open
 
 Do not use a mounted-path liveness probe. If the FUSE request path is wedged,
 killing the fd owner turns a degraded connection into an `ENOTCONN` stale
-mount. `orlop mount check <path>` is intentionally a readiness check only. A
-mount pod uses a single-use enroll token, so after the pod itself fails the
-controller must clean the stale mount and create a replacement pod with a fresh
-token; container restart with the consumed token cannot recover it.
+mount. `orlop mount check <path>` is intentionally a readiness check only.
+Configure mount pods with a projected ServiceAccount token at
+`ORLOP_SA_TOKEN_PATH` and its agent-scoped exchange endpoint in
+`ORLOP_REFRESH_URL`. Every `orlop mount --from-env` process then obtains a fresh
+single-use enroll token before enrolling, so retries cannot loop forever on a
+consumed token. A pre-minted `ORLOP_ENROLL_TOKEN` remains supported for simple
+deployments, but its caller must replace it after a failed process attempt.
 
 For a dead client, use `orlop mount ls --json` to discover Orlop entries from
 `/proc/self/mountinfo`, then `orlop unmount --stale` to lazy-detach only paths
