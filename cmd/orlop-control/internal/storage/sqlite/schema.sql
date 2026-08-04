@@ -148,6 +148,39 @@ WHERE da.user_id IS NOT NULL
 GROUP BY da.user_id, sp.id
 ON CONFLICT(user_id, server_id) DO NOTHING;
 
+-- Migration 0011's equivalent placement join omitted historical per-agent
+-- tenants whose server_vms row was missing (#108). In a single-server SQLite
+-- deployment placement is unambiguous, so repair every still-unreserved owner.
+-- Open validates below that no ambiguous owners remain when multiple servers
+-- are configured.
+INSERT INTO owner_capacity_reservations (user_id, server_id, size_bytes, created_at)
+SELECT da.user_id, only_server.id, MAX(da.size_bytes), MIN(da.created_at)
+FROM disk_allocations da
+CROSS JOIN (
+    SELECT id
+    FROM server_pool
+    WHERE (SELECT COUNT(*) FROM server_pool) = 1
+) only_server
+WHERE da.user_id IS NOT NULL
+  AND da.purged_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM owner_capacity_reservations r WHERE r.user_id = da.user_id
+  )
+  -- A successful enroll records agent_enrollments after Reserve commits. Use
+  -- that durable evidence so a merely provisioned, never-enrolled allocation
+  -- does not start consuming pool capacity just because the process restarted.
+  AND EXISTS (
+      SELECT 1
+      FROM disk_allocations enrolled_da
+      JOIN agent_enrollments ae
+        ON ae.user_id = enrolled_da.user_id
+       AND ae.enrolled_at >= enrolled_da.created_at
+      WHERE enrolled_da.user_id = da.user_id
+        AND enrolled_da.purged_at IS NULL
+  )
+GROUP BY da.user_id, only_server.id
+ON CONFLICT(user_id, server_id) DO NOTHING;
+
 UPDATE server_pool
 SET free_bytes = MAX(0, total_bytes - COALESCE((
         SELECT SUM(r.size_bytes)
