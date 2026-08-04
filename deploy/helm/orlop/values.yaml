@@ -55,6 +55,9 @@ control:
   # Renewable mount heartbeat window. This is not a token or certificate TTL;
   # clients refresh automatically at half the server-returned remaining time.
   mountLeaseTTL: 60s
+  # Built-in reconciliation for revoked allocations whose inline purge was
+  # missed. Set to 0 only when an external controller deliberately owns it.
+  purgeSweepInterval: 10m
   # Agent-visible path prefix returned as entity virtual_path.
   mountPrefix: /mnt/orlop
   # Metrics are served on a separate listener so they do not share the

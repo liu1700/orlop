@@ -55,6 +55,8 @@ spec:
               value: {{ .Values.control.mountPrefix | quote }}
             - name: ORLOP_MOUNT_LEASE_TTL
               value: {{ .Values.control.mountLeaseTTL | quote }}
+            - name: ORLOP_PURGE_SWEEP_INTERVAL
+              value: {{ .Values.control.purgeSweepInterval | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

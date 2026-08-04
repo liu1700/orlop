@@ -97,7 +97,8 @@ type entityHandlers struct {
 	serverAPI  allocations.TenantResizer
 	// purge erases a revoked allocation's backend data inline on DELETE (the
 	// revoke itself is metadata-only). Nil when no data-plane admin client is
-	// configured — the on-demand purge sweep then remains the only eraser.
+	// configured — purge remains queued until a data-plane admin client is
+	// available to either the built-in reconciler or the on-demand sweep.
 	purge    allocationPurger
 	purgeAPI allocations.AgentDataPurger
 	// initialGrantBytes is the elastic disk size granted at provision when the

@@ -144,6 +144,7 @@ rendered from chart values; the object store and routes DB live on the PVC at
 | `control.replicas` | `1` | |
 | `control.port` | `8080` | control HTTP API port |
 | `control.metricsPort` | `9090` | private Prometheus metrics listener |
+| `control.purgeSweepInterval` | `10m` | built-in revoked-allocation purge reconciliation; `0` disables |
 | `server.opsPort` / `server.dataPort` | `7878` / `8443` | mTLS listeners |
 | `server.persistence.size` | `10Gi` | size of the PVC at `dataDir` |
 | `server.persistence.storageClass` | `""` (cluster default) | |

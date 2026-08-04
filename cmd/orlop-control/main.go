@@ -32,7 +32,10 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 )
 
-const shutdownTimeout = 10 * time.Second
+const (
+	shutdownTimeout           = 10 * time.Second
+	defaultPurgeSweepInterval = 10 * time.Minute
+)
 
 // A shorter lease leaves too little room for the client's one-second minimum
 // refresh interval, a retry, and network transit. Service-level tests may
@@ -87,6 +90,10 @@ type config struct {
 	// It is a renewable heartbeat lease, not a credential lifetime.
 	// ORLOP_MOUNT_LEASE_TTL or --mount-lease-ttl; default 60s.
 	MountLeaseTTL time.Duration
+	// PurgeSweepInterval controls the built-in level-triggered reconciliation
+	// of revoked-but-unpurged allocations. Default 10m; 0 disables it for an
+	// embedder that deliberately owns scheduling. ORLOP_PURGE_SWEEP_INTERVAL.
+	PurgeSweepInterval time.Duration
 
 	// Mode B host-identity verifier (docs/design-identity.md §3). When
 	// IdentityAudience is set, orlop-control verifies a host-issued signed JWT
@@ -140,6 +147,10 @@ func loadConfig(args ...string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	purgeSweepInterval, err := parseDisableableDurationEnv("ORLOP_PURGE_SWEEP_INTERVAL", defaultPurgeSweepInterval)
+	if err != nil {
+		return config{}, err
+	}
 	cfg := config{
 		Addr:                  ":" + port,
 		MetricsAddr:           metricsAddr,
@@ -158,6 +169,7 @@ func loadConfig(args ...string) (config, error) {
 		ServerCertTTL:         serverCertTTL,
 		APITokenTTL:           apiTokenTTL,
 		MountLeaseTTL:         mountLeaseTTL,
+		PurgeSweepInterval:    purgeSweepInterval,
 
 		IdentityIssuer:          os.Getenv("ORLOP_IDENTITY_ISSUER"),
 		IdentityAudience:        os.Getenv("ORLOP_IDENTITY_AUDIENCE"),
@@ -266,6 +278,23 @@ func parseDurationEnv(key string, fallback time.Duration) (time.Duration, error)
 	d, err := time.ParseDuration(s)
 	if err != nil || d <= 0 {
 		return 0, fmt.Errorf("%s: invalid duration %q (use a positive Go duration like \"2160h\")", key, s)
+	}
+	return d, nil
+}
+
+// parseDisableableDurationEnv accepts the same positive Go durations as
+// parseDurationEnv, plus zero ("0" or "0s") as an explicit disable switch.
+func parseDisableableDurationEnv(key string, fallback time.Duration) (time.Duration, error) {
+	s := strings.TrimSpace(os.Getenv(key))
+	if s == "" {
+		return fallback, nil
+	}
+	if s == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("%s: invalid duration %q (use a positive Go duration like \"10m\", or 0 to disable)", key, s)
 	}
 	return d, nil
 }
@@ -428,6 +457,7 @@ type runtimeDeps struct {
 	mountLeaseFencer mountLeaseFencer
 	agentPurger      allocations.AgentDataPurger
 	certRevReconcile *certRevocationReconciler
+	purgeSweep       *purgeSweepHandlers
 	hostIdentity     identity.Verifier
 	cookieDomain     string
 	metrics          *controlMetrics
@@ -544,6 +574,9 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 			deps.certRevReconcile = newCertRevocationReconciler(deps.store, adminClient, logger)
 		}
 	}
+	if deps.store != nil && deps.allocations != nil {
+		deps.purgeSweep = newPurgeSweepHandlers(logger, deps.store, deps.allocations, deps.agentPurger)
+	}
 
 	apiServer := &http.Server{
 		Addr:              cfg.Addr,
@@ -570,11 +603,15 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	if deps.certRevReconcile != nil {
 		go deps.certRevReconcile.Run(ctx)
 	}
+	if deps.purgeSweep != nil && cfg.PurgeSweepInterval > 0 {
+		go deps.purgeSweep.Run(ctx, cfg.PurgeSweepInterval)
+	}
 
 	logger.Info("starting orlop-control",
 		"addr", cfg.Addr,
 		"metrics_addr", cfg.MetricsAddr,
 		"mount_lease_ttl", cfg.MountLeaseTTL.String(),
+		"purge_sweep_interval", cfg.PurgeSweepInterval.String(),
 		"database_url_configured", cfg.DatabaseURL != "",
 		"device_flow_enabled", deps.devAuth != nil,
 		"dashboard_enabled", deps.devAuth != nil && deps.store != nil && deps.allocations != nil,
@@ -645,8 +682,12 @@ func newRouter(logger *slog.Logger, deps runtimeDeps, cfg config) http.Handler {
 	// POST /v1/admin/purge-sweep: on-demand erase of revoked-but-unpurged
 	// allocations' backend data. Same service-token gate as /v1/entities.
 	if deps.store != nil && deps.allocations != nil {
+		purgeSweep := deps.purgeSweep
+		if purgeSweep == nil {
+			purgeSweep = newPurgeSweepHandlers(logger, deps.store, deps.allocations, deps.agentPurger)
+		}
 		mountPurgeSweep(router, RequireServiceToken(cfg.ControlPlaneToken),
-			newPurgeSweepHandlers(logger, deps.store, deps.allocations, deps.agentPurger))
+			purgeSweep)
 	}
 	// GET /v1/tenants/{owner}/usage: per-user disk usage for the control-plane's
 	// storage meter, same static-token gate as /v1/entities. serverUsage may be
