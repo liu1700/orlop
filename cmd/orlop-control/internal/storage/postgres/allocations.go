@@ -249,3 +249,48 @@ func (s *Store) ReserveCapacityForGrowth(ctx context.Context, serverID uuid.UUID
 	_, err := s.q.ReserveCapacityForGrowth(ctx, sqlcdb.ReserveCapacityForGrowthParams{FreeBytes: bytes, ID: pgUUID(serverID)})
 	return mapErr(err)
 }
+
+func (s *Store) ListOwnerCapacityReservations(ctx context.Context, userID uuid.UUID) ([]storage.OwnerCapacityReservation, error) {
+	rows, err := s.q.ListOwnerCapacityReservations(ctx, pgUUID(userID))
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	out := make([]storage.OwnerCapacityReservation, len(rows))
+	for i, row := range rows {
+		out[i] = storage.OwnerCapacityReservation{
+			UserID: domainUUID(row.UserID), ServerID: domainUUID(row.ServerID),
+			DataAddr: row.DataAddr, OpsAddr: row.OpsAddr, SizeBytes: row.SizeBytes,
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) CreateOwnerCapacityReservation(ctx context.Context, userID, serverID uuid.UUID, sizeBytes int64) error {
+	err := s.q.CreateOwnerCapacityReservation(ctx, sqlcdb.CreateOwnerCapacityReservationParams{
+		UserID: pgUUID(userID), ServerID: pgUUID(serverID), SizeBytes: sizeBytes,
+	})
+	if isUniqueViolation(err) {
+		return storage.ErrAlreadyExists
+	}
+	return mapErr(err)
+}
+
+func (s *Store) UpdateOwnerCapacityReservationSize(ctx context.Context, userID, serverID uuid.UUID, sizeBytes int64) error {
+	return mapErr(s.q.UpdateOwnerCapacityReservationSize(ctx, sqlcdb.UpdateOwnerCapacityReservationSizeParams{
+		UserID: pgUUID(userID), ServerID: pgUUID(serverID), SizeBytes: sizeBytes,
+	}))
+}
+
+func (s *Store) DeleteOwnerCapacityReservation(ctx context.Context, userID, serverID uuid.UUID) (int64, error) {
+	n, err := s.q.DeleteOwnerCapacityReservation(ctx, sqlcdb.DeleteOwnerCapacityReservationParams{
+		UserID: pgUUID(userID), ServerID: pgUUID(serverID),
+	})
+	return n, mapErr(err)
+}
+
+func (s *Store) CountPlacedAllocationsForUserOnServer(ctx context.Context, userID uuid.UUID, dataAddr string) (int64, error) {
+	n, err := s.q.CountPlacedAllocationsForUserOnServer(ctx, sqlcdb.CountPlacedAllocationsForUserOnServerParams{
+		UserID: pgUUID(userID), DataAddr: dataAddr,
+	})
+	return n, mapErr(err)
+}

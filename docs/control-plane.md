@@ -236,6 +236,9 @@ return `503` with `Retry-After: 60` so a sidecar can retry without burning the
 (still-unspent) enroll token. Pool exhaustion uses the wire error
 `no_capacity`; other placement failures use `server_vm_unavailable`, so an
 operator is not sent to debug a healthy data-plane VM when the pool is full.
+Because the data plane enforces one shared owner-directory quota, placement
+debits that account budget once per hosting server. Additional agents on the
+same account/server reuse the durable reservation; the last purge releases it.
 
 ### `GET /v1/whoami`
 

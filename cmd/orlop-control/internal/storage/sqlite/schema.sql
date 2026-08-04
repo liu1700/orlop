@@ -126,6 +126,35 @@ CREATE TABLE IF NOT EXISTS server_vms (
     created_at      INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS owner_capacity_reservations (
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    server_id  TEXT NOT NULL REFERENCES server_pool(id) ON DELETE CASCADE,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, server_id)
+);
+
+-- Idempotent upgrade bridge from the historical per-agent debits. Existing
+-- SQLite databases re-run this schema on open, so populate any missing ledger
+-- rows and derive free_bytes from the ledger on every start.
+INSERT INTO owner_capacity_reservations (user_id, server_id, size_bytes, created_at)
+SELECT da.user_id, sp.id, MAX(da.size_bytes), MIN(da.created_at)
+FROM disk_allocations da
+JOIN users u ON u.id = da.user_id
+JOIN server_vms sv ON sv.tenant_id = COALESCE(da.tenant_id, u.tenant_id)
+JOIN server_pool sp ON sp.data_addr = sv.data_addr
+WHERE da.user_id IS NOT NULL
+  AND da.purged_at IS NULL
+GROUP BY da.user_id, sp.id
+ON CONFLICT(user_id, server_id) DO NOTHING;
+
+UPDATE server_pool
+SET free_bytes = MAX(0, total_bytes - COALESCE((
+        SELECT SUM(r.size_bytes)
+        FROM owner_capacity_reservations r
+        WHERE r.server_id = server_pool.id
+    ), 0));
+
 CREATE TABLE IF NOT EXISTS dg_ca_secrets (
     key        TEXT PRIMARY KEY,
     value      BLOB NOT NULL,

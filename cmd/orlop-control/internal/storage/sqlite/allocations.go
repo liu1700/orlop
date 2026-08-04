@@ -288,3 +288,59 @@ func (s *Store) ReserveCapacityForGrowth(ctx context.Context, serverID uuid.UUID
 		bytes, nowMicros(), serverID, bytes).Scan(&id)
 	return mapErr(err)
 }
+
+func (s *Store) ListOwnerCapacityReservations(ctx context.Context, userID uuid.UUID) ([]storage.OwnerCapacityReservation, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT r.user_id, r.server_id, r.size_bytes, sp.data_addr, sp.ops_addr
+		   FROM owner_capacity_reservations r JOIN server_pool sp ON sp.id = r.server_id
+		  WHERE r.user_id = ? ORDER BY r.created_at, r.server_id`, userID)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	var out []storage.OwnerCapacityReservation
+	for rows.Next() {
+		var r storage.OwnerCapacityReservation
+		if err := rows.Scan(&r.UserID, &r.ServerID, &r.SizeBytes, &r.DataAddr, &r.OpsAddr); err != nil {
+			return nil, mapErr(err)
+		}
+		out = append(out, r)
+	}
+	return out, mapErr(rows.Err())
+}
+
+func (s *Store) CreateOwnerCapacityReservation(ctx context.Context, userID, serverID uuid.UUID, sizeBytes int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO owner_capacity_reservations (user_id, server_id, size_bytes, created_at) VALUES (?, ?, ?, ?)`,
+		userID, serverID, sizeBytes, nowMicros())
+	return mapErr(err)
+}
+
+func (s *Store) UpdateOwnerCapacityReservationSize(ctx context.Context, userID, serverID uuid.UUID, sizeBytes int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE owner_capacity_reservations SET size_bytes = ? WHERE user_id = ? AND server_id = ?`,
+		sizeBytes, userID, serverID)
+	return mapErr(err)
+}
+
+func (s *Store) DeleteOwnerCapacityReservation(ctx context.Context, userID, serverID uuid.UUID) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM owner_capacity_reservations WHERE user_id = ? AND server_id = ?`, userID, serverID)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	n, err := res.RowsAffected()
+	return n, mapErr(err)
+}
+
+func (s *Store) CountPlacedAllocationsForUserOnServer(ctx context.Context, userID uuid.UUID, dataAddr string) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count(DISTINCT sv.tenant_id)
+		   FROM disk_allocations da
+		   JOIN users u ON u.id = da.user_id
+		   JOIN server_vms sv ON sv.tenant_id = COALESCE(da.tenant_id, u.tenant_id)
+		  WHERE da.user_id = ? AND da.purged_at IS NULL AND sv.data_addr = ?`,
+		userID, dataAddr).Scan(&n)
+	return n, mapErr(err)
+}

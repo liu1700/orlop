@@ -65,6 +65,16 @@ type ChosenServer struct {
 	OpsAddr  string
 }
 
+// OwnerCapacityReservation is the account-level pool debit backing the shared
+// owner-directory quota on one server. Multiple agents on that server reuse it.
+type OwnerCapacityReservation struct {
+	UserID    uuid.UUID
+	ServerID  uuid.UUID
+	DataAddr  string
+	OpsAddr   string
+	SizeBytes int64
+}
+
 // NewServerVM records a tenant placement.
 type NewServerVM struct {
 	TenantID string
@@ -112,6 +122,11 @@ type AllocationOps interface {
 	ReserveCapacity(ctx context.Context, serverID uuid.UUID, bytes int64) error // ErrNotFound when none fits
 	ReleaseCapacity(ctx context.Context, serverID uuid.UUID, bytes int64) error
 	ReserveCapacityForGrowth(ctx context.Context, serverID uuid.UUID, bytes int64) error // ErrNotFound when full
+	ListOwnerCapacityReservations(ctx context.Context, userID uuid.UUID) ([]OwnerCapacityReservation, error)
+	CreateOwnerCapacityReservation(ctx context.Context, userID, serverID uuid.UUID, sizeBytes int64) error
+	UpdateOwnerCapacityReservationSize(ctx context.Context, userID, serverID uuid.UUID, sizeBytes int64) error
+	DeleteOwnerCapacityReservation(ctx context.Context, userID, serverID uuid.UUID) (int64, error)
+	CountPlacedAllocationsForUserOnServer(ctx context.Context, userID uuid.UUID, dataAddr string) (int64, error)
 }
 
 // AllocationStore is the allocations data layer plus transaction control.

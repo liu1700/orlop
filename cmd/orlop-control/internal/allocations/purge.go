@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -45,14 +44,12 @@ type AgentDataPurger interface {
 //     (manifests under /<agentID> + chunks that drop to refcount 0). The
 //     tenant's pool reservation stays: it backs the surviving agents.
 //   - this was the last one → unregister the whole tenant (os.RemoveAll of
-//     the tenant dir), drop the server_vms placement so a future agent
-//     re-Reserves cleanly, and release the allocation's size_bytes back to
-//     server_pool.free_bytes.
+//     the tenant dir), drop the server_vms placement, and release the owner's
+//     one account-level reservation after its final placement disappears.
 //
-// Idempotent and concurrency-safe: the purged_at CAS (MarkAllocationPurged)
-// elects exactly one winner, and only the winner releases pool capacity, so
-// the inline delete-agent purge and the on-demand sweeper can race freely.
-// The data-plane calls themselves are idempotent on the server.
+// Idempotent and concurrency-safe: the owner row lock serializes concurrent
+// final-placement cleanup, and deleting the reservation is the release CAS.
+// The data-plane calls and purged_at transition are themselves idempotent.
 //
 // An unplaced tenant (provisioned but never enrolled — no server_vms row) has
 // no data anywhere; the allocation is just marked purged.
@@ -93,7 +90,11 @@ func (s *Service) PurgeAllocation(ctx context.Context, api AgentDataPurger, allo
 	vm, err := s.store.GetServerVMByTenant(ctx, tenant)
 	if errors.Is(err, storage.ErrNotFound) {
 		// Never placed on a server: no bytes exist to erase.
-		return s.markPurged(ctx, allocID, "unplaced", 0, nil)
+		released, cleanupErr := s.releaseUnusedOwnerCapacity(ctx, alloc.UserID, "")
+		if cleanupErr != nil {
+			return cleanupErr
+		}
+		return s.markPurged(ctx, allocID, "unplaced", released)
 	}
 	if err != nil {
 		return fmt.Errorf("purge: get server vm: %w", err)
@@ -125,17 +126,11 @@ func (s *Service) PurgeAllocation(ctx context.Context, api AgentDataPurger, allo
 		if err := api.UnregisterTenant(ctx, server.OpsAddr, tenant); err != nil {
 			return fmt.Errorf("purge: unregister tenant %s: %w", tenant, err)
 		}
-		return s.markPurged(ctx, allocID, "tenant_unregistered", alloc.SizeBytes, func(cctx context.Context) {
-			if n, derr := s.store.DeleteServerVM(cctx, tenant); derr != nil {
-				s.logger.Error("purge_delete_server_vm_failed", "tenant_id", tenant, "error", derr)
-			} else if n > 0 {
-				s.logger.Info("purge_placement_dropped", "tenant_id", tenant)
-			}
-			if rerr := s.store.ReleaseCapacity(cctx, server.ID, alloc.SizeBytes); rerr != nil {
-				s.logger.Error("purge_release_capacity_failed",
-					"server_id", server.ID, "bytes", alloc.SizeBytes, "error", rerr)
-			}
-		})
+		released, cleanupErr := s.releaseUnusedOwnerCapacity(ctx, alloc.UserID, tenant)
+		if cleanupErr != nil {
+			return cleanupErr
+		}
+		return s.markPurged(ctx, allocID, "tenant_unregistered", released)
 	}
 
 	// Legacy shared tenant with other agents: erase just this agent's subtree.
@@ -143,25 +138,73 @@ func (s *Service) PurgeAllocation(ctx context.Context, api AgentDataPurger, allo
 	if err := api.PurgeAgentData(ctx, server.OpsAddr, tenant, alloc.AgentID); err != nil {
 		return fmt.Errorf("purge: agent data on %s: %w", server.OpsAddr, err)
 	}
-	return s.markPurged(ctx, allocID, "agent_subtree", 0, nil)
+	return s.markPurged(ctx, allocID, "agent_subtree", 0)
 }
 
-// markPurged CAS-transitions purged_at and, when this caller wins the CAS,
-// runs the release hook (placement drop + capacity release) on a fresh
-// context so a cancelled parent cannot strand half the cleanup. Losing the
-// CAS means a concurrent purge finished first — nothing left to do.
-func (s *Service) markPurged(ctx context.Context, allocationID uuid.UUID, mode string, releasedBytes int64, release func(context.Context)) error {
+// releaseUnusedOwnerCapacity drops the erased placement and, once the account
+// has neither active allocations nor placements on a reserved server, releases
+// its one durable account-level debit. The owner row lock serializes concurrent
+// last-agent purges; doing this before purged_at means the sweeper retries the
+// whole idempotent cleanup after a crash instead of silently stranding capacity.
+func (s *Service) releaseUnusedOwnerCapacity(ctx context.Context, userID uuid.UUID, erasedTenant string) (int64, error) {
+	tx, err := s.store.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("purge: begin owner cleanup: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.GetUserForUpdate(ctx, userID); err != nil {
+		return 0, fmt.Errorf("purge: lock owner: %w", err)
+	}
+	if erasedTenant != "" {
+		if _, err := tx.DeleteServerVM(ctx, erasedTenant); err != nil {
+			return 0, fmt.Errorf("purge: delete placement: %w", err)
+		}
+	}
+	active, err := tx.CountActiveAllocationsForUser(ctx, userID)
+	if err != nil {
+		return 0, fmt.Errorf("purge: count active allocations: %w", err)
+	}
+	reservations, err := tx.ListOwnerCapacityReservations(ctx, userID)
+	if err != nil {
+		return 0, fmt.Errorf("purge: list owner reservations: %w", err)
+	}
+	var released int64
+	if active == 0 {
+		for _, reservation := range reservations {
+			placed, err := tx.CountPlacedAllocationsForUserOnServer(ctx, userID, reservation.DataAddr)
+			if err != nil {
+				return 0, fmt.Errorf("purge: count owner placements: %w", err)
+			}
+			if placed != 0 {
+				continue
+			}
+			n, err := tx.DeleteOwnerCapacityReservation(ctx, userID, reservation.ServerID)
+			if err != nil {
+				return 0, fmt.Errorf("purge: delete owner reservation: %w", err)
+			}
+			if n > 0 {
+				if err := tx.ReleaseCapacity(ctx, reservation.ServerID, reservation.SizeBytes); err != nil {
+					return 0, fmt.Errorf("purge: release owner capacity: %w", err)
+				}
+				released += reservation.SizeBytes
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("purge: commit owner cleanup: %w", err)
+	}
+	return released, nil
+}
+
+// markPurged CAS-transitions purged_at. Losing the CAS means a concurrent
+// purge completed first; the preceding cleanup is idempotent.
+func (s *Service) markPurged(ctx context.Context, allocationID uuid.UUID, mode string, releasedBytes int64) error {
 	row, err := s.store.MarkAllocationPurged(ctx, allocationID)
 	if errors.Is(err, storage.ErrNotFound) {
 		return nil // concurrent purge won; it owns the release
 	}
 	if err != nil {
 		return fmt.Errorf("purge: mark purged: %w", err)
-	}
-	if release != nil {
-		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		release(cctx)
 	}
 	s.logger.Info("allocation_purged",
 		"allocation_id", row.ID.String(),

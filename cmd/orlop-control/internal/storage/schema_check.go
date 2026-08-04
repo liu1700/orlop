@@ -48,6 +48,7 @@ func RequiredSchema() []RequiredTable {
 		{Name: "cert_revocations"},
 		{Name: "server_pool"},
 		{Name: "server_vms"},
+		{Name: "owner_capacity_reservations", Columns: []string{"user_id", "server_id", "size_bytes"}},
 		{Name: "dg_ca_secrets"},
 		{Name: "sessions_anonymous"},
 	}

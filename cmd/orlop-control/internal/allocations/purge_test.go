@@ -69,11 +69,26 @@ func getAllocation(t *testing.T, pool *pgxpool.Pool, id pgtype.UUID) sqlcdb.Disk
 	return row
 }
 
+func seedOwnerReservation(t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID, dataAddr string, sizeBytes int64) {
+	t.Helper()
+	q := sqlcdb.New(pool)
+	server, err := q.GetServerPoolByDataAddr(context.Background(), dataAddr)
+	if err != nil {
+		t.Fatalf("get server pool: %v", err)
+	}
+	if err := q.CreateOwnerCapacityReservation(context.Background(), sqlcdb.CreateOwnerCapacityReservationParams{
+		UserID: userID, ServerID: server.ID, SizeBytes: sizeBytes,
+	}); err != nil {
+		t.Fatalf("create owner reservation: %v", err)
+	}
+}
+
 func TestPurgeLastAllocationUnregistersTenantAndReleasesCapacity(t *testing.T) {
 	svc, pool := withSvc(t)
 	ctx := context.Background()
 	user := seedUser(t, pool, "purge-last@acme.example", 10*GiB)
 	placeTenant(t, pool, user.TenantID, 100*GiB, 90*GiB) // 10 GiB notionally reserved
+	seedOwnerReservation(t, pool, user.ID, "data-"+user.TenantID, 10*GiB)
 	alloc := seedAgentAllocation(t, pool, user.ID, "agent-last", 10*GiB)
 	revokeRow(t, pool, alloc)
 
@@ -113,6 +128,7 @@ func TestPurgeWithSurvivingAgentPurgesSubtreeOnly(t *testing.T) {
 	ctx := context.Background()
 	user := seedUser(t, pool, "purge-shared@acme.example", 10*GiB)
 	placeTenant(t, pool, user.TenantID, 100*GiB, 90*GiB)
+	seedOwnerReservation(t, pool, user.ID, "data-"+user.TenantID, 10*GiB)
 	doomed := seedAgentAllocation(t, pool, user.ID, "agent-doomed", 1*GiB)
 	seedAgentAllocation(t, pool, user.ID, "agent-survivor", 1*GiB)
 	revokeRow(t, pool, doomed)
@@ -182,6 +198,7 @@ func TestPurgeIsIdempotentAndReleasesOnce(t *testing.T) {
 	ctx := context.Background()
 	user := seedUser(t, pool, "purge-twice@acme.example", 10*GiB)
 	placeTenant(t, pool, user.TenantID, 100*GiB, 90*GiB)
+	seedOwnerReservation(t, pool, user.ID, "data-"+user.TenantID, 10*GiB)
 	alloc := seedAgentAllocation(t, pool, user.ID, "agent-twice", 10*GiB)
 	revokeRow(t, pool, alloc)
 
