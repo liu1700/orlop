@@ -115,6 +115,35 @@ func TestRefreshUnknownReturnsError(t *testing.T) {
 	}
 }
 
+func TestAuthorizeOrRebindSession(t *testing.T) {
+	mgr, _ := newTestMgr(t)
+	g, err := mgr.Grant(context.Background(), "agentA", 10, "/x", dataplane.LeaseExclusiveWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := idArrayFromBytes(g.LeaseID)
+
+	if authorized, rebound := mgr.AuthorizeOrRebindSession(id, "agentB", 20); authorized || rebound {
+		t.Fatalf("different holder authorized=%v rebound=%v, want false/false", authorized, rebound)
+	}
+	if authorized, rebound := mgr.AuthorizeOrRebindSession(id, "agentA", 20); !authorized || !rebound {
+		t.Fatalf("successor connection authorized=%v rebound=%v, want true/true", authorized, rebound)
+	}
+
+	// Cleanup and delayed I/O from the superseded connection must not affect
+	// the session after ownership moves forward.
+	mgr.ReleaseAllForConn(10)
+	if !mgr.HeldByConn(id, 20) {
+		t.Fatal("old connection cleanup released rebound session")
+	}
+	if authorized, rebound := mgr.AuthorizeOrRebindSession(id, "agentA", 10); authorized || rebound {
+		t.Fatalf("superseded connection reclaimed session: authorized=%v rebound=%v", authorized, rebound)
+	}
+	if !mgr.HeldByConn(id, 20) {
+		t.Fatal("superseded connection changed rebound session ownership")
+	}
+}
+
 func TestLeaseHandlerRoundTrip(t *testing.T) {
 	mgr, _ := newTestMgr(t)
 

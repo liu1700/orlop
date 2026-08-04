@@ -105,9 +105,9 @@ func TestManifestPutCasConflictPopulatesLastWriter(t *testing.T) {
 		allocA   = "alloc_cas_test"
 		agentA   = "agent_A"
 	)
-	seedMountLease(state, tenant, allocA, 0x61)
 	identA := testIdentity()
 	identA.AgentID = agentA
+	tenant.leases.installForTest(testLeaseID(0x61), agentA, testConnID, "/", dataplane.LeaseExclusiveWrite)
 	priorPut := dataplane.ManifestPutRequest{
 		Path:         path,
 		Size:         4,

@@ -254,15 +254,52 @@ func buildRevokeFrame(id [16]byte, reason string) dataplane.Frame {
 
 // HeldByConn reports whether the lease with the given id is currently held by
 // connID. False if the lease doesn't exist OR it's held by a different
-// connection. Used by the mount-session forgery check (checkSessionFence) to
-// reject (a) fabricated session_ids and (b) replay of a leaked session_id
-// across connections. Spec:
-// an internal design spec.
+// connection. Primarily used by lifecycle checks and tests; session write
+// authorization uses AuthorizeOrRebindSession so a live mount can survive a
+// transport reconnect without weakening the authenticated-agent boundary.
 func (m *leaseManager) HeldByConn(id [16]byte, connID uint64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rec, ok := m.byID[id]
 	return ok && rec.connID == connID
+}
+
+// AuthorizeOrRebindSession verifies that id is a live lease held by holder and
+// binds it to connID. A changed connection with the same authenticated agent is
+// a transport reconnect, not a new mount: keep the lease id/session_id stable
+// and atomically move its byConn ownership so cleanup of the dead connection
+// cannot release the rebound lease. A different holder, expired/revoking lease,
+// or unknown id is rejected without changing state.
+func (m *leaseManager) AuthorizeOrRebindSession(id [16]byte, holder string, connID uint64) (authorized, rebound bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.byID[id]
+	if !ok || rec.holder != holder || !rec.expiresAt.After(time.Now()) || rec.revoking != nil {
+		return false, false
+	}
+	if rec.connID == connID {
+		return true, false
+	}
+	// Connection ids are monotonically allocated for the lifetime of the
+	// server. Only a successor connection may take over a live session; this
+	// prevents a delayed request on the old socket from moving the lease back
+	// after a successful reconnect. Restored leases use connID 0 and may be
+	// claimed by the first authenticated connection from the same holder.
+	if connID < rec.connID {
+		return false, false
+	}
+	if old := m.byConn[rec.connID]; old != nil {
+		delete(old, rec.id)
+		if len(old) == 0 {
+			delete(m.byConn, rec.connID)
+		}
+	}
+	rec.connID = connID
+	if m.byConn[connID] == nil {
+		m.byConn[connID] = map[[16]byte]struct{}{}
+	}
+	m.byConn[connID][rec.id] = struct{}{}
+	return true, true
 }
 
 // Refresh extends the lease's expiry. connID must be the connection the lease

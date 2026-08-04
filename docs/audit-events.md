@@ -339,7 +339,8 @@ Also exposed:
 | `orlop_journal_query_duration_seconds` | histogram | none |
 | `orlop_journal_rows_total` | gauge | `allocation_id` |
 | `orlop_journal_revert_total` | counter | `allocation_id`, `result` |
-| `orlop_session_forgery_rejected_total` | counter | `reason` (`bad_format`, `bad_hex`, `unknown_or_wrong_conn`, `fenced`) |
+| `orlop_session_forgery_rejected_total` | counter | `reason` (`bad_format`, `bad_hex`, `unknown_or_wrong_holder`, `fenced`) |
+| `orlop_session_rebind_total` | counter | none; legitimate live-lease reconnects, kept separate from forgery alerts |
 | `orlop_agent_path_denied_total` | counter | `op` |
 
 `orlop_agent_path_denied_total` increments when a connection whose cert carries

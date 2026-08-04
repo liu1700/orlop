@@ -49,7 +49,7 @@ func testLeaseID(suffix byte) [16]byte {
 // forgery check accepts the fabricated session_id. Production code installs
 // via Grant; tests skip the wire dance and seed both registries directly.
 func seedMountLease(state *serverState, tenant *tenantState, allocID string, suffix byte) {
-	tenant.leases.installForTest(testLeaseID(suffix), "test-holder", testConnID, "/", dataplane.LeaseExclusiveWrite)
+	tenant.leases.installForTest(testLeaseID(suffix), testAgent, testConnID, "/", dataplane.LeaseExclusiveWrite)
 	state.mountLeases.Install(allocID, testSessionIDHex(suffix))
 }
 
