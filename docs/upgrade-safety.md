@@ -18,6 +18,7 @@ check the control plane runs at boot.
 | v0.2.0 | HEAD | Postgres, SQLite |
 | v0.2.1 | HEAD | Postgres, SQLite |
 | v0.5.1 | HEAD | Postgres, SQLite |
+| v0.5.2 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -72,7 +73,7 @@ legacy per-agent over-reservation. The migration is safe to retry, but the old
 v0.5.1 allocator does not understand the new ledger: after migrating, restore
 the backup before rolling the control plane back to v0.5.1.
 
-Deployments that already ran v0.5.2 should also run the next release's
+Deployments that already ran v0.5.2 should upgrade to v0.5.3 and run its
 `0012_repair_owner_capacity_reservations.sql`. It repairs historical allocations
 whose per-agent tenant has no `server_vms` row and rebuilds `free_bytes` (#108).
 The repair is automatic when only one pool server exists. In a multi-server
