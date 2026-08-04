@@ -19,6 +19,7 @@ check the control plane runs at boot.
 | v0.2.1 | HEAD | Postgres, SQLite |
 | v0.5.1 | HEAD | Postgres, SQLite |
 | v0.5.2 | HEAD | Postgres, SQLite |
+| v0.5.3 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
