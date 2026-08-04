@@ -79,7 +79,53 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("apply sqlite schema: %w", err)
 	}
+	if err := validateOwnerCapacityLedger(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	return New(pool), nil
+}
+
+// validateOwnerCapacityLedger prevents the startup-time schema bridge from
+// silently accepting the same incomplete ledger that migration 0011 produced
+// for Postgres (#108). The SQL bridge repairs historically enrolled, unplaced
+// owners automatically when there is one server; with multiple servers,
+// choosing one here would be unsafe because disk_allocations does not persist
+// its own server address.
+func validateOwnerCapacityLedger(ctx context.Context, pool *sql.DB) error {
+	var unresolved int64
+	err := pool.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM (
+			SELECT DISTINCT da.user_id
+			FROM disk_allocations da
+			WHERE da.user_id IS NOT NULL
+			  AND da.purged_at IS NULL
+			  AND EXISTS (
+				  SELECT 1
+				  FROM disk_allocations enrolled_da
+				  JOIN agent_enrollments ae
+				    ON ae.user_id = enrolled_da.user_id
+				   AND ae.enrolled_at >= enrolled_da.created_at
+				  WHERE enrolled_da.user_id = da.user_id
+				    AND enrolled_da.purged_at IS NULL
+			  )
+			  AND NOT EXISTS (
+				  SELECT 1
+				  FROM owner_capacity_reservations r
+				  WHERE r.user_id = da.user_id
+			  )
+		) unresolved`).Scan(&unresolved)
+	if err != nil {
+		return fmt.Errorf("validate owner-capacity ledger: %w", err)
+	}
+	if unresolved > 0 {
+		return fmt.Errorf(
+			"owner-capacity repair cannot infer server placement for %d owner(s); restore their server_vms rows or create matching owner_capacity_reservations, then reopen the database",
+			unresolved,
+		)
+	}
+	return nil
 }
 
 // dsn builds a modernc.org/sqlite connection string with the pragmas the control

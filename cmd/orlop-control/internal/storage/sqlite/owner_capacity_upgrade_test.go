@@ -3,7 +3,9 @@ package sqlite
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -80,5 +82,163 @@ func TestSchemaUpgradeBackfillsOneReservationPerOwner(t *testing.T) {
 	}
 	if len(reservations) != 1 || reservations[0].SizeBytes != 2<<30 || reservations[0].DataAddr != server.DataAddr {
 		t.Fatalf("reservations = %+v, want one 2 GiB owner reservation", reservations)
+	}
+}
+
+func TestSchemaUpgradeRepairsUnplacedOwnerOnSingleServer(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "owner-capacity-unplaced.db")
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerID := uuid.New()
+	if err := s.EnsureTenant(ctx, "u_owner", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureUserWithID(ctx, storage.NewUser{ID: ownerID, TenantID: "u_owner", Email: "owner@test.invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureTenant(ctx, "a_unplaced", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertAgentAllocation(ctx, storage.NewAgentAllocation{
+		UserID: ownerID, AgentID: "agent-1", TenantID: "a_unplaced", SizeBytes: 2 << 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAgentEnrollment(ctx, storage.NewAgentEnrollment{
+		UserID: ownerID, CertSerial: "enrolled-unplaced", CertNotAfter: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RegisterServerPool(ctx, storage.ServerPool{
+		DataAddr: "data:1", OpsAddr: "ops:1", TotalBytes: 10 << 30, FreeBytes: 10 << 30, Status: "available",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Emulate v0.5.2 after migration 0011: the live allocation has no
+	// server_vms placement, no ledger row, and free_bytes still reads as full.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM owner_capacity_reservations`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	reservations, err := s.ListOwnerCapacityReservations(ctx, ownerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reservations) != 1 || reservations[0].DataAddr != "data:1" || reservations[0].SizeBytes != 2<<30 {
+		t.Fatalf("reservations = %+v, want one 2 GiB reservation on the only server", reservations)
+	}
+	var free int64
+	if err := s.db.QueryRowContext(ctx, `SELECT free_bytes FROM server_pool WHERE data_addr = ?`, "data:1").Scan(&free); err != nil {
+		t.Fatal(err)
+	}
+	if free != 8<<30 {
+		t.Fatalf("free_bytes = %d, want 8 GiB after repairing the missing reservation", free)
+	}
+}
+
+func TestSchemaUpgradeRejectsAmbiguousUnplacedOwner(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "owner-capacity-ambiguous.db")
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerID := uuid.New()
+	if err := s.EnsureTenant(ctx, "u_owner", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureUserWithID(ctx, storage.NewUser{ID: ownerID, TenantID: "u_owner", Email: "owner@test.invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureTenant(ctx, "a_unplaced", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertAgentAllocation(ctx, storage.NewAgentAllocation{
+		UserID: ownerID, AgentID: "agent-1", TenantID: "a_unplaced", SizeBytes: 2 << 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAgentEnrollment(ctx, storage.NewAgentEnrollment{
+		UserID: ownerID, CertSerial: "enrolled-ambiguous", CertNotAfter: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range []storage.ServerPool{
+		{DataAddr: "data:1", OpsAddr: "ops:1", TotalBytes: 10 << 30, FreeBytes: 10 << 30, Status: "available"},
+		{DataAddr: "data:2", OpsAddr: "ops:2", TotalBytes: 10 << 30, FreeBytes: 10 << 30, Status: "available"},
+	} {
+		if _, err := s.RegisterServerPool(ctx, server); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM owner_capacity_reservations`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = Open(ctx, path)
+	if err == nil || !strings.Contains(err.Error(), "cannot infer server placement for 1 owner(s)") {
+		t.Fatalf("Open error = %v, want explicit ambiguous-placement error", err)
+	}
+}
+
+func TestSchemaUpgradeLeavesNeverEnrolledAllocationUnreserved(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "owner-capacity-never-enrolled.db")
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerID := uuid.New()
+	if err := s.EnsureTenant(ctx, "u_owner", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureUserWithID(ctx, storage.NewUser{ID: ownerID, TenantID: "u_owner", Email: "owner@test.invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureTenant(ctx, "a_unplaced", "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertAgentAllocation(ctx, storage.NewAgentAllocation{
+		UserID: ownerID, AgentID: "agent-1", TenantID: "a_unplaced", SizeBytes: 2 << 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range []storage.ServerPool{
+		{DataAddr: "data:1", OpsAddr: "ops:1", TotalBytes: 10 << 30, FreeBytes: 10 << 30, Status: "available"},
+		{DataAddr: "data:2", OpsAddr: "ops:2", TotalBytes: 10 << 30, FreeBytes: 10 << 30, Status: "available"},
+	} {
+		if _, err := s.RegisterServerPool(ctx, server); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open rejected a legitimately unplaced allocation: %v", err)
+	}
+	defer s.Close()
+	reservations, err := s.ListOwnerCapacityReservations(ctx, ownerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reservations) != 0 {
+		t.Fatalf("reservations = %+v, want none before first enrollment", reservations)
 	}
 }

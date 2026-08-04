@@ -72,6 +72,14 @@ legacy per-agent over-reservation. The migration is safe to retry, but the old
 v0.5.1 allocator does not understand the new ledger: after migrating, restore
 the backup before rolling the control plane back to v0.5.1.
 
+Deployments that already ran v0.5.2 should also run the next release's
+`0012_repair_owner_capacity_reservations.sql`. It repairs historical allocations
+whose per-agent tenant has no `server_vms` row and rebuilds `free_bytes` (#108).
+The repair is automatic when only one pool server exists. In a multi-server
+deployment, `migrate up` stops with an unresolved-owner count if placement
+cannot be inferred; restore those `server_vms` rows (or create the matching
+owner reservation explicitly) and rerun the idempotent migration.
+
 | Do | Don't |
 |---|---|
 | Run `migrate up` with the **new** binary before starting it. | Start a new binary against an un-migrated database — boot fails the schema check by design. |
