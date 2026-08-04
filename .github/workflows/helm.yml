@@ -1,0 +1,43 @@
+name: helm
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    name: chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.1.0
+      - name: Lint chart
+        run: helm lint deploy/helm/orlop
+      - name: Render default release image tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/orlop
+          app_version="$(helm show chart "$chart" | awk '$1 == "appVersion:" {gsub(/"/, "", $2); print $2}')"
+          case "$app_version" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Chart appVersion must be a vX.Y.Z release tag, got: $app_version" >&2; exit 1 ;;
+          esac
+          rendered="$(helm template release-check "$chart" \
+            --set auth.controlPlaneToken=release-test-token \
+            --set auth.secretsEncKey=0000000000000000000000000000000000000000000000000000000000000000 \
+            --set database.url=postgresql://orlop:test@postgres/orlop)"
+          for image in \
+            "ghcr.io/liu1700/orlop-control:$app_version" \
+            "ghcr.io/liu1700/orlop-server:$app_version"; do
+            if ! grep -Fq "image: $image" <<<"$rendered"; then
+              echo "Rendered chart does not reference $image" >&2
+              exit 1
+            fi
+          done
