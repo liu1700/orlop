@@ -374,10 +374,10 @@ func (s *serverState) authorizePath(ident Identity, w *frameWriter, frame datapl
 // resolveSessionFence unwraps a write request's optional session/allocation
 // ids and runs checkSessionFence on them. ok=false means the fence check has
 // already written the EACCES frame; callers must stop.
-func (s *serverState) resolveSessionFence(tenant *tenantState, w *frameWriter, frame dataplane.Frame, sessionIDPtr, allocationIDPtr *string) (sessionID, allocationID, activeLeaseHex string, ok bool) {
+func (s *serverState) resolveSessionFence(tenant *tenantState, ident Identity, w *frameWriter, frame dataplane.Frame, sessionIDPtr, allocationIDPtr *string) (sessionID, allocationID, activeLeaseHex string, ok bool) {
 	sessionID = derefSession(sessionIDPtr)
 	allocationID = derefSession(allocationIDPtr)
-	activeLeaseHex, ok = s.checkSessionFence(tenant, w, frame, sessionID, allocationID)
+	activeLeaseHex, ok = s.checkSessionFence(tenant, ident, w, frame, sessionID, allocationID)
 	return sessionID, allocationID, activeLeaseHex, ok
 }
 
@@ -537,7 +537,7 @@ func handleManifestPut(s *serverState, tenant *tenantState, ident Identity, w *f
 		Mtime:  req.Mtime,
 		Chunks: fromWireChunks(req.Chunks),
 	}
-	sessionID, allocationID, activeLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
+	sessionID, allocationID, activeLeaseHex, ok := s.resolveSessionFence(tenant, ident, w, frame, req.SessionID, req.AllocationID)
 	if !ok {
 		return
 	}
@@ -607,7 +607,7 @@ func handleManifestDelete(s *serverState, tenant *tenantState, ident Identity, w
 	if !s.authorizePath(ident, w, frame, "manifest_delete", req.Path, req.SessionID) {
 		return
 	}
-	delSessionID, delAllocationID, delActiveLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
+	delSessionID, delAllocationID, delActiveLeaseHex, ok := s.resolveSessionFence(tenant, ident, w, frame, req.SessionID, req.AllocationID)
 	if !ok {
 		return
 	}
@@ -636,7 +636,7 @@ func handleManifestRename(s *serverState, tenant *tenantState, ident Identity, w
 	if !s.checkAgentPath(ident, w, frame, req.To) {
 		return
 	}
-	renSessionID, renAllocationID, renActiveLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
+	renSessionID, renAllocationID, renActiveLeaseHex, ok := s.resolveSessionFence(tenant, ident, w, frame, req.SessionID, req.AllocationID)
 	if !ok {
 		return
 	}
@@ -662,7 +662,7 @@ func handleLink(s *serverState, tenant *tenantState, ident Identity, w *frameWri
 	if !s.checkAgentPath(ident, w, frame, req.From) || !s.checkAgentPath(ident, w, frame, req.To) {
 		return
 	}
-	sessionID, allocationID, activeLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
+	sessionID, allocationID, activeLeaseHex, ok := s.resolveSessionFence(tenant, ident, w, frame, req.SessionID, req.AllocationID)
 	if !ok {
 		return
 	}
@@ -721,7 +721,7 @@ func handleSetattr(s *serverState, tenant *tenantState, ident Identity, w *frame
 	if !s.authorizePath(ident, w, frame, "setattr", req.Path, req.SessionID) {
 		return
 	}
-	sessionID, allocationID, activeLeaseHex, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID)
+	sessionID, allocationID, activeLeaseHex, ok := s.resolveSessionFence(tenant, ident, w, frame, req.SessionID, req.AllocationID)
 	if !ok {
 		return
 	}
@@ -818,7 +818,7 @@ func handleMknod(s *serverState, tenant *tenantState, ident Identity, w *frameWr
 	if !s.authorizePath(ident, w, frame, "mknod", req.Path, req.SessionID) {
 		return
 	}
-	if _, _, _, ok := s.resolveSessionFence(tenant, w, frame, req.SessionID, req.AllocationID); !ok {
+	if _, _, _, ok := s.resolveSessionFence(tenant, ident, w, frame, req.SessionID, req.AllocationID); !ok {
 		return
 	}
 	if err := tenant.manifests.Mknod(req.Path, req.Mode, req.Rdev); err != nil {
@@ -1237,7 +1237,7 @@ func (s *serverState) denyAgentPath(ident Identity, w *frameWriter, frame datapl
 // For unsessioned writes (empty sessionID) it is a no-op, returning
 // ("", true). On any failure it writes an EACCES frame and returns
 // ("", false); callers must stop processing the request.
-func (s *serverState) checkSessionFence(tenant *tenantState, w *frameWriter, frame dataplane.Frame, sessionID, allocationID string) (string, bool) {
+func (s *serverState) checkSessionFence(tenant *tenantState, ident Identity, w *frameWriter, frame dataplane.Frame, sessionID, allocationID string) (string, bool) {
 	if sessionID == "" {
 		return "", true
 	}
@@ -1253,10 +1253,14 @@ func (s *serverState) checkSessionFence(tenant *tenantState, w *frameWriter, fra
 		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("invalid session_id hex: "+err.Error()))
 		return "", false
 	}
-	if !tenant.leases.HeldByConn(leaseID, w.connID) {
-		s.metrics.sessionForgery("unknown_or_wrong_conn")
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("session_id does not match a granted lease on this connection"))
+	authorized, rebound := tenant.leases.AuthorizeOrRebindSession(leaseID, ident.AgentID, w.connID)
+	if !authorized {
+		s.metrics.sessionForgery("unknown_or_wrong_holder")
+		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEACCES("session_id does not match a live lease held by this agent"))
 		return "", false
+	}
+	if rebound {
+		s.metrics.sessionRebind()
 	}
 	if !s.mountLeases.Install(allocationID, leaseHex) {
 		s.metrics.sessionForgery("fenced")

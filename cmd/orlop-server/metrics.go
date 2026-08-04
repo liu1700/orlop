@@ -31,8 +31,11 @@ type serverMetrics struct {
 	journalRevertTotal *prometheus.CounterVec
 
 	// Session-forgery rejections by reason (bad_format, bad_hex,
-	// unknown_or_wrong_conn, fenced). See checkSessionFence.
+	// unknown_or_wrong_holder, fenced). See checkSessionFence.
 	sessionForgeryRejected *prometheus.CounterVec
+	// Legitimate live-lease transfers to a newly authenticated connection.
+	// Kept separate from forgery rejections so security alerts stay meaningful.
+	sessionRebindTotal prometheus.Counter
 
 	// Per-agent path-authorization rejections, by op. A connection whose cert
 	// carries an /agent/<id> SAN that touches a path outside /agents/<id>.
@@ -85,6 +88,10 @@ func newServerMetrics() *serverMetrics {
 			Name: "orlop_session_forgery_rejected_total",
 			Help: "Writes rejected by the mount-session authenticity check, by reason.",
 		}, []string{"reason"}),
+		sessionRebindTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "orlop_session_rebind_total",
+			Help: "Live mount sessions rebound to a new connection after a transport reconnect.",
+		}),
 		agentPathDenied: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "orlop_agent_path_denied_total",
 			Help: "Requests rejected because the cert's agent SAN scope did not cover the requested path, by op.",
@@ -94,13 +101,20 @@ func newServerMetrics() *serverMetrics {
 	reg.MustRegister(
 		sm.opDuration, sm.bytesTotal, sm.chunksTotal, sm.leaseHeld,
 		sm.journalWrites, sm.journalQueryDur, sm.journalRows, sm.journalRevertTotal,
-		sm.sessionForgeryRejected, sm.agentPathDenied,
+		sm.sessionForgeryRejected, sm.sessionRebindTotal, sm.agentPathDenied,
 	)
 	return sm
 }
 
+func (m *serverMetrics) sessionRebind() {
+	if m == nil {
+		return
+	}
+	m.sessionRebindTotal.Inc()
+}
+
 // sessionForgery bumps orlop_session_forgery_rejected_total{reason} by 1.
-// reason values: bad_format, bad_hex, unknown_or_wrong_conn, fenced.
+// reason values: bad_format, bad_hex, unknown_or_wrong_holder, fenced.
 func (m *serverMetrics) sessionForgery(reason string) {
 	if m == nil {
 		return
