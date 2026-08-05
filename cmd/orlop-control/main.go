@@ -964,6 +964,21 @@ func (a *serverapiMountLeaseFencer) FenceAllocation(ctx context.Context, tenantI
 	return a.client.ClearActiveMountLease(ctx, opsAddr, tenantID, allocationID)
 }
 
+func (a *serverapiMountLeaseFencer) MountSessionLive(ctx context.Context, tenantID, allocationID string) (bool, error) {
+	opsAddr, placed, err := resolveTenantOpsAddr(ctx, a.queries, tenantID)
+	if err != nil {
+		return false, fmt.Errorf("mount liveness: %w", err)
+	}
+	if !placed {
+		// Single-node / no populated server_pool: there is no remote data plane to
+		// ask, so liveness is unknowable here. Report LIVE — the caller reclaims
+		// only on a definite "dead", and inventing one from an absent data plane
+		// would hand out a mount nobody verified was free.
+		return true, nil
+	}
+	return a.client.MountSessionLive(ctx, opsAddr, tenantID, allocationID)
+}
+
 // serverapiAgentPurger adapts *serverapi.Client to allocations.AgentDataPurger
 // (the purge path only needs error-or-not from the per-agent erase; the
 // detailed counts stay in the client's own logs).

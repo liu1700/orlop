@@ -69,6 +69,21 @@ func (h *mountLeaseHandlers) handleAcquireMount(w http.ResponseWriter, r *http.R
 		return
 	}
 	a, err := h.alloc.AcquireMountLease(r.Context(), allocID, agentID, h.leaseTTL, force)
+	if errors.Is(err, allocations.ErrLeaseLive) && !force {
+		// The row says someone holds this mount, but a mount lease is a timed
+		// reservation and outlives a holder that crashed. Refusing on the row
+		// alone locked an agent out of its OWN disk for the rest of the TTL
+		// after its mounter died — 18% of production runs on one measured day
+		// (issue #114). Ask the data plane, which knows whether anything is
+		// actually mounted, and reclaim only when the answer is a definite no.
+		if h.deadHolder(r.Context(), allocID) {
+			a, err = h.alloc.AcquireMountLease(r.Context(), allocID, agentID, h.leaseTTL, true)
+			if err == nil {
+				h.logger.Info("mount_lease_reclaimed_from_dead_holder",
+					"allocation_id", uuidString(allocID), "agent_id", uuidString(agentID))
+			}
+		}
+	}
 	if err != nil {
 		h.writeLeaseError(w, r, "acquire", allocID, agentID, err)
 		return
@@ -84,6 +99,37 @@ func (h *mountLeaseHandlers) handleAcquireMount(w http.ResponseWriter, r *http.R
 		"lease_id":   uuidString(a.ID),
 		"expires_at": a.LeaseExpiresAt.UTC().Format(time.RFC3339Nano),
 	})
+}
+
+// deadHolder reports whether the allocation's incumbent mount is provably gone,
+// so its lease may be reclaimed without the caller asserting force.
+//
+// Every uncertain path answers false, and that asymmetry is the point: a wrong
+// "dead" displaces a live writer mid-write and loses its data (issue #93), while
+// a wrong "alive" only makes the caller wait out the TTL it would have waited
+// anyway. No fencer configured, no server placement, a lookup failure, an
+// unreachable data plane — all false.
+func (h *mountLeaseHandlers) deadHolder(ctx context.Context, allocID pgtype.UUID) bool {
+	if h.fencer == nil {
+		return false
+	}
+	alloc, err := h.store.GetAllocation(ctx, toUUID(allocID))
+	if err != nil {
+		h.logger.Warn("mount_liveness_lookup_alloc_failed", "error", err, "allocation_id", uuidString(allocID))
+		return false
+	}
+	user, err := h.store.GetUser(ctx, alloc.UserID)
+	if err != nil {
+		h.logger.Warn("mount_liveness_lookup_user_failed", "error", err, "allocation_id", uuidString(allocID))
+		return false
+	}
+	live, err := h.fencer.MountSessionLive(ctx, user.TenantID, uuidString(allocID))
+	if err != nil {
+		h.logger.Warn("mount_liveness_probe_failed", "error", err,
+			"tenant_id", user.TenantID, "allocation_id", uuidString(allocID))
+		return false
+	}
+	return !live
 }
 
 func (h *mountLeaseHandlers) handleRefreshMount(w http.ResponseWriter, r *http.Request) {

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -381,5 +382,81 @@ func TestMountLeaseRefreshRevokedReturnsGone(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusGone || !strings.Contains(string(body), "revoked") {
 		t.Fatalf("refresh status = %d body = %s", resp.StatusCode, body)
+	}
+}
+
+// mountLiveTakeoverFixture builds an allocation whose mount lease is LIVE and
+// held by agent1, plus a second agent's fingerprint to claim it with. This is
+// the exact state issue #114 is about: the row says "held", and only the data
+// plane knows whether the holder still exists.
+func mountLiveTakeoverFixture(t *testing.T, fencer mountLeaseFencer) (url, claimantFP string) {
+	t.Helper()
+	pool := httpOpenTestPool(t)
+	srv, svc := httpStartServerWithFencer(t, pool, fencer)
+	cookie, _ := httpSeedAdmin(t, pool, svc)
+	userID := dashGetUserID(t, cookie, srv.URL)
+	asvc := dashAllocSvc(pool)
+	allocation, err := asvc.Allocate(context.Background(), userID, dashGiB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent1, _ := mountSeedAgent(t, pool, userID)
+	_, fp2 := mountSeedAgent(t, pool, userID)
+	mountBindAgentID(t, pool, allocation.ID)
+	if _, err := asvc.AcquireMountLease(context.Background(), allocation.ID, agent1,
+		allocations.DefaultMountLeaseTTL, false); err != nil {
+		t.Fatal(err)
+	}
+	return srv.URL + "/api/allocations/" + uuidString(allocation.ID) + "/mount", fp2
+}
+
+func mountPostStatus(t *testing.T, url, fp string) (int, string) {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", mountBody(fp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
+}
+
+// #114: a mount lease is a timed reservation, so it outlives a mounter that
+// crashed. Refusing a re-mount on the row alone locked an agent out of its own
+// disk for the rest of the TTL — 18% of production runs on one measured day.
+// When the data plane confirms nothing is mounted, the claim must succeed.
+func TestMountLeaseReclaimedWhenDataPlaneSaysHolderIsGone(t *testing.T) {
+	fencer := &recordingFencer{sessionLive: false}
+	url, fp := mountLiveTakeoverFixture(t, fencer)
+
+	if st, body := mountPostStatus(t, url, fp); st != http.StatusOK {
+		t.Fatalf("claim over a dead holder status = %d, want 200; body = %s", st, body)
+	}
+	if fencer.liveProbes == 0 {
+		t.Fatal("the data plane was never asked; the lease was reclaimed on the row alone")
+	}
+}
+
+// The other direction, and the one that must never regress: a holder that is
+// genuinely mounted and mid-write keeps its lease. Displacing it silently loses
+// its data (issue #93), which is why force stays the only way past a live one.
+func TestMountLeaseNotReclaimedWhileDataPlaneReportsALiveHolder(t *testing.T) {
+	fencer := &recordingFencer{sessionLive: true}
+	url, fp := mountLiveTakeoverFixture(t, fencer)
+
+	if st, body := mountPostStatus(t, url, fp); st != http.StatusConflict {
+		t.Fatalf("claim over a LIVE holder status = %d, want 409; body = %s", st, body)
+	}
+}
+
+// An unreachable or erroring data plane is "unknown", not "dead". Reclaiming on
+// a failed probe would turn a network blip into data loss, so the caller waits
+// out the TTL exactly as it did before this check existed.
+func TestMountLeaseNotReclaimedWhenLivenessProbeFails(t *testing.T) {
+	fencer := &recordingFencer{sessionLiveErr: errors.New("data plane unreachable")}
+	url, fp := mountLiveTakeoverFixture(t, fencer)
+
+	if st, body := mountPostStatus(t, url, fp); st != http.StatusConflict {
+		t.Fatalf("claim after a failed liveness probe status = %d, want 409; body = %s", st, body)
 	}
 }
