@@ -20,6 +20,7 @@ check the control plane runs at boot.
 | v0.5.1 | HEAD | Postgres, SQLite |
 | v0.5.2 | HEAD | Postgres, SQLite |
 | v0.5.3 | HEAD | Postgres, SQLite |
+| v0.5.4 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -81,6 +82,17 @@ The repair is automatic when only one pool server exists. In a multi-server
 deployment, `migrate up` stops with an unresolved-owner count if placement
 cannot be inferred; restore those `server_vms` rows (or create the matching
 owner reservation explicitly) and rerun the idempotent migration.
+
+v0.5.4 and v0.5.5 ship **no migration**, so unlike the two upgrades above they roll
+back with a plain image revert and need no backup step.
+
+v0.5.5 does change both halves together: orlop-control asks orlop-server whether a
+mount is still live before reclaiming a lease from a dead holder (#114), over a new
+`GET /control/tenants/{id}/allocations/{alloc}/mount-lease`. **Roll the two together.**
+A new control plane against an old server gets a 404 from that call, which is treated
+as "liveness unknown" and refuses the reclaim — i.e. it degrades to the pre-v0.5.5
+behaviour rather than doing anything unsafe, so a staggered roll is survivable, just
+pointless until the server catches up.
 
 | Do | Don't |
 |---|---|
