@@ -31,6 +31,10 @@ type tenantUsageClient interface {
 // the data-correctness window until the client's next lease refresh from #175.
 type mountLeaseFencer interface {
 	FenceAllocation(ctx context.Context, tenantID, allocationID string) error
+	// MountSessionLive reports whether a client currently holds this
+	// allocation's mount on the data plane (issue #114). An error means
+	// "unknown" and callers must not treat it as "dead".
+	MountSessionLive(ctx context.Context, tenantID, allocationID string) (bool, error)
 }
 
 // dashboardStore is the slice of the storage layer the dashboard reads:

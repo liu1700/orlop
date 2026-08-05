@@ -332,6 +332,7 @@ func newRouter(state *serverState) http.Handler {
 		r.Get("/control/tenants/{id}/journal/stream", state.tenantJournalStream)
 		r.Post("/control/tenants/{id}/journal/revert", state.tenantJournalRevert)
 		r.Delete("/control/tenants/{id}/allocations/{alloc}/mount-lease", state.clearActiveMountLease)
+		r.Get("/control/tenants/{id}/allocations/{alloc}/mount-lease", state.mountSessionStatus)
 	})
 	return r
 }

@@ -12,6 +12,12 @@ import (
 type recordingFencer struct {
 	mu    sync.Mutex
 	calls []fenceCall
+	// sessionLive is what MountSessionLive reports; sessionLiveErr, when set,
+	// is returned instead. Defaults model a healthy incumbent, so a test that
+	// does not opt in cannot accidentally exercise the reclaim path (#114).
+	sessionLive    bool
+	sessionLiveErr error
+	liveProbes     int
 }
 
 type fenceCall struct {
@@ -24,6 +30,16 @@ func (r *recordingFencer) FenceAllocation(_ context.Context, tenantID, allocatio
 	r.calls = append(r.calls, fenceCall{TenantID: tenantID, AllocationID: allocationID})
 	r.mu.Unlock()
 	return nil
+}
+
+func (r *recordingFencer) MountSessionLive(_ context.Context, _, _ string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.liveProbes++
+	if r.sessionLiveErr != nil {
+		return false, r.sessionLiveErr
+	}
+	return r.sessionLive, nil
 }
 
 // A clean DELETE /api/allocations/{id}/mount (agent-driven unmount) must

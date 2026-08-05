@@ -264,6 +264,24 @@ func (m *leaseManager) HeldByConn(id [16]byte, connID uint64) bool {
 	return ok && rec.connID == connID
 }
 
+// Live reports whether id is a lease this server still considers held: present,
+// unexpired, and not mid-revoke.
+//
+// This is how orlop-control tells a dead mount from a live one (issue #114). A
+// mount lease in the control database outlives its holder by design — it is a
+// timed reservation — so "the row says someone holds it" cannot distinguish a
+// crashed mounter from a working one, and the control plane refused an agent its
+// own disk for the remainder of the TTL. Here the answer is authoritative rather
+// than inferred: when a mount's transport drops, ReleaseAllForConn removes its
+// leases, and a mounter that stops refreshing loses them to SweepExpired within
+// one lease TTL. Either way this returns false while a live mount returns true.
+func (m *leaseManager) Live(id [16]byte) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.byID[id]
+	return ok && rec.revoking == nil && rec.expiresAt.After(time.Now())
+}
+
 // AuthorizeOrRebindSession verifies that id is a live lease held by holder and
 // binds it to connID. A changed connection with the same authenticated agent is
 // a transport reconnect, not a new mount: keep the lease id/session_id stable

@@ -634,6 +634,38 @@ func (c *Client) ClearActiveMountLease(ctx context.Context, opsAddr, tenantID, a
 	return ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 }
 
+// MountSessionLive asks the data-plane server whether the allocation's mount
+// session is still held by a live client (issue #114).
+//
+// The caller uses this to tell a crashed mount from a working one: the control
+// database's mount lease is a timed reservation and survives its holder, so only
+// the server can say whether anything is actually mounted right now.
+//
+// Any failure returns false with the error, and callers MUST treat an error as
+// "unknown, do not take over" rather than as "dead" — the whole point of the
+// check is to keep a genuinely live incumbent protected.
+func (c *Client) MountSessionLive(ctx context.Context, opsAddr, tenantID, allocationID string) (bool, error) {
+	var out struct {
+		SessionLive bool `json:"session_live"`
+	}
+	status, e, err := c.doJSON(ctx, http.MethodGet,
+		"https://"+opsAddr+"/control/tenants/"+tenantID+"/allocations/"+allocationID+"/mount-lease", nil, &out)
+	if err != nil {
+		return false, err
+	}
+	if status == http.StatusOK {
+		return out.SessionLive, nil
+	}
+	c.logger.Error("mount_session_live_failed",
+		"ops_addr", opsAddr,
+		"tenant_id", tenantID,
+		"allocation_id", allocationID,
+		"status", status,
+		"code", e.Code,
+	)
+	return false, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
+}
+
 // CertRevocation is one entry pushed to a data-plane server's deny-list (issue #5).
 type CertRevocation struct {
 	Serial    string    `json:"serial"`     // uppercase hex
