@@ -137,7 +137,7 @@ rendered from chart values; the object store and routes DB live on the PVC at
 | Key | Default | Notes |
 |---|---|---|
 | `image.registry` | `ghcr.io/liu1700` | |
-| `image.control.tag` / `image.server.tag` | `""` → chart `appVersion` (`v0.5.5`) | pin a tag/digest for reproducible deploys |
+| `image.control.tag` / `image.server.tag` | `""` → chart `appVersion` (`v0.5.6`) | pin a tag/digest for reproducible deploys |
 | `serverFQDN` | `orlop-server` | the server Service name **and** cert SAN — keep it one value |
 | `trustDomain` | `orlop.example` | applied to both components |
 | `orgName` | `ORL` | |
