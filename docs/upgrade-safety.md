@@ -21,6 +21,7 @@ check the control plane runs at boot.
 | v0.5.2 | HEAD | Postgres, SQLite |
 | v0.5.3 | HEAD | Postgres, SQLite |
 | v0.5.4 | HEAD | Postgres, SQLite |
+| v0.5.5 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -83,8 +84,12 @@ deployment, `migrate up` stops with an unresolved-owner count if placement
 cannot be inferred; restore those `server_vms` rows (or create the matching
 owner reservation explicitly) and rerun the idempotent migration.
 
-v0.5.4 and v0.5.5 ship **no migration**, so unlike the two upgrades above they roll
-back with a plain image revert and need no backup step.
+v0.5.4, v0.5.5 and v0.5.6 ship **no migration**, so unlike the two upgrades above
+they roll back with a plain image revert and need no backup step.
+
+v0.5.6 is a mount-client-only change (the mount process releases its lease on
+SIGTERM/SIGINT instead of dying with it held, #117): nothing server-side moves, so
+it can roll independently of orlop-control/orlop-server.
 
 v0.5.5 does change both halves together: orlop-control asks orlop-server whether a
 mount is still live before reclaiming a lease from a dead holder (#114), over a new
