@@ -1048,6 +1048,70 @@ impl Drop for MountLeaseManager {
     }
 }
 
+/// The signals a foreground mount must not die to without releasing its lease.
+#[cfg(target_os = "linux")]
+fn mount_signal_set() -> libc::sigset_t {
+    // SAFETY: sigemptyset/sigaddset on a locally owned set are defined.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        set
+    }
+}
+
+/// Block SIGTERM/SIGINT process-wide. Must run on the main thread BEFORE worker
+/// threads spawn (blocking HTTP clients start background threads on creation),
+/// so every later thread inherits the mask.
+///
+/// #117 (plori#1137): a foreground mount that has acquired the control-plane
+/// mount lease but not yet mounted has no signal handling at all — a
+/// default-action SIGTERM kills the process without running any Drop, the lease
+/// is never released, and takeover of a live lease is refused by design
+/// (v0.5.0) — so one killed mount locks its allocation out of mounting for the
+/// rest of the lease TTL, which is longer than a typical host's entire retry
+/// budget. With the signals blocked, a TERM landing at ANY point stays pending
+/// until the watcher thread ([`spawn_mount_signal_watcher`], armed right after
+/// enrollment) consumes it and releases the lease on the way out. A TERM that
+/// arrives before the watcher is armed keeps the process alive slightly longer
+/// than the default action would — until the killer escalates — and there is
+/// nothing to leak in that window.
+#[cfg(target_os = "linux")]
+fn block_mount_signals() {
+    let set = mount_signal_set();
+    // SAFETY: pthread_sigmask(SIG_BLOCK) with a valid set is defined and only
+    // fails on an invalid `how`.
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Arm the mount's TERM/INT watcher: one thread in sigwait; on the first signal
+/// it best-effort unmounts (severing the FUSE session so no write races what
+/// follows), releases the mount lease when one is held, and exits 128+sig.
+/// Requires [`block_mount_signals`] to have run first on the main thread. The
+/// thread is deliberately never joined: either it fires and the process exits
+/// through it, or the process exits first through the normal Drop path, which
+/// releases the lease itself.
+#[cfg(target_os = "linux")]
+fn spawn_mount_signal_watcher(mountpoint: PathBuf, client: Option<MountLeaseClient>) {
+    std::thread::spawn(move || {
+        let set = mount_signal_set();
+        let mut sig: libc::c_int = 0;
+        // SAFETY: sigwait on a set of blocked signals is defined.
+        if unsafe { libc::sigwait(&set, &mut sig) } != 0 {
+            return;
+        }
+        eprintln!("received signal {sig}; releasing the mount lease before exit");
+        let _ = orlop::mount::unmount(&mountpoint);
+        if let Some(client) = client {
+            util::warn_err("mount lease release on signal", client.release());
+        }
+        std::process::exit(128 + sig);
+    });
+}
+
 impl MountLeaseClient {
     fn new(
         control_plane_url: String,
@@ -1600,6 +1664,11 @@ fn run_env_mount(
     on_eviction: Option<EvictionAction>,
     takeover: bool,
 ) -> anyhow::Result<()> {
+    // Before anything that creates a thread (the enroll-token mint below builds a
+    // blocking HTTP client, which starts one): see block_mount_signals.
+    #[cfg(target_os = "linux")]
+    block_mount_signals();
+
     let spec = EnvMountSpec::from_env()?;
 
     // Credential-per-attempt: when workload identity is configured, mint a
@@ -1746,6 +1815,12 @@ fn run_mount_payload(
         return Ok(());
     }
 
+    // Idempotent when run_env_mount already did it; load-bearing for the daemon
+    // grandchild and the config-foreground path, which enter here directly (a
+    // fork leaves the child single-threaded, so this is still "before threads").
+    #[cfg(target_os = "linux")]
+    block_mount_signals();
+
     let audit = audit::AuditLog::new(cfg.audit_log.clone())?;
     let cache_cfg = cfg.cache.clone().unwrap_or_default();
     let chunk_cache = backend::dataplane::ChunkCache::open(
@@ -1795,6 +1870,14 @@ fn run_mount_payload(
                     takeover,
                 )?)
             };
+            // The lease (when there is one) now exists server-side; from here a
+            // signal-death without release would strand the allocation, so arm
+            // the watcher immediately (#117 / plori#1137).
+            #[cfg(target_os = "linux")]
+            spawn_mount_signal_watcher(
+                mountpoint.clone(),
+                lease_manager.as_ref().map(|lm| lm.client.clone()),
+            );
             let addr = enrolled.server_addr.clone();
             eprintln!(
                 "Allocation {} on {} ({})",
