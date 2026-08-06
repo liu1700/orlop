@@ -77,11 +77,15 @@ func (s *serverState) registerTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hold the write lock across the entire handler — existence check through the
-	// tenants-map insert and appendRegisteredTenant — to prevent concurrent
-	// same-tenant registrations from opening duplicate handles or racing the JSON file.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Serialize register/unregister/resize of the SAME tenant so concurrent
+	// same-id registrations don't open duplicate handles or race the JSON file,
+	// while DIFFERENT tenants proceed in parallel. This replaces holding the
+	// server-wide mu across the slow JuiceFS filesystem init (MkdirAll, SQLite
+	// opens), which serialized every registration and stalled every data-plane
+	// tenant lookup after a cold-cache pod restart (#119). mu is now taken only
+	// briefly, around the in-memory map mutation.
+	unlock := s.tenantRegLocks.lock(req.TenantID)
+	defer unlock()
 
 	// The account quota lives on the owner dir; the tenant nests under it (unless it IS
 	// the account, in which case dir == owner dir).
@@ -136,9 +140,10 @@ func (s *serverState) registerTenant(w http.ResponseWriter, r *http.Request) {
 		return 0, false
 	}
 
-	if existing, ok := s.tenants[req.TenantID]; ok {
-		// Idempotent placement: the tenant is already live. Re-assert the account quota
-		// (the budget may have grown since) and return.
+	// Fast path: the tenant is already live. Only a brief read lock — never blocked
+	// by another tenant's filesystem init. Re-assert the account quota (the budget
+	// may have grown since) and return.
+	if existing, ok := s.tenant(req.TenantID); ok {
 		projID, okQ := ensureAccountQuota()
 		if !okQ {
 			return
@@ -149,6 +154,13 @@ func (s *serverState) registerTenant(w http.ResponseWriter, r *http.Request) {
 			SizeBytes: req.SizeBytes,
 		})
 		return
+	}
+
+	// Slow filesystem + tenant-state init runs WITHOUT mu so it cannot block
+	// data-plane tenant lookups or the registration of other tenants. The
+	// per-tenant lock (held above) guarantees no concurrent same-id init.
+	if s.beforeTenantInit != nil {
+		s.beforeTenantInit(req.TenantID)
 	}
 
 	if err := os.MkdirAll(storeRoot, 0o750); err != nil {
@@ -171,8 +183,13 @@ func (s *serverState) registerTenant(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "open_tenant_failed", err.Error())
 		return
 	}
-	// Assign directly — we already hold s.mu.Lock().
+
+	// Publish into the in-memory map under a brief write lock — only the map
+	// mutation needs mu (Go maps are not safe for concurrent writes across
+	// tenants). The per-tenant lock guarantees no concurrent same-id insert.
+	s.mu.Lock()
 	s.tenants[ts.id] = ts
+	s.mu.Unlock()
 
 	rt := registeredTenant{
 		ID:        req.TenantID,
@@ -182,7 +199,7 @@ func (s *serverState) registerTenant(w http.ResponseWriter, r *http.Request) {
 		StoreRoot: storeRoot,
 		RoutesDB:  routesDB,
 	}
-	if err := appendRegisteredTenant(s.adminCfg.RegisteredTenantsPath, rt); err != nil {
+	if err := s.persistRegisteredTenant(rt); err != nil {
 		s.logger.Error("persist registered tenant failed", "tenant_id", req.TenantID, "error", err)
 		// Non-fatal: tenant is live in memory; next restart will need quota reload from quota_state.json.
 	}
@@ -229,12 +246,14 @@ func (s *serverState) resizeTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hold the write lock across the existence check + Resize to serialize with
-	// a concurrent register/unregister of the same tenant. Mirrors registerTenant.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Serialize with a concurrent register/unregister of the same tenant via the
+	// per-tenant lock (mirrors registerTenant). The existence check is a brief
+	// read lock and quota.Resize does its own locking, so mu is never held across
+	// the (possibly slow) quota I/O.
+	unlock := s.tenantRegLocks.lock(tenantID)
+	defer unlock()
 
-	if _, ok := s.tenants[tenantID]; !ok {
+	if _, ok := s.tenant(tenantID); !ok {
 		writeJSONError(w, http.StatusNotFound, "not_found", "tenant is not registered")
 		return
 	}
@@ -291,19 +310,24 @@ func (s *serverState) unregisterTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hold s.mu across the registered_tenants.json write so a concurrent
-	// registerTenant of the same ID can't race with our remove and either
-	// resurrect a deleted entry or drop a live one. Mirrors the lock
-	// scope in registerTenant.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Serialize this teardown against a concurrent same-id registerTenant via the
+	// per-tenant lock, so a re-register can't resurrect a deleted entry, drop a
+	// live one, or MkdirAll a fresh dir that our RemoveAll then deletes. Mirrors
+	// registerTenant; a different tenant's registration is not blocked (#119).
+	unlock := s.tenantRegLocks.lock(tenantID)
+	defer unlock()
 
+	// Drop from the in-memory map under a brief write lock so new connections
+	// can't bind to it. Capture ts for the teardown below.
+	s.mu.Lock()
 	ts, ok := s.tenants[tenantID]
 	if !ok {
+		s.mu.Unlock()
 		writeJSONError(w, http.StatusNotFound, "not_found", "tenant is not registered")
 		return
 	}
 	delete(s.tenants, tenantID)
+	s.mu.Unlock()
 
 	// Gate the tenant's store writes and drain any in-flight chunk Put BEFORE we
 	// remove the directory. Without this, a chunk arriving on a data-plane
@@ -311,13 +335,14 @@ func (s *serverState) unregisterTenant(w http.ResponseWriter, r *http.Request) {
 	// into existence right after os.RemoveAll, leaving an orphan (#103). markClosed
 	// blocks until in-flight writes finish, so RemoveAll is the last write to the dir.
 	//
-	// The drain, db.Close, and RemoveAll all run under s.mu, which is required:
-	// s.mu serializes this teardown against a concurrent same-id registerTenant so
-	// a re-register cannot MkdirAll a fresh dir that RemoveAll then deletes. The
-	// drain is bounded (each in-flight put is a size-capped, already-buffered write
-	// plus one fsync; no client-controlled blocking), and os.RemoveAll — the
-	// dominant on-disk cost — already ran under s.mu before this change, so the
-	// gate does not introduce a new class of I/O-under-lock.
+	// The drain, db.Close, and RemoveAll run under the per-tenant lock (not mu),
+	// which is what serializes this teardown against a concurrent same-id
+	// registerTenant: that re-register waits on the same key, so it cannot MkdirAll
+	// a fresh dir that RemoveAll then deletes. Keeping this off mu means the
+	// os.RemoveAll — the dominant on-disk cost — no longer stalls data-plane tenant
+	// lookups or other tenants' registration (#119). The drain itself is bounded
+	// (each in-flight put is a size-capped, already-buffered write plus one fsync;
+	// no client-controlled blocking).
 	ts.markClosed()
 
 	if err := ts.db.Close(); err != nil {
@@ -337,7 +362,7 @@ func (s *serverState) unregisterTenant(w http.ResponseWriter, r *http.Request) {
 			s.logger.Error("unregister tenant metadata rmdir failed", "tenant_id", tenantID, "error", err)
 		}
 	}
-	if err := removeRegisteredTenant(s.adminCfg.RegisteredTenantsPath, tenantID); err != nil {
+	if err := s.dropRegisteredTenant(tenantID); err != nil {
 		s.logger.Error("unregister tenant persist failed", "tenant_id", tenantID, "error", err)
 	}
 
@@ -370,9 +395,10 @@ func (s *serverState) setAccountQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	// No mu here: this handler touches no mu-guarded in-memory state (it never
+	// reads or writes s.tenants). MkdirAll is idempotent and the quota manager /
+	// async applier do their own locking, so holding mu across this JuiceFS I/O
+	// would only stall unrelated tenant lookups and registrations (#119).
 	ownerDir := filepath.Join(s.adminCfg.TenantsRoot, owner)
 	if err := os.MkdirAll(ownerDir, 0o750); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "mkdir_failed", err.Error())

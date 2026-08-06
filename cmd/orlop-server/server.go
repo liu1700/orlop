@@ -44,6 +44,23 @@ type serverState struct {
 	// frame is served — the data-plane kill switch. See cert_revocation_registry.go.
 	certRevocations *certRevocationRegistry
 
+	// tenantRegLocks serializes register/unregister/resize of the SAME tenant so
+	// concurrent same-id operations stay idempotent and leak-free, WITHOUT holding
+	// mu across a new tenant's slow JuiceFS filesystem init. Different tenants take
+	// different keys and proceed in parallel; data-plane tenant lookups (mu.RLock)
+	// are never blocked for the duration of a registration (#119).
+	tenantRegLocks keyedMutex
+	// regFileMu serializes writes to registered_tenants.json. Now that different
+	// tenants persist off mu (each under its own tenantRegLocks key), this guards
+	// the shared load→mutate→atomic-rename file so one write cannot clobber another.
+	regFileMu sync.Mutex
+
+	// beforeTenantInit, when non-nil, is invoked inside registerTenant after the
+	// existence check but before the (unlocked) filesystem/tenant-state init. Tests
+	// set it to block a specific tenant's slow init and prove other tenants still
+	// register and existing tenants still resolve. Always nil in production.
+	beforeTenantInit func(tenantID string)
+
 	// connSem bounds concurrent framed sessions; reqSem bounds concurrent
 	// in-flight request handlers. Both are buffered-channel semaphores sized at
 	// construction (see dos_hardening.go). Nil-safe: a serverState built without

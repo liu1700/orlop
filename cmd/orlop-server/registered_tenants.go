@@ -74,6 +74,25 @@ func mutateRegisteredTenants(path string, mutate func([]registeredTenant) []regi
 	return nil
 }
 
+// persistRegisteredTenant appends rt to registered_tenants.json under regFileMu.
+// The mutex serializes the shared load→mutate→atomic-rename file: with tenant
+// registration no longer under mu, two DIFFERENT tenants can persist
+// concurrently, and without this guard one write would clobber the other (they
+// share a fixed .tmp name and each rewrites the whole file). See serverState.regFileMu.
+func (s *serverState) persistRegisteredTenant(rt registeredTenant) error {
+	s.regFileMu.Lock()
+	defer s.regFileMu.Unlock()
+	return appendRegisteredTenant(s.adminCfg.RegisteredTenantsPath, rt)
+}
+
+// dropRegisteredTenant removes tenantID from registered_tenants.json under
+// regFileMu (see persistRegisteredTenant).
+func (s *serverState) dropRegisteredTenant(tenantID string) error {
+	s.regFileMu.Lock()
+	defer s.regFileMu.Unlock()
+	return removeRegisteredTenant(s.adminCfg.RegisteredTenantsPath, tenantID)
+}
+
 // appendRegisteredTenant inserts rt or, if an entry with the same ID exists,
 // replaces it. Idempotent.
 func appendRegisteredTenant(path string, rt registeredTenant) error {
