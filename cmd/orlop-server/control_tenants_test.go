@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/liu1700/orlop/cmd/orlop-server/internal/quota"
 )
@@ -435,6 +436,96 @@ func TestControlPlaneOnlyMiddlewareAcceptsMTLSControlPlaneCert(t *testing.T) {
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRegisterTenantSlowInitDoesNotBlockOthers is the acceptance test for #119:
+// a new tenant whose filesystem initialization is slow (cold JuiceFS cache after
+// a pod restart) must NOT serialize other tenants' registration or block
+// data-plane lookups of already-registered tenants. Before the fix, registerTenant
+// held the server-wide write lock across MkdirAll + SQLite opens, so one slow
+// registration stalled everything behind s.mu.
+func TestRegisterTenantSlowInitDoesNotBlockOthers(t *testing.T) {
+	exec := &fakeExec{}
+	state, _ := newAdminTestState(t, exec)
+
+	// An already-registered tenant, on the fast lookup path.
+	if rr := doAdminRequest(state, http.MethodPost, "/control/tenants",
+		registerTenantRequest{TenantID: "existing", Name: "Existing", SizeBytes: 1 << 30}); rr.Code != http.StatusOK {
+		t.Fatalf("pre-register existing: status %d body %s", rr.Code, rr.Body.String())
+	}
+
+	// Park "slow" inside its (unlocked) filesystem init until we release it. The
+	// hook fires for every registration, so gate on the tenant ID.
+	release := make(chan struct{})
+	blocked := make(chan struct{})
+	state.beforeTenantInit = func(tenantID string) {
+		if tenantID != "slow" {
+			return
+		}
+		close(blocked)
+		<-release
+	}
+
+	slowDone := make(chan int, 1)
+	go func() {
+		rr := doAdminRequest(state, http.MethodPost, "/control/tenants",
+			registerTenantRequest{TenantID: "slow", Name: "Slow", SizeBytes: 1 << 30})
+		slowDone <- rr.Code
+	}()
+
+	select {
+	case <-blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow tenant never reached its init hook")
+	}
+
+	// 1. A DIFFERENT tenant must be able to register while "slow" is blocked.
+	fastDone := make(chan int, 1)
+	go func() {
+		rr := doAdminRequest(state, http.MethodPost, "/control/tenants",
+			registerTenantRequest{TenantID: "fast", Name: "Fast", SizeBytes: 1 << 30})
+		fastDone <- rr.Code
+	}()
+	select {
+	case code := <-fastDone:
+		if code != http.StatusOK {
+			t.Fatalf("concurrent register of a different tenant: status %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("registration of a different tenant blocked on the slow tenant's init")
+	}
+
+	// 2. Existing tenant lookups must not be blocked during the slow init.
+	lookupDone := make(chan bool, 1)
+	go func() {
+		_, ok := state.tenant("existing")
+		lookupDone <- ok
+	}()
+	select {
+	case ok := <-lookupDone:
+		if !ok {
+			t.Fatal("existing tenant lookup returned not-ok")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("existing tenant lookup blocked on the slow tenant's init")
+	}
+
+	// Release the slow init; it must complete successfully.
+	close(release)
+	select {
+	case code := <-slowDone:
+		if code != http.StatusOK {
+			t.Fatalf("slow register: status %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow tenant never completed after release")
+	}
+
+	for _, id := range []string{"existing", "fast", "slow"} {
+		if _, ok := state.tenant(id); !ok {
+			t.Errorf("tenant %q not registered", id)
+		}
 	}
 }
 
