@@ -29,6 +29,23 @@ fn fastcdc_4mib_golden_vector_chunks() {
             })
             .collect();
 
+    let streamed: Vec<(usize, usize, String)> = fastcdc::v2020::StreamCDC::new(
+        std::io::Cursor::new(&bytes),
+        CHUNK_MIN,
+        CHUNK_AVG,
+        CHUNK_MAX,
+    )
+    .map(|result| {
+        let chunk = result.expect("stream FastCDC");
+        (
+            chunk.offset as usize,
+            chunk.length,
+            hex::encode(blake3::hash(&chunk.data).as_bytes()),
+        )
+    })
+    .collect();
+    assert_eq!(streamed, chunks, "streaming and slice FastCDC must agree");
+
     assert!(!chunks.is_empty(), "no chunks produced from 4 MiB input");
 
     // Format: one line per chunk: "<offset> <length> <hash>"

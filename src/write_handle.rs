@@ -1,5 +1,8 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::{Condvar, Mutex as ParkingMutex};
 
 /// Per-FH write buffer. Memory-backed below `spill_threshold`, spills to an
 /// anonymous tempfile (OS-unlinked, crash-safe) above.
@@ -169,9 +172,8 @@ mod tests {
 use crate::backend::dataplane::messages::RecoveryHint;
 use crate::backend::BackendError;
 use crate::lease::LeaseHandle;
-use crate::store::{ChunkRef, Manifest, Store};
-use blake3::Hasher;
-use std::sync::Arc;
+use crate::store::{ChunkHash, ChunkRef, Manifest, Store};
+use std::collections::HashSet;
 
 /// `EFBIG` for a size that exceeds [`MAX_FILE_BYTES`]. Typed so the FUSE layer's
 /// `backend_errno` maps it to the right errno instead of the EIO default.
@@ -186,6 +188,228 @@ fn efbig(size: u64) -> anyhow::Error {
 pub const CHUNK_MIN: u32 = 1024 * 1024; // 1 MiB — matches cmd/orlop-server/cdc.go
 pub const CHUNK_AVG: u32 = 4 * 1024 * 1024; // 4 MiB
 pub const CHUNK_MAX: u32 = 16 * 1024 * 1024; // 16 MiB
+
+// One upload window is large enough for two maximum-sized chunks, preserving
+// useful batching without letting a single flush retain an entire file.
+const CHUNK_UPLOAD_WINDOW_BYTES: usize = 32 * 1024 * 1024;
+// Shared by every mount and concurrent flush in this process. This bounds the
+// StreamCDC buffers plus queued/in-flight upload bytes, not just one handle.
+const GLOBAL_UPLOAD_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+const UPLOAD_QUEUE_DEPTH: usize = 1;
+
+#[derive(Clone)]
+struct UploadBudget {
+    inner: Arc<UploadBudgetInner>,
+}
+
+struct UploadBudgetInner {
+    limit: usize,
+    used: ParkingMutex<usize>,
+    available: Condvar,
+}
+
+impl UploadBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(UploadBudgetInner {
+                limit,
+                used: ParkingMutex::new(0),
+                available: Condvar::new(),
+            }),
+        }
+    }
+
+    fn acquire(&self, bytes: usize) -> UploadPermit {
+        assert!(bytes <= self.inner.limit);
+        let mut used = self.inner.used.lock();
+        while *used + bytes > self.inner.limit {
+            self.inner.available.wait(&mut used);
+        }
+        *used += bytes;
+        UploadPermit {
+            budget: Arc::clone(&self.inner),
+            bytes,
+        }
+    }
+}
+
+struct UploadPermit {
+    budget: Arc<UploadBudgetInner>,
+    bytes: usize,
+}
+
+impl UploadPermit {
+    fn split_off(&mut self, bytes: usize) -> Self {
+        assert!(bytes <= self.bytes);
+        self.bytes -= bytes;
+        Self {
+            budget: Arc::clone(&self.budget),
+            bytes,
+        }
+    }
+}
+
+impl Drop for UploadPermit {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock();
+        *used -= self.bytes;
+        self.budget.available.notify_all();
+    }
+}
+
+fn global_upload_budget() -> &'static UploadBudget {
+    static BUDGET: OnceLock<UploadBudget> = OnceLock::new();
+    BUDGET.get_or_init(|| UploadBudget::new(GLOBAL_UPLOAD_BUDGET_BYTES))
+}
+
+struct UploadWindow {
+    chunks: Vec<(ChunkHash, Vec<u8>)>,
+    bytes: usize,
+    _permit: UploadPermit,
+}
+
+impl UploadWindow {
+    fn new(permit: UploadPermit) -> Self {
+        Self {
+            chunks: Vec::new(),
+            bytes: 0,
+            _permit: permit,
+        }
+    }
+
+    fn push(&mut self, hash: ChunkHash, bytes: Vec<u8>) {
+        self.bytes += bytes.len();
+        self.chunks.push((hash, bytes));
+    }
+}
+
+struct ChunkUploadPlan {
+    total: u64,
+    refs: Vec<ChunkRef>,
+    chunks_new: u32,
+    chunks_reused: u32,
+}
+
+fn upload_window(store: &dyn Store, window: UploadWindow) -> anyhow::Result<(u32, u32)> {
+    let UploadWindow {
+        chunks,
+        bytes: _,
+        _permit,
+    } = window;
+    let mut flat = Vec::with_capacity(chunks.len() * 32);
+    for (hash, _) in &chunks {
+        flat.extend_from_slice(hash);
+    }
+    let bitmap = store.chunk_has_many(&flat)?;
+
+    let mut missing = Vec::new();
+    let mut reused = 0u32;
+    for (i, item) in chunks.into_iter().enumerate() {
+        let present = (bitmap.get(i / 8).copied().unwrap_or(0) >> (i % 8)) & 1 != 0;
+        if present {
+            reused += 1;
+        } else {
+            missing.push(item);
+        }
+    }
+    let chunks_new = missing.len() as u32;
+    store.chunk_put_many(missing)?;
+    Ok((chunks_new, reused))
+}
+
+/// Run StreamCDC once and hand each owned chunk buffer to a bounded uploader.
+/// The manifest plan is returned only after every upload has completed.
+fn stream_and_upload<R: Read>(reader: R, store: &dyn Store) -> anyhow::Result<ChunkUploadPlan> {
+    let budget = global_upload_budget();
+    // Acquire the StreamCDC buffer and first upload window atomically. This
+    // prevents concurrent flushes from each holding a chunker buffer while all
+    // wait for the last bytes needed to make forward progress.
+    let mut initial = budget.acquire(CHUNK_MAX as usize + CHUNK_UPLOAD_WINDOW_BYTES);
+    let first_window_permit = initial.split_off(CHUNK_UPLOAD_WINDOW_BYTES);
+    let _stream_buffer_permit = initial;
+    let (window_tx, window_rx) = std::sync::mpsc::sync_channel(UPLOAD_QUEUE_DEPTH);
+
+    std::thread::scope(|scope| {
+        let uploader = scope.spawn(move || -> anyhow::Result<(u32, u32)> {
+            let mut chunks_new = 0u32;
+            let mut chunks_reused = 0u32;
+            for window in window_rx {
+                let (new, reused) = upload_window(store, window)?;
+                chunks_new += new;
+                chunks_reused += reused;
+            }
+            Ok((chunks_new, chunks_reused))
+        });
+
+        let producer_result = (|| -> anyhow::Result<(u64, Vec<ChunkRef>, u32)> {
+            let mut refs = Vec::new();
+            let mut scheduled = HashSet::new();
+            let mut local_reused = 0u32;
+            let mut total = 0u64;
+            let mut window = UploadWindow::new(first_window_permit);
+            let chunker = fastcdc::v2020::StreamCDC::new(reader, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX);
+
+            for result in chunker {
+                let chunk = result?;
+                let hash: ChunkHash = blake3::hash(&chunk.data).into();
+                total += chunk.length as u64;
+                refs.push(ChunkRef {
+                    hash,
+                    offset: chunk.offset,
+                    len: chunk.length as u32,
+                });
+
+                if scheduled.insert(hash) {
+                    window.push(hash, chunk.data);
+                    // Seal early enough that the next maximum-sized chunk can
+                    // never make this window exceed its reserved byte count.
+                    if window.bytes >= CHUNK_UPLOAD_WINDOW_BYTES - CHUNK_MAX as usize {
+                        window_tx
+                            .send(window)
+                            .map_err(|_| anyhow::anyhow!("chunk upload worker stopped"))?;
+                        window = UploadWindow::new(budget.acquire(CHUNK_UPLOAD_WINDOW_BYTES));
+                    }
+                } else {
+                    local_reused += 1;
+                }
+            }
+
+            if !window.chunks.is_empty() {
+                window_tx
+                    .send(window)
+                    .map_err(|_| anyhow::anyhow!("chunk upload worker stopped"))?;
+            }
+            Ok((total, refs, local_reused))
+        })();
+        drop(window_tx);
+
+        let upload_result = uploader
+            .join()
+            .map_err(|_| anyhow::anyhow!("chunk upload worker panicked"))?;
+        match (producer_result, upload_result) {
+            (_, Err(e)) => Err(e),
+            (Err(e), _) => Err(e),
+            (Ok((total, refs, local_reused)), Ok((chunks_new, remote_reused))) => {
+                Ok(ChunkUploadPlan {
+                    total,
+                    refs,
+                    chunks_new,
+                    chunks_reused: local_reused + remote_reused,
+                })
+            }
+        }
+    })
+}
+
+fn chunk_and_upload(buffer: &mut Buffer, store: &dyn Store) -> anyhow::Result<ChunkUploadPlan> {
+    match buffer {
+        Buffer::Mem(bytes) => stream_and_upload(Cursor::new(bytes.as_slice()), store),
+        Buffer::Spilled(file) => {
+            file.seek(SeekFrom::Start(0))?;
+            stream_and_upload(file, store)
+        }
+    }
+}
 
 /// Hard ceiling on a single file's logical size. truncate()/write past this
 /// return EFBIG instead of attempting the allocation, so a stray
@@ -342,66 +566,18 @@ impl WriteHandle {
                 recovery: None,
             });
         }
-        let bytes = self.buffer.read_all()?;
-        let total = bytes.len() as u64;
-
-        // FastCDC chunk — compute all hashes first, then batch dedup in one RTT.
-        let chunker = fastcdc::v2020::FastCDC::new(&bytes, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX);
-        struct Pending {
-            hash: [u8; 32],
-            offset: usize,
-            length: usize,
-        }
-        let mut pending: Vec<Pending> = Vec::new();
-        for c in chunker {
-            let chunk_bytes = &bytes[c.offset..c.offset + c.length];
-            let mut hasher = Hasher::new();
-            hasher.update(chunk_bytes);
-            let hash: [u8; 32] = hasher.finalize().into();
-            pending.push(Pending {
-                hash,
-                offset: c.offset,
-                length: c.length,
-            });
-        }
-
-        // Pack all hashes into a flat buffer, batch-query presence.
-        let flat: Vec<u8> = pending
-            .iter()
-            .flat_map(|p| p.hash.iter().copied())
-            .collect();
-        let bitmap = store.chunk_has_many(&flat)?;
-
-        // Build refs in original order; collect *new* chunks for one batch put.
-        let mut refs = Vec::with_capacity(pending.len());
-        let mut to_put: Vec<(crate::store::ChunkHash, Vec<u8>)> = Vec::new();
-        let mut chunks_reused = 0u32;
-        for (i, p) in pending.iter().enumerate() {
-            let present = (bitmap.get(i / 8).copied().unwrap_or(0) >> (i % 8)) & 1 != 0;
-            if !present {
-                to_put.push((p.hash, bytes[p.offset..p.offset + p.length].to_vec()));
-            } else {
-                chunks_reused += 1;
-            }
-            refs.push(ChunkRef {
-                hash: p.hash,
-                offset: p.offset as u64,
-                len: p.length as u32,
-            });
-        }
-        let chunks_new = to_put.len() as u32;
-        store.chunk_put_many(&to_put)?;
+        let plan = chunk_and_upload(&mut self.buffer, store)?;
 
         let mtime_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
         let mf = Manifest {
-            size: total,
+            size: plan.total,
             mode: self.mode,
             mtime_ns,
             version: 0,
-            chunks: refs,
+            chunks: plan.refs,
         };
 
         let mut expected = self.base_version;
@@ -443,9 +619,9 @@ impl WriteHandle {
         self.dirty = false;
         self.mtime_ns = mtime_ns;
         Ok(FlushStats {
-            bytes: total,
-            chunks_new,
-            chunks_reused,
+            bytes: plan.total,
+            chunks_new: plan.chunks_new,
+            chunks_reused: plan.chunks_reused,
             cas_retries,
             version_new: new_version,
             recovery: last_recovery,
@@ -503,6 +679,9 @@ mod handle_tests {
     pub(crate) struct MockStore {
         manifests: Mutex<std::collections::HashMap<String, Manifest>>,
         chunks: Mutex<std::collections::HashMap<[u8; 32], Vec<u8>>>,
+        retain_chunks: bool,
+        fail_upload: bool,
+        put_batch_bytes: Mutex<Vec<usize>>,
     }
 
     impl MockStore {
@@ -510,7 +689,31 @@ mod handle_tests {
             Self {
                 manifests: Default::default(),
                 chunks: Default::default(),
+                retain_chunks: true,
+                fail_upload: false,
+                put_batch_bytes: Default::default(),
             }
+        }
+        pub(crate) fn new_discarding_chunks() -> Self {
+            Self {
+                manifests: Default::default(),
+                chunks: Default::default(),
+                retain_chunks: false,
+                fail_upload: false,
+                put_batch_bytes: Default::default(),
+            }
+        }
+        pub(crate) fn new_failing_upload() -> Self {
+            Self {
+                manifests: Default::default(),
+                chunks: Default::default(),
+                retain_chunks: false,
+                fail_upload: true,
+                put_batch_bytes: Default::default(),
+            }
+        }
+        pub(crate) fn put_batch_bytes(&self) -> Vec<usize> {
+            self.put_batch_bytes.lock().unwrap().clone()
         }
         pub(crate) fn put_chunk(&self, h: [u8; 32], data: Vec<u8>) {
             self.chunks.lock().unwrap().insert(h, data);
@@ -528,7 +731,29 @@ mod handle_tests {
             Ok(self.chunks.lock().unwrap().contains_key(h))
         }
         fn chunk_put(&self, h: &[u8; 32], b: &[u8]) -> anyhow::Result<()> {
-            self.chunks.lock().unwrap().insert(*h, b.to_vec());
+            if self.retain_chunks {
+                self.chunks.lock().unwrap().insert(*h, b.to_vec());
+            }
+            Ok(())
+        }
+        fn chunk_put_many(
+            &self,
+            items: Vec<(crate::store::ChunkHash, Vec<u8>)>,
+        ) -> anyhow::Result<()> {
+            if self.fail_upload && !items.is_empty() {
+                anyhow::bail!("injected upload failure");
+            }
+            if !items.is_empty() {
+                self.put_batch_bytes
+                    .lock()
+                    .unwrap()
+                    .push(items.iter().map(|(_, bytes)| bytes.len()).sum());
+            }
+            for (hash, bytes) in items {
+                if self.retain_chunks {
+                    self.chunks.lock().unwrap().insert(hash, bytes);
+                }
+            }
             Ok(())
         }
         fn chunk_get(&self, h: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
@@ -675,6 +900,29 @@ mod handle_tests {
 mod flush_tests {
     use super::handle_tests::MockStore;
     use super::*;
+    use rand::{RngCore, SeedableRng};
+
+    #[test]
+    fn shared_upload_budget_blocks_until_bytes_are_released() {
+        let budget = UploadBudget::new(64);
+        let held = budget.acquire(64);
+        let contender = budget.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _permit = contender.acquire(1);
+            tx.send(()).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a concurrent reservation exceeded the shared byte limit"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("reservation did not resume after bytes were released");
+        worker.join().unwrap();
+    }
 
     #[test]
     fn flush_clean_handle_is_noop() {
@@ -722,6 +970,70 @@ mod flush_tests {
         // identical content → all reused on the second flush
         assert_eq!(s2.chunks_new, 0);
         assert_eq!(s2.chunks_reused, s1.chunks_new);
+    }
+
+    #[test]
+    fn spilled_flush_streams_and_bounds_upload_batches() {
+        const LOGICAL_BYTES: usize = 96 * 1024 * 1024;
+        const WRITE_BYTES: usize = 1024 * 1024;
+
+        // The store discards uploaded bytes, and this test reuses one write
+        // block, so the process never holds the whole logical file in memory.
+        let s = MockStore::new_discarding_chunks();
+        let mut wh = WriteHandle::new("/large".into(), 0o644, 0, 1, 1, None);
+        wh.loaded = true;
+        wh.cached = true;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(131);
+        let mut block = vec![0u8; WRITE_BYTES];
+        for offset in (0..LOGICAL_BYTES).step_by(WRITE_BYTES) {
+            rng.fill_bytes(&mut block);
+            wh.write(&s, offset as u64, &block).unwrap();
+        }
+        assert!(matches!(wh.buffer, Buffer::Spilled(_)));
+
+        let stats = wh.flush(&s).unwrap();
+        let manifest = s.manifest_get("/large").unwrap();
+        assert_eq!(stats.bytes, LOGICAL_BYTES as u64);
+        assert_eq!(manifest.size, LOGICAL_BYTES as u64);
+        assert_eq!(
+            manifest
+                .chunks
+                .iter()
+                .map(|chunk| chunk.len as u64)
+                .sum::<u64>(),
+            LOGICAL_BYTES as u64
+        );
+
+        let batches = s.put_batch_bytes();
+        assert!(
+            batches.len() >= 2,
+            "large flush should use multiple batches"
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|&bytes| bytes <= CHUNK_UPLOAD_WINDOW_BYTES),
+            "batch exceeded {} bytes: {batches:?}",
+            CHUNK_UPLOAD_WINDOW_BYTES
+        );
+    }
+
+    #[test]
+    fn upload_failure_does_not_commit_manifest() {
+        let s = MockStore::new_failing_upload();
+        let mut wh = WriteHandle::new("/failed".into(), 0o644, 0, 1, 1, None);
+        wh.loaded = true;
+        wh.cached = true;
+        wh.write(&s, 0, &vec![9u8; CHUNK_MIN as usize + 1024])
+            .unwrap();
+
+        assert!(wh.flush(&s).is_err());
+        assert!(wh.dirty, "a failed flush must remain retryable");
+        assert_eq!(
+            s.manifest_get("/failed").unwrap().version,
+            0,
+            "manifest became visible before its chunks were durable"
+        );
     }
 
     use crate::backend::BackendError;

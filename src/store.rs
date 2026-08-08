@@ -60,9 +60,9 @@ pub trait Store: Send + Sync {
 
     /// Batch upload. Default is serial; `DataStore` overrides to issue the
     /// underlying RPCs concurrently. Empty input is a no-op.
-    fn chunk_put_many(&self, items: &[(ChunkHash, Vec<u8>)]) -> anyhow::Result<()> {
+    fn chunk_put_many(&self, items: Vec<(ChunkHash, Vec<u8>)>) -> anyhow::Result<()> {
         for (hash, bytes) in items {
-            self.chunk_put(hash, bytes)?;
+            self.chunk_put(&hash, &bytes)?;
         }
         Ok(())
     }
