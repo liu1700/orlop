@@ -1,10 +1,11 @@
 # Orlop Metadata Mirror: Local Reads, Proven Freshness
 
-> **Status:** design contract for
-> [issue #122](https://github.com/liu1700/orlop/issues/122). The server change
-> feed, the client mirror, and the pipelined write path described here land in
-> separate PRs behind this document; op codes, schemas, and semantics below are
-> the plan of record for those changes.
+> **Status:** implemented as of v0.6.0
+> ([issue #122](https://github.com/liu1700/orlop/issues/122)). The read-through
+> mirror ships enabled by default (`ORLOP_METADATA_MIRROR=0` disables it).
+> Pipelined unlink is implemented but **opt-in**
+> (`ORLOP_METADATA_PIPELINE=1`) until its performance gate is demonstrated on
+> production workload benchmarks (section 6, gate 4).
 
 Orlop's remaining performance gap is metadata-heavy work, not bulk throughput.
 Measured on a production agent disk (200 small files, five rounds, medians):
