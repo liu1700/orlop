@@ -44,6 +44,13 @@ pub struct EntryWire {
     /// Device number, set only when `kind` is a block/char device.
     #[serde(default)]
     pub rdev: u64,
+    /// Modification time (files: unix nanoseconds, the manifest's own units).
+    /// 0 → unreported (old server); callers fall back to a manifest fetch.
+    #[serde(default)]
+    pub mtime: i64,
+    /// Manifest CAS version, files only. 0 → unreported (old server).
+    #[serde(default)]
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

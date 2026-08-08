@@ -44,6 +44,9 @@ const (
 	OpJournalRevertPath Op = 0x18
 	OpMknod             Op = 0x19
 	OpLink              Op = 0x1A
+	OpChangesFetch      Op = 0x1B
+	OpChangesSubscribe  Op = 0x1C
+	OpChangesEvent      Op = 0x1D
 )
 
 // String returns the canonical name for log lines.
@@ -97,6 +100,12 @@ func (o Op) String() string {
 		return "JOURNAL_QUERY"
 	case OpJournalRevertPath:
 		return "JOURNAL_REVERT_PATH"
+	case OpChangesFetch:
+		return "CHANGES_FETCH"
+	case OpChangesSubscribe:
+		return "CHANGES_SUBSCRIBE"
+	case OpChangesEvent:
+		return "CHANGES_EVENT"
 	default:
 		return "UNKNOWN"
 	}
@@ -110,7 +119,8 @@ func (o Op) Valid() bool {
 		OpManifestDelete, OpManifestRename, OpDirCreate, OpDirRemove,
 		OpSetattr, OpSymlink, OpReadlink, OpMknod, OpLink,
 		OpLeaseGrant, OpLeaseRefresh, OpLeaseRelease, OpLeaseRevoke,
-		OpJournalQuery, OpJournalRevertPath:
+		OpJournalQuery, OpJournalRevertPath,
+		OpChangesFetch, OpChangesSubscribe, OpChangesEvent:
 		return true
 	}
 	return false

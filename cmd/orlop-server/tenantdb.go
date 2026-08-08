@@ -134,6 +134,14 @@ func ensureTenantSchema(db *sql.DB) error {
 		`alter table symlinks add column uid integer not null default 0`,
 		`alter table symlinks add column gid integer not null default 0`,
 		`alter table symlinks add column atime integer not null default 0`,
+		// Metadata change feed (issue #122): every mutation stamps the rows it
+		// touches with a per-tenant monotonic revision. Pre-existing rows keep
+		// the default 0 — the feed's compound (rev, path) cursor starting at
+		// (0, "") delivers them during a full hydration.
+		`alter table manifests add column rev integer not null default 0`,
+		`alter table dir_entries add column rev integer not null default 0`,
+		`alter table symlinks add column rev integer not null default 0`,
+		`alter table special_nodes add column rev integer not null default 0`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
@@ -161,6 +169,31 @@ func ensureTenantSchema(db *sql.DB) error {
 		return err
 	}
 	if _, err := db.Exec(`create index if not exists manifests_inode_id on manifests(inode_id)`); err != nil {
+		return err
+	}
+	// Change-feed bookkeeping (issue #122): the revision counter (one row,
+	// mirrors inode_counter), delete tombstones, and per-table rev indexes so
+	// the feed's (rev, path)-ordered catch-up query stays cheap.
+	// pruned_before_rev is the rebaseline watermark: a cursor below it may
+	// have missed pruned tombstones and must resync from scratch.
+	if _, err := db.Exec(`
+		create table if not exists change_counter (
+		  singleton integer primary key check (singleton = 1),
+		  last_rev integer not null,
+		  pruned_before_rev integer not null default 0
+		);
+		insert or ignore into change_counter(singleton, last_rev) values(1, 0);
+		create table if not exists change_tombstones (
+		  path text primary key,
+		  rev integer not null,
+		  ts_unix_ms integer not null
+		);
+		create index if not exists manifests_by_rev on manifests(rev);
+		create index if not exists dir_entries_by_rev on dir_entries(rev);
+		create index if not exists symlinks_by_rev on symlinks(rev);
+		create index if not exists special_nodes_by_rev on special_nodes(rev);
+		create index if not exists change_tombstones_by_rev on change_tombstones(rev);
+	`); err != nil {
 		return err
 	}
 	return nil

@@ -194,6 +194,10 @@ impl NFSFileSystem for OrlopNfs {
             .map_err(|_| nfsstat3::NFS3ERR_IO)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
         let mtime_ns = match entry.kind {
+            // Prefer the stat-reported mtime (issue #122: servers now carry it
+            // on EntryWire); fall back to a manifest fetch against an old
+            // server that reports 0.
+            EntryKind::File if entry.mtime > 0 => entry.mtime as u64,
             EntryKind::File => self
                 .store
                 .manifest_get(&path)
@@ -285,6 +289,10 @@ impl NFSFileSystem for OrlopNfs {
                 });
             }
             let mtime_ns = match entry.kind {
+                // Prefer the listing-reported mtime (issue #122); the
+                // manifest fetch remains only as the old-server fallback,
+                // instead of one round trip per regular file in the listing.
+                EntryKind::File if entry.mtime > 0 => entry.mtime as u64,
                 EntryKind::File => self
                     .store
                     .manifest_get(&rel)
@@ -627,6 +635,8 @@ mod tests {
                     gid: 0,
                     atime: 0,
                     rdev: 0,
+                    mtime: 0,
+                    version: 0,
                 },
             );
             self.dirs
@@ -692,6 +702,8 @@ mod tests {
                     gid: 0,
                     atime: 0,
                     rdev: 0,
+                    mtime: 0,
+                    version: 0,
                 },
             );
             let mut dirs = self.dirs.lock();
@@ -801,6 +813,8 @@ mod tests {
                     gid: 0,
                     atime: 0,
                     rdev: 0,
+                    mtime: 0,
+                    version: 0,
                 },
             );
             let mut dirs = self.dirs.lock();

@@ -151,6 +151,18 @@ func purgeAgentSubtree(t *tenantState, agentID string) (agentPurgeResult, error)
 		return result, err
 	}
 
+	// Change feed (issue #122): a purge is a bulk delete that bypasses lease
+	// fences, so it MUST be visible to a mounted client's mirror. Tombstone
+	// every doomed path at one revision before the deletes run, and ring the
+	// doorbell post-commit.
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return result, err
+	}
+	if err := tombstoneSubtreeTx(tx, prefix, rev); err != nil {
+		return result, err
+	}
+
 	res, err := tx.Exec(
 		`delete from manifests where path = ? or path like ? escape '\'`,
 		prefix, likePrefix,
@@ -192,6 +204,7 @@ func purgeAgentSubtree(t *tenantState, agentID string) (agentPurgeResult, error)
 	if err := tx.Commit(); err != nil {
 		return result, err
 	}
+	t.changes.Notify(rev)
 
 	// Phase 2: immediate targeted sweep of the hashes this purge released.
 	deleted, err := deletePurgedChunkRows(db, delta)

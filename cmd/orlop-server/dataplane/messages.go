@@ -32,6 +32,14 @@ type EntryWire struct {
 	// Rdev is the device number, set only for block/char device special nodes.
 	// Append-only msgpack field — old clients/servers omit it (defaults to 0).
 	Rdev uint64 `msgpack:"rdev,omitempty"`
+	// Mtime is the modification time in the manifest's own units (the client
+	// writes unix nanoseconds), and Version the manifest CAS version; both are
+	// populated for regular files. Append-only msgpack fields (issue #122):
+	// they let stat/readdir answer without a per-file MANIFEST_GET round trip,
+	// and give a metadata mirror a freshness token to store per entry. Old
+	// clients/servers omit them and keep today's manifest-fetch fallback.
+	Mtime   int64  `msgpack:"mtime,omitempty"`
+	Version uint64 `msgpack:"version,omitempty"`
 }
 
 type ListResponse struct {
@@ -379,6 +387,101 @@ type JournalRevertPathResponse struct {
 type RevertConflict struct {
 	Path   string `msgpack:"path"`
 	Reason string `msgpack:"reason"`
+}
+
+// ---- Layer 8: metadata change feed (issue #122) -----------------------
+
+// SyncProtocolV1 is the only change-feed protocol version this build speaks.
+// Every CHANGES_FETCH / CHANGES_SUBSCRIBE request carries the version the
+// client wants and the response echoes the version the server will speak;
+// any other value is EINVAL. Negotiation is deliberately explicit (an
+// issue #122 acceptance gate): an old client must never silently interpret
+// a newer sync stream, and a new client learns "no feed" from the unknown-op
+// EINVAL an old server returns.
+const SyncProtocolV1 uint32 = 1
+
+// ChangesFetchRequest pages through the coalesced change feed. The compound
+// (CursorRev, CursorPath) cursor is a resume point, not a snapshot: entries
+// are delivered ordered by (rev, path), strictly greater than the cursor,
+// and a path mutated mid-hydration simply reappears later at its new
+// revision. A fresh mirror starts from (0, "").
+type ChangesFetchRequest struct {
+	SyncProtocol uint32 `msgpack:"sync_protocol"`
+	CursorRev    uint64 `msgpack:"cursor_rev"`
+	CursorPath   string `msgpack:"cursor_path"`
+	// Limit caps the page size; the server clamps it to [1, 1000], 0 means 500.
+	Limit uint32 `msgpack:"limit"`
+	// IncludeChunks asks for each file entry's manifest chunk list, so a
+	// mirror can serve manifest reads locally too.
+	IncludeChunks bool `msgpack:"include_chunks,omitempty"`
+}
+
+// ChangeEntryWire is one coalesced final-state entry: the current state of
+// one path, or its tombstone, stamped with the revision of the last mutation
+// that touched it. There is no rename opcode and no operation history —
+// final-state entries are idempotent to apply and indifferent to receiver
+// history.
+type ChangeEntryWire struct {
+	Path    string     `msgpack:"path"`
+	Rev     uint64     `msgpack:"rev"`
+	Kind    string     `msgpack:"kind"` // file|dir|symlink|fifo|socket|chardev|blockdev|tombstone
+	Size    uint64     `msgpack:"size,omitempty"`
+	Mode    uint32     `msgpack:"mode,omitempty"`
+	Mtime   int64      `msgpack:"mtime,omitempty"`
+	Uid     uint32     `msgpack:"uid,omitempty"`
+	Gid     uint32     `msgpack:"gid,omitempty"`
+	Atime   int64      `msgpack:"atime,omitempty"`
+	InodeID uint64     `msgpack:"inode_id,omitempty"`
+	Nlink   uint32     `msgpack:"nlink,omitempty"`
+	Version uint64     `msgpack:"version,omitempty"`
+	Target  string     `msgpack:"target,omitempty"`
+	Rdev    uint64     `msgpack:"rdev,omitempty"`
+	Chunks  []ChunkRef `msgpack:"chunks,omitempty"`
+	// HasChunks distinguishes "chunk list included and empty" (a zero-length
+	// file) from "chunk list not requested" — msgpack omitempty erases the
+	// empty list itself.
+	HasChunks bool `msgpack:"has_chunks,omitempty"`
+}
+
+// ChangesFetchResponse carries one feed page. NextRev/NextPath is the cursor
+// for the next call; CurrentRev is the tenant's latest committed revision at
+// serve time — when the client's applied cursor reaches it, the mirror is
+// caught up. ResyncRequired means the cursor predates pruned tombstones: the
+// client must discard its mirror and restart from (0, "").
+type ChangesFetchResponse struct {
+	SyncProtocol   uint32            `msgpack:"sync_protocol"`
+	Entries        []ChangeEntryWire `msgpack:"entries"`
+	NextRev        uint64            `msgpack:"next_rev"`
+	NextPath       string            `msgpack:"next_path"`
+	CurrentRev     uint64            `msgpack:"current_rev"`
+	ResyncRequired bool              `msgpack:"resync_required,omitempty"`
+	// Subtree is the server-authoritative path prefix this feed covers
+	// (derived from the cert's agent scope). It is the mirror's answerable
+	// domain: within it, a caught-up mirror may answer negatively (ENOENT)
+	// for absent paths; outside it, the mirror must not answer at all.
+	Subtree string `msgpack:"subtree,omitempty"`
+}
+
+// ChangesSubscribeRequest registers this connection for CHANGES_EVENT pushes.
+type ChangesSubscribeRequest struct {
+	SyncProtocol uint32 `msgpack:"sync_protocol"`
+}
+
+type ChangesSubscribeResponse struct {
+	SyncProtocol uint32 `msgpack:"sync_protocol"`
+	CurrentRev   uint64 `msgpack:"current_rev"`
+	// Subtree: see ChangesFetchResponse.Subtree.
+	Subtree string `msgpack:"subtree,omitempty"`
+}
+
+// ChangesEventPush is server-pushed after a metadata mutation commits: a
+// conflated doorbell carrying only the latest committed revision. The client
+// compares it against its applied cursor and pulls the delta with
+// CHANGES_FETCH; the event itself never carries entries, so bursts coalesce
+// and a slow consumer can never be dropped for buffering reasons. The
+// subscription dies with the connection.
+type ChangesEventPush struct {
+	CurrentRev uint64 `msgpack:"current_rev"`
 }
 
 func ErrEBUSY(msg string) ErrorPayload { return ErrorPayload{Errno: ErrnoEBUSY, Message: msg} }

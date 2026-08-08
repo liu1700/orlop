@@ -352,6 +352,8 @@ fn entry_from_wire(w: EntryWire) -> Result<Entry> {
         gid: w.gid,
         atime: w.atime,
         rdev: w.rdev,
+        mtime: w.mtime,
+        version: w.version,
     })
 }
 

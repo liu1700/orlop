@@ -75,6 +75,17 @@ func (g *gcLoop) tick(ctx context.Context) {
 			"bytes_freed", result.BytesFreed, "dry_run", result.DryRun,
 			"duration_ms", result.Duration.Milliseconds(),
 		)
+		// Change-feed tombstones age out on the same retention window as
+		// chunks; the pruned_before_rev watermark forces stale cursors to
+		// rebaseline instead of silently missing the pruned deletions.
+		if !g.cfg.DryRun {
+			tombstoneCutoffMs := g.clock().Add(-g.cfg.RetentionWindow).UnixMilli()
+			if n, err := pruneTombstones(tenant.db.DB(), tombstoneCutoffMs); err != nil {
+				g.logger.Error("tombstone prune failed", "tenant", tid, "error", err)
+			} else if n > 0 {
+				g.logger.Info("tombstones pruned", "tenant", tid, "count", n)
+			}
+		}
 	}
 }
 
