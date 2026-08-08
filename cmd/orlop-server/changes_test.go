@@ -491,6 +491,9 @@ func TestHandleChangesFetchSubtreeConfinement(t *testing.T) {
 	if resp.SyncProtocol != dataplane.SyncProtocolV1 {
 		t.Fatalf("sync_protocol echo = %d", resp.SyncProtocol)
 	}
+	if resp.Subtree != "/agent-A" {
+		t.Fatalf("subtree = %q, want /agent-A", resp.Subtree)
+	}
 	if len(resp.Entries) != 2 {
 		t.Fatalf("scoped feed = %d entries, want 2: %+v", len(resp.Entries), resp.Entries)
 	}

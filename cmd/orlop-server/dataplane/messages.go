@@ -455,6 +455,11 @@ type ChangesFetchResponse struct {
 	NextPath       string            `msgpack:"next_path"`
 	CurrentRev     uint64            `msgpack:"current_rev"`
 	ResyncRequired bool              `msgpack:"resync_required,omitempty"`
+	// Subtree is the server-authoritative path prefix this feed covers
+	// (derived from the cert's agent scope). It is the mirror's answerable
+	// domain: within it, a caught-up mirror may answer negatively (ENOENT)
+	// for absent paths; outside it, the mirror must not answer at all.
+	Subtree string `msgpack:"subtree,omitempty"`
 }
 
 // ChangesSubscribeRequest registers this connection for CHANGES_EVENT pushes.
@@ -465,6 +470,8 @@ type ChangesSubscribeRequest struct {
 type ChangesSubscribeResponse struct {
 	SyncProtocol uint32 `msgpack:"sync_protocol"`
 	CurrentRev   uint64 `msgpack:"current_rev"`
+	// Subtree: see ChangesFetchResponse.Subtree.
+	Subtree string `msgpack:"subtree,omitempty"`
 }
 
 // ChangesEventPush is server-pushed after a metadata mutation commits: a

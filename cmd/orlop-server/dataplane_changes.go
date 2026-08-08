@@ -60,6 +60,7 @@ func handleChangesFetch(s *serverState, tenant *tenantState, ident Identity, w *
 			NextPath:       req.CursorPath,
 			CurrentRev:     lastRev,
 			ResyncRequired: true,
+			Subtree:        subtree,
 		})
 		s.recordDataAudit(ident, "changes_fetch", subtree, nil, true, nil)
 		return
@@ -112,6 +113,7 @@ func handleChangesFetch(s *serverState, tenant *tenantState, ident Identity, w *
 		SyncProtocol: dataplane.SyncProtocolV1,
 		Entries:      wire,
 		CurrentRev:   lastRev,
+		Subtree:      subtree,
 	}
 	if len(entries) < limit {
 		// Not-full page: the subtree's feed is drained as of query time. Jump
@@ -161,10 +163,15 @@ func handleChangesSubscribe(s *serverState, tenant *tenantState, ident Identity,
 		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEIO(err.Error()))
 		return
 	}
+	subtree := ""
+	if ident.ScopedAgentID != "" {
+		subtree = "/" + ident.ScopedAgentID
+	}
 	go changesEventPump(w, sub)
 	sendResp(w, frame, dataplane.ChangesSubscribeResponse{
 		SyncProtocol: dataplane.SyncProtocolV1,
 		CurrentRev:   lastRev,
+		Subtree:      subtree,
 	})
 	s.recordDataAudit(ident, "changes_subscribe", "", nil, true, nil)
 }
