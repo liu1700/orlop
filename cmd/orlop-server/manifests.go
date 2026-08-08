@@ -115,6 +115,12 @@ type ManifestStore struct {
 	// tenantState construction via SetJournal; nil in unit tests that
 	// don't exercise the subscription path.
 	journal *SessionJournal
+	// onChange, when non-nil, is called with the allocated change revision
+	// after a mutation's transaction commits (issue #122). Unlike the
+	// journal it fires for EVERY metadata mutation — a mirror that misses
+	// even one writer's changes serves stale data. Set by tenantState
+	// construction via SetChangeNotify.
+	onChange func(rev uint64)
 }
 
 // NewManifestStore wraps the same sqlite handle the TenantDB opened.
@@ -126,6 +132,21 @@ func NewManifestStore(db *sql.DB, metrics *serverMetrics) *ManifestStore {
 // call once at construction; not safe to swap concurrently with writes.
 func (m *ManifestStore) SetJournal(j *SessionJournal) {
 	m.journal = j
+}
+
+// SetChangeNotify wires the change-feed doorbell for post-commit
+// notifications. Same construction-time contract as SetJournal.
+func (m *ManifestStore) SetChangeNotify(fn func(rev uint64)) {
+	m.onChange = fn
+}
+
+// notifyChange rings the change-feed doorbell after a committed mutation.
+// Post-commit invariant mirrors the journal Broadcast: only revisions that
+// actually landed are announced.
+func (m *ManifestStore) notifyChange(rev uint64) {
+	if m.onChange != nil && rev != 0 {
+		m.onChange(rev)
+	}
 }
 
 // Get returns the manifest for path. ErrManifestNotFound if missing.
@@ -240,6 +261,10 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 		return 0, &VersionConflictError{Existing: existingVersion}
 	}
 	newVersion := expectedVersion + 1
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return 0, err
+	}
 
 	// 3b. Journal the inverse op before the write lands. Failure here aborts
 	// the manifest write — better to refuse than leave an unrevertable change.
@@ -277,10 +302,10 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 			newAtime = mf.Mtime
 		}
 		res, err := tx.Exec(`
-			insert into manifests (path, inode_id, size, mode, mtime, version, chunks, uid, gid, atime)
-			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			insert into manifests (path, inode_id, size, mode, mtime, version, chunks, uid, gid, atime, rev)
+			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			on conflict(path) do nothing
-		`, p, allocatedInodeID, mf.Size, mf.Mode, mf.Mtime, newVersion, blob, mf.Uid, mf.Gid, newAtime)
+		`, p, allocatedInodeID, mf.Size, mf.Mode, mf.Mtime, newVersion, blob, mf.Uid, mf.Gid, newAtime, rev)
 		if err != nil {
 			return 0, fmt.Errorf("insert manifest %s: %w", p, err)
 		}
@@ -290,6 +315,9 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 		}
 		if n == 0 {
 			return 0, ErrVersionConflict
+		}
+		if err := clearTombstoneTx(tx, p); err != nil {
+			return 0, err
 		}
 	} else {
 		// Update (content write): PRESERVE the stored owner and access time —
@@ -301,9 +329,9 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 		}
 		res, err := tx.Exec(`
 			update manifests
-			set size = ?, mode = ?, mtime = ?, version = ?, chunks = ?, uid = ?, gid = ?, atime = ?
+			set size = ?, mode = ?, mtime = ?, version = ?, chunks = ?, uid = ?, gid = ?, atime = ?, rev = ?
 			where inode_id = ?
-		`, mf.Size, mf.Mode, mf.Mtime, newVersion, blob, keepUID, keepGID, keepAtime, oldInodeID)
+		`, mf.Size, mf.Mode, mf.Mtime, newVersion, blob, keepUID, keepGID, keepAtime, rev, oldInodeID)
 		if err != nil {
 			return 0, fmt.Errorf("update manifest %s: %w", p, err)
 		}
@@ -333,6 +361,7 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 	if journalEntry != nil && m.journal != nil {
 		m.journal.Broadcast(journalEntry.AllocationID, *journalEntry)
 	}
+	m.notifyChange(rev)
 	return newVersion, nil
 }
 
@@ -387,11 +416,23 @@ func (m *ManifestStore) Link(from, to, sessionID, allocationID, agentID string) 
 		blob = []byte{}
 	}
 
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.Exec(`
-		insert into manifests(path, inode_id, size, mode, mtime, version, chunks, uid, gid, atime)
-		values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, to, inodeID, size, mode, mtime, version, blob, uid, gid, atime); err != nil {
+		insert into manifests(path, inode_id, size, mode, mtime, version, chunks, uid, gid, atime, rev)
+		values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, to, inodeID, size, mode, mtime, version, blob, uid, gid, atime, rev); err != nil {
 		return 0, fmt.Errorf("insert hard link %s -> %s: %w", to, from, err)
+	}
+	// nlink changed for every name of this inode; restamp them all so a
+	// mirror re-fetches their entries (nlink is computed live at feed time).
+	if _, err := tx.Exec(`update manifests set rev = ? where inode_id = ?`, rev, inodeID); err != nil {
+		return 0, fmt.Errorf("restamp linked inode %d: %w", inodeID, err)
+	}
+	if err := clearTombstoneTx(tx, to); err != nil {
+		return 0, err
 	}
 	parent, name := splitParentName(to)
 	if _, err := tx.Exec(`insert into dir_entries(parent, name) values(?, ?)`, parent, name); err != nil {
@@ -418,6 +459,7 @@ func (m *ManifestStore) Link(from, to, sessionID, allocationID, agentID string) 
 	if journalEntry != nil && m.journal != nil {
 		m.journal.Broadcast(journalEntry.AllocationID, *journalEntry)
 	}
+	m.notifyChange(rev)
 	return nlink, nil
 }
 
@@ -429,8 +471,9 @@ func (m *ManifestStore) deleteSymlink(p string) error {
 }
 
 // deletePathRow removes the path-keyed row in `table` plus its dir_entry in
-// one transaction. Returns ErrManifestNotFound when no row exists at p. Backs
-// deleteSymlink and deleteSpecialNode; `label` names the node kind in errors.
+// one transaction, recording a change-feed tombstone. Returns
+// ErrManifestNotFound when no row exists at p. Backs deleteSymlink and
+// deleteSpecialNode; `label` names the node kind in errors.
 func (m *ManifestStore) deletePathRow(table, label, p string) error {
 	tx, err := m.db.Begin()
 	if err != nil {
@@ -450,7 +493,18 @@ func (m *ManifestStore) deletePathRow(table, label, p string) error {
 			return fmt.Errorf("delete %s dir_entry %s/%s: %w", label, parent, name, err)
 		}
 	}
-	return tx.Commit()
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return err
+	}
+	if err := upsertTombstoneTx(tx, p, rev); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.notifyChange(rev)
+	return nil
 }
 
 // Delete removes the manifest for p using CAS semantics on expectedVersion.
@@ -563,6 +617,20 @@ func (m *ManifestStore) Delete(p string, expectedVersion uint64, sessionID, allo
 			return fmt.Errorf("delete dir_entry %s/%s: %w", parent, name, err)
 		}
 	}
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return err
+	}
+	if err := upsertTombstoneTx(tx, p, rev); err != nil {
+		return err
+	}
+	// A non-final hard-link delete changes nlink for the surviving names;
+	// restamp them (p's own row is already gone) so a mirror re-fetches them.
+	if nlink > 1 {
+		if _, err := tx.Exec(`update manifests set rev = ? where inode_id = ?`, rev, inodeID); err != nil {
+			return fmt.Errorf("restamp surviving hard links of inode %d: %w", inodeID, err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -570,6 +638,7 @@ func (m *ManifestStore) Delete(p string, expectedVersion uint64, sessionID, allo
 	if journalEntry != nil && m.journal != nil {
 		m.journal.Broadcast(journalEntry.AllocationID, *journalEntry)
 	}
+	m.notifyChange(rev)
 	return nil
 }
 
@@ -676,8 +745,11 @@ func removeDirEntryTx(tx *sql.Tx, p string) error {
 // deleteDestTx removes the destination node `to` of kind `k` inside tx so the
 // rename can move `from` onto it. Regular files decref their chunks; symlinks
 // and special nodes drop their backing row; empty directories drop their
-// dir_entry. The dir_entry registration is removed for every kind.
-func deleteDestTx(tx *sql.Tx, to string, k nodeKind) error {
+// dir_entry. The dir_entry registration is removed for every kind. rev is the
+// rename's change revision: a displaced regular dest with surviving hard
+// links gets those survivors restamped (their nlink changed). No tombstone is
+// recorded for `to` — the moved source immediately re-occupies the path.
+func deleteDestTx(tx *sql.Tx, to string, k nodeKind, rev uint64) error {
 	switch k {
 	case nodeRegular:
 		var (
@@ -704,6 +776,11 @@ func deleteDestTx(tx *sql.Tx, to string, k nodeKind) error {
 		if _, err := tx.Exec(`delete from manifests where path = ?`, to); err != nil {
 			return fmt.Errorf("delete dest manifest %s: %w", to, err)
 		}
+		if nlink > 1 {
+			if _, err := tx.Exec(`update manifests set rev = ? where inode_id = ?`, rev, inodeID); err != nil {
+				return fmt.Errorf("restamp displaced dest inode %d: %w", inodeID, err)
+			}
+		}
 	case nodeSymlink:
 		if _, err := tx.Exec(`delete from symlinks where path = ?`, to); err != nil {
 			return fmt.Errorf("delete dest symlink %s: %w", to, err)
@@ -722,15 +799,25 @@ func deleteDestTx(tx *sql.Tx, to string, k nodeKind) error {
 // Children live under `from + "/"`; rewrite their `path` columns (and the
 // dir_entries `parent` column) to sit under `to` instead. Called only when a
 // directory itself is moved.
-func reparentDescendantsTx(tx *sql.Tx, from, to string) error {
+//
+// Change-feed bookkeeping (issue #122): the old descendant paths vanish, so
+// they are tombstoned BEFORE the rewrite (the SELECTs must still see them),
+// every moved row is stamped with the rename's revision, and stale tombstones
+// under the destination are cleared. The whole subtree lands at ONE revision
+// — this is exactly why the feed cursor is a (rev, path) pair rather than a
+// scalar watermark.
+func reparentDescendantsTx(tx *sql.Tx, from, to string, rev uint64) error {
+	if err := tombstoneSubtreeTx(tx, from, rev); err != nil {
+		return err
+	}
 	// For the three path-keyed tables, rewrite the path prefix.
 	// path = to || substr(path, len(from)+1) for rows where path like from||'/%'.
 	likePat := from + "/%"
 	prefixLen := len(from) + 1 // 1-based substr index of the first char after `from`
 	for _, table := range []string{"manifests", "symlinks", "special_nodes"} {
 		if _, err := tx.Exec(
-			`update `+table+` set path = ? || substr(path, ?) where path like ?`,
-			to, prefixLen, likePat,
+			`update `+table+` set path = ? || substr(path, ?), rev = ? where path like ?`,
+			to, prefixLen, rev, likePat,
 		); err != nil {
 			return fmt.Errorf("reparent %s paths %s->%s: %w", table, from, to, err)
 		}
@@ -738,15 +825,18 @@ func reparentDescendantsTx(tx *sql.Tx, from, to string) error {
 	// dir_entries are keyed by (parent, name): rewrite the `parent` prefix for
 	// every descendant whose parent is `from` or nested under `from/`.
 	if _, err := tx.Exec(
-		`update dir_entries set parent = ? where parent = ?`, to, from,
+		`update dir_entries set parent = ?, rev = ? where parent = ?`, to, rev, from,
 	); err != nil {
 		return fmt.Errorf("reparent dir_entries direct children %s->%s: %w", from, to, err)
 	}
 	if _, err := tx.Exec(
-		`update dir_entries set parent = ? || substr(parent, ?) where parent like ?`,
-		to, prefixLen, likePat,
+		`update dir_entries set parent = ? || substr(parent, ?), rev = ? where parent like ?`,
+		to, prefixLen, rev, likePat,
 	); err != nil {
 		return fmt.Errorf("reparent dir_entries nested %s->%s: %w", from, to, err)
+	}
+	if err := clearTombstoneSubtreeTx(tx, to); err != nil {
+		return err
 	}
 	return nil
 }
@@ -837,9 +927,17 @@ func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint
 		}
 	}
 
+	// 6b. One change revision for the whole rename: displaced dest, moved
+	// source (subtree included for directories), and the old-path tombstone
+	// all land at the same rev.
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return 0, err
+	}
+
 	// 7. Overwrite the destination in-tx (if present and compatible).
 	if dstKind != nodeAbsent {
-		if err := deleteDestTx(tx, to, dstKind); err != nil {
+		if err := deleteDestTx(tx, to, dstKind, rev); err != nil {
 			return 0, err
 		}
 	}
@@ -851,13 +949,21 @@ func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint
 	}
 
 	// 9. Move the source's backing row to `to`.
-	if err := moveRenameSourceTx(tx, from, to, srcKind, newVersion, src.inodeID); err != nil {
+	if err := moveRenameSourceTx(tx, from, to, srcKind, newVersion, src.inodeID, rev); err != nil {
 		return 0, err
 	}
 
 	// 10. Rewrite the source's own dir_entry: drop (fromParent,fromName), add
 	// (toParent,toName).
-	if err := rewriteRenameDirEntriesTx(tx, from, to, srcKind); err != nil {
+	if err := rewriteRenameDirEntriesTx(tx, from, to, srcKind, rev); err != nil {
+		return 0, err
+	}
+
+	// 11. The source path no longer exists; the destination does.
+	if err := upsertTombstoneTx(tx, from, rev); err != nil {
+		return 0, err
+	}
+	if err := clearTombstoneTx(tx, to); err != nil {
 		return 0, err
 	}
 
@@ -868,6 +974,7 @@ func (m *ManifestStore) renameOpt(from, to string, expectedFrom, expectedTo uint
 	if journalEntry != nil && m.journal != nil {
 		m.journal.Broadcast(journalEntry.AllocationID, *journalEntry)
 	}
+	m.notifyChange(rev)
 	return newVersion, nil
 }
 
@@ -989,8 +1096,9 @@ func (m *ManifestStore) journalRenameTx(tx *sql.Tx, from, to string, srcKind nod
 
 // moveRenameSourceTx moves the source's backing row to `to`: a path (and, for
 // regular files, version) rewrite on the kind's own table, or a descendant
-// re-parent for directories.
-func moveRenameSourceTx(tx *sql.Tx, from, to string, srcKind nodeKind, newVersion, inodeID uint64) error {
+// re-parent for directories. Every moved row is stamped with the rename's
+// change revision.
+func moveRenameSourceTx(tx *sql.Tx, from, to string, srcKind nodeKind, newVersion, inodeID, rev uint64) error {
 	switch srcKind {
 	case nodeRegular:
 		if _, err := tx.Exec(`update manifests set path = ? where path = ?`, to, from); err != nil {
@@ -998,21 +1106,22 @@ func moveRenameSourceTx(tx *sql.Tx, from, to string, srcKind nodeKind, newVersio
 		}
 		// Version is inode metadata: every hard-link name must observe the same
 		// value or later CAS writes through another name would spuriously fail.
-		if _, err := tx.Exec(`update manifests set version = ? where inode_id = ?`, newVersion, inodeID); err != nil {
+		// The rev stamp rides along for every alias for the same reason.
+		if _, err := tx.Exec(`update manifests set version = ?, rev = ? where inode_id = ?`, newVersion, rev, inodeID); err != nil {
 			return fmt.Errorf("update renamed inode version %d: %w", inodeID, err)
 		}
 	case nodeSymlink:
-		if _, err := tx.Exec(`update symlinks set path = ? where path = ?`, to, from); err != nil {
+		if _, err := tx.Exec(`update symlinks set path = ?, rev = ? where path = ?`, to, rev, from); err != nil {
 			return fmt.Errorf("move symlink %s->%s: %w", from, to, err)
 		}
 	case nodeSpecial:
-		if _, err := tx.Exec(`update special_nodes set path = ? where path = ?`, to, from); err != nil {
+		if _, err := tx.Exec(`update special_nodes set path = ?, rev = ? where path = ?`, to, rev, from); err != nil {
 			return fmt.Errorf("move special node %s->%s: %w", from, to, err)
 		}
 	case nodeDir:
 		// Re-parent every descendant path/parent BEFORE moving the dir's own
 		// entry, so the prefix rewrite still matches `from/...`.
-		if err := reparentDescendantsTx(tx, from, to); err != nil {
+		if err := reparentDescendantsTx(tx, from, to, rev); err != nil {
 			return err
 		}
 	}
@@ -1022,7 +1131,7 @@ func moveRenameSourceTx(tx *sql.Tx, from, to string, srcKind nodeKind, newVersio
 // rewriteRenameDirEntriesTx rewrites the source's own dir_entry: drop
 // (fromParent,fromName), add (toParent,toName). A directory carries its stored
 // mode/owner/atime so a moved directory keeps its metadata.
-func rewriteRenameDirEntriesTx(tx *sql.Tx, from, to string, srcKind nodeKind) error {
+func rewriteRenameDirEntriesTx(tx *sql.Tx, from, to string, srcKind nodeKind, rev uint64) error {
 	fromParent, fromName := splitParentName(from)
 	toParent, toName := splitParentName(to)
 
@@ -1043,9 +1152,9 @@ func rewriteRenameDirEntriesTx(tx *sql.Tx, from, to string, srcKind nodeKind) er
 	if toName != "" {
 		if srcKind == nodeDir {
 			if _, err := tx.Exec(
-				`insert into dir_entries(parent, name, mode, uid, gid, atime) values(?, ?, ?, ?, ?, ?)
-				 on conflict(parent, name) do update set mode=excluded.mode, uid=excluded.uid, gid=excluded.gid, atime=excluded.atime`,
-				toParent, toName, dMode, dUID, dGID, dAtime,
+				`insert into dir_entries(parent, name, mode, uid, gid, atime, rev) values(?, ?, ?, ?, ?, ?, ?)
+				 on conflict(parent, name) do update set mode=excluded.mode, uid=excluded.uid, gid=excluded.gid, atime=excluded.atime, rev=excluded.rev`,
+				toParent, toName, dMode, dUID, dGID, dAtime, rev,
 			); err != nil {
 				return fmt.Errorf("insert dir_entry %s/%s: %w", toParent, toName, err)
 			}
@@ -1085,6 +1194,12 @@ type DirChild struct {
 	Atime   int64
 	InodeID uint64
 	Nlink   uint32
+	// Mtime is the modification time; real for files (manifest mtime), the
+	// stored (rarely set) value for symlinks/dirs. Version is the manifest
+	// CAS version, files only. Carried so listings can answer stat-shaped
+	// questions without a per-file manifest fetch (issue #122).
+	Mtime   int64
+	Version uint64
 }
 
 // ListChildren returns the children of `parent` from dir_entries, joined with
@@ -1105,7 +1220,9 @@ func (m *ManifestStore) ListChildren(parent string) ([]DirChild, error) {
 		       COALESCE(mf.inode_id, 0) AS inode_id,
 		       CASE WHEN mf.inode_id IS NULL THEN 1
 		            ELSE (select count(*) from manifests links where links.inode_id = mf.inode_id)
-		       END AS nlink
+		       END AS nlink,
+		       COALESCE(mf.mtime, sl.mtime, d.mtime, 0) AS mtime,
+		       COALESCE(mf.version, 0) AS version
 		FROM dir_entries d
 		LEFT JOIN manifests mf
 		  ON mf.path = CASE WHEN d.parent = '/' THEN '/' || d.name
@@ -1124,7 +1241,7 @@ func (m *ManifestStore) ListChildren(parent string) ([]DirChild, error) {
 	var out []DirChild
 	for rows.Next() {
 		var c DirChild
-		if err := rows.Scan(&c.Name, &c.Kind, &c.Size, &c.Mode, &c.Uid, &c.Gid, &c.Atime, &c.InodeID, &c.Nlink); err != nil {
+		if err := rows.Scan(&c.Name, &c.Kind, &c.Size, &c.Mode, &c.Uid, &c.Gid, &c.Atime, &c.InodeID, &c.Nlink, &c.Mtime, &c.Version); err != nil {
 			return nil, err
 		}
 		c.IsDir = c.Kind == "dir"
@@ -1200,12 +1317,23 @@ func (m *ManifestStore) DirCreate(p string, mode uint32) error {
 	if mode == 0 {
 		mode = 0o755
 	}
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(
-		`insert into dir_entries(parent, name, mode, uid, gid, atime) values(?, ?, ?, 0, 0, 0)`, parent, name, mode&0o7777,
+		`insert into dir_entries(parent, name, mode, uid, gid, atime, rev) values(?, ?, ?, 0, 0, 0, ?)`, parent, name, mode&0o7777, rev,
 	); err != nil {
 		return fmt.Errorf("insert dir_entry %s: %w", p, err)
 	}
-	return tx.Commit()
+	if err := clearTombstoneTx(tx, p); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.notifyChange(rev)
+	return nil
 }
 
 // DirInfo returns the stored mode + owner + atime for a directory path.
@@ -1270,8 +1398,12 @@ func (m *ManifestStore) Symlink(p, target string, mode uint32) error {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(
-		`insert into symlinks(path, target, mode, mtime, uid, gid, atime) values(?, ?, ?, 0, 0, 0, 0)`, p, target, mode&0o7777,
+		`insert into symlinks(path, target, mode, mtime, uid, gid, atime, rev) values(?, ?, ?, 0, 0, 0, 0, ?)`, p, target, mode&0o7777, rev,
 	); err != nil {
 		return fmt.Errorf("insert symlink %s: %w", p, err)
 	}
@@ -1280,7 +1412,14 @@ func (m *ManifestStore) Symlink(p, target string, mode uint32) error {
 	); err != nil {
 		return fmt.Errorf("register symlink dir_entry %s: %w", p, err)
 	}
-	return tx.Commit()
+	if err := clearTombstoneTx(tx, p); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.notifyChange(rev)
+	return nil
 }
 
 // Readlink returns the target of the symlink at p. ErrManifestNotFound if p is
@@ -1341,8 +1480,12 @@ func (m *ManifestStore) Mknod(p string, mode uint32, rdev uint64) error {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(
-		`insert into special_nodes(path, mode, rdev, mtime, uid, gid, atime) values(?, ?, ?, 0, 0, 0, 0)`, p, mode, rdev,
+		`insert into special_nodes(path, mode, rdev, mtime, uid, gid, atime, rev) values(?, ?, ?, 0, 0, 0, 0, ?)`, p, mode, rdev, rev,
 	); err != nil {
 		return fmt.Errorf("insert special node %s: %w", p, err)
 	}
@@ -1351,7 +1494,14 @@ func (m *ManifestStore) Mknod(p string, mode uint32, rdev uint64) error {
 	); err != nil {
 		return fmt.Errorf("register special node dir_entry %s: %w", p, err)
 	}
-	return tx.Commit()
+	if err := clearTombstoneTx(tx, p); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.notifyChange(rev)
+	return nil
 }
 
 // SpecialNodeInfo reports a special node's mode+rdev+owner+atime and the derived
@@ -1402,22 +1552,40 @@ func (m *ManifestStore) SetMode(p string, mode uint32, sessionID, allocationID, 
 	if !errors.Is(err, ErrManifestNotFound) {
 		return err
 	}
+	// Symlink / special node / directory: metadata-only rows, one transaction
+	// so the change-rev allocation commits (or rolls back) with the stamp.
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return err
+	}
+	commitNotify := func() error {
+		if cErr := tx.Commit(); cErr != nil {
+			return cErr
+		}
+		m.notifyChange(rev)
+		return nil
+	}
 	// Symlink.
-	if res, sErr := m.db.Exec(`update symlinks set mode = ? where path = ?`, mode, p); sErr != nil {
+	if res, sErr := tx.Exec(`update symlinks set mode = ?, rev = ? where path = ?`, mode, rev, p); sErr != nil {
 		return sErr
 	} else if n, _ := res.RowsAffected(); n > 0 {
-		return nil
+		return commitNotify()
 	}
 	// Special node: chmod must preserve the type bits (S_IF*) so a fifo/device
 	// stays a fifo/device. Read the stored mode, replace only the perm bits.
 	var oldMode uint32
-	snErr := m.db.QueryRow(`select mode from special_nodes where path = ?`, p).Scan(&oldMode)
+	snErr := tx.QueryRow(`select mode from special_nodes where path = ?`, p).Scan(&oldMode)
 	if snErr == nil {
 		newMode := (oldMode & sIFMT) | (mode & 0o7777)
-		if _, uErr := m.db.Exec(`update special_nodes set mode = ? where path = ?`, newMode, p); uErr != nil {
+		if _, uErr := tx.Exec(`update special_nodes set mode = ?, rev = ? where path = ?`, newMode, rev, p); uErr != nil {
 			return uErr
 		}
-		return nil
+		return commitNotify()
 	}
 	if !errors.Is(snErr, sql.ErrNoRows) {
 		return snErr
@@ -1425,16 +1593,16 @@ func (m *ManifestStore) SetMode(p string, mode uint32, sessionID, allocationID, 
 	// Directory.
 	parent, name := splitParentName(p)
 	if name == "" {
-		return nil // root: nothing to persist, succeed
+		return nil // root: nothing to persist, succeed (rollback discards the rev)
 	}
-	res, dErr := m.db.Exec(`update dir_entries set mode = ? where parent = ? and name = ?`, mode, parent, name)
+	res, dErr := tx.Exec(`update dir_entries set mode = ?, rev = ? where parent = ? and name = ?`, mode, rev, parent, name)
 	if dErr != nil {
 		return dErr
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrManifestNotFound
 	}
-	return nil
+	return commitNotify()
 }
 
 // SetOwner stores uid+gid for the file, directory, or symlink at p (chown).
@@ -1444,80 +1612,112 @@ func (m *ManifestStore) SetMode(p string, mode uint32, sessionID, allocationID, 
 // manifests (file) → symlinks → dir_entries (directory). ENOENT-equivalent
 // (ErrManifestNotFound) when p does not exist; root ("/") succeeds as a no-op.
 func (m *ManifestStore) SetOwner(p string, uid, gid uint32) error {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return err
+	}
+	commitNotify := func() error {
+		if cErr := tx.Commit(); cErr != nil {
+			return cErr
+		}
+		m.notifyChange(rev)
+		return nil
+	}
 	// File.
-	if res, fErr := m.db.Exec(`
-		update manifests set uid = ?, gid = ?
+	if res, fErr := tx.Exec(`
+		update manifests set uid = ?, gid = ?, rev = ?
 		where inode_id = (select inode_id from manifests where path = ?)
-	`, uid, gid, p); fErr != nil {
+	`, uid, gid, rev, p); fErr != nil {
 		return fErr
 	} else if n, _ := res.RowsAffected(); n > 0 {
-		return nil
+		return commitNotify()
 	}
 	// Symlink.
-	if res, sErr := m.db.Exec(`update symlinks set uid = ?, gid = ? where path = ?`, uid, gid, p); sErr != nil {
+	if res, sErr := tx.Exec(`update symlinks set uid = ?, gid = ?, rev = ? where path = ?`, uid, gid, rev, p); sErr != nil {
 		return sErr
 	} else if n, _ := res.RowsAffected(); n > 0 {
-		return nil
+		return commitNotify()
 	}
 	// Special node.
-	if res, snErr := m.db.Exec(`update special_nodes set uid = ?, gid = ? where path = ?`, uid, gid, p); snErr != nil {
+	if res, snErr := tx.Exec(`update special_nodes set uid = ?, gid = ?, rev = ? where path = ?`, uid, gid, rev, p); snErr != nil {
 		return snErr
 	} else if n, _ := res.RowsAffected(); n > 0 {
-		return nil
+		return commitNotify()
 	}
 	// Directory.
 	parent, name := splitParentName(p)
 	if name == "" {
-		return nil // root: nothing to persist, succeed
+		return nil // root: nothing to persist, succeed (rollback discards the rev)
 	}
-	res, dErr := m.db.Exec(`update dir_entries set uid = ?, gid = ? where parent = ? and name = ?`, uid, gid, parent, name)
+	res, dErr := tx.Exec(`update dir_entries set uid = ?, gid = ?, rev = ? where parent = ? and name = ?`, uid, gid, rev, parent, name)
 	if dErr != nil {
 		return dErr
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrManifestNotFound
 	}
-	return nil
+	return commitNotify()
 }
 
 // SetAtime stores the access time (atime) for the file, directory, or symlink
 // at p (utimensat). Store-and-readback only; same three-table fan-out and
 // not-journaled model as SetOwner.
 func (m *ManifestStore) SetAtime(p string, atime int64) error {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return err
+	}
+	commitNotify := func() error {
+		if cErr := tx.Commit(); cErr != nil {
+			return cErr
+		}
+		m.notifyChange(rev)
+		return nil
+	}
 	// File.
-	if res, fErr := m.db.Exec(`
-		update manifests set atime = ?
+	if res, fErr := tx.Exec(`
+		update manifests set atime = ?, rev = ?
 		where inode_id = (select inode_id from manifests where path = ?)
-	`, atime, p); fErr != nil {
+	`, atime, rev, p); fErr != nil {
 		return fErr
 	} else if n, _ := res.RowsAffected(); n > 0 {
-		return nil
+		return commitNotify()
 	}
 	// Symlink.
-	if res, sErr := m.db.Exec(`update symlinks set atime = ? where path = ?`, atime, p); sErr != nil {
+	if res, sErr := tx.Exec(`update symlinks set atime = ?, rev = ? where path = ?`, atime, rev, p); sErr != nil {
 		return sErr
 	} else if n, _ := res.RowsAffected(); n > 0 {
-		return nil
+		return commitNotify()
 	}
 	// Special node.
-	if res, snErr := m.db.Exec(`update special_nodes set atime = ? where path = ?`, atime, p); snErr != nil {
+	if res, snErr := tx.Exec(`update special_nodes set atime = ?, rev = ? where path = ?`, atime, rev, p); snErr != nil {
 		return snErr
 	} else if n, _ := res.RowsAffected(); n > 0 {
-		return nil
+		return commitNotify()
 	}
 	// Directory.
 	parent, name := splitParentName(p)
 	if name == "" {
-		return nil // root: nothing to persist, succeed
+		return nil // root: nothing to persist, succeed (rollback discards the rev)
 	}
-	res, dErr := m.db.Exec(`update dir_entries set atime = ? where parent = ? and name = ?`, atime, parent, name)
+	res, dErr := tx.Exec(`update dir_entries set atime = ?, rev = ? where parent = ? and name = ?`, atime, rev, parent, name)
 	if dErr != nil {
 		return dErr
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrManifestNotFound
 	}
-	return nil
+	return commitNotify()
 }
 
 // DirRemove removes the directory at p. ErrManifestNotFound if it does not
@@ -1569,7 +1769,18 @@ func (m *ManifestStore) DirRemove(p string) error {
 	); err != nil {
 		return fmt.Errorf("delete dir_entry %s: %w", p, err)
 	}
-	return tx.Commit()
+	rev, err := allocChangeRevTx(tx)
+	if err != nil {
+		return err
+	}
+	if err := upsertTombstoneTx(tx, p, rev); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.notifyChange(rev)
+	return nil
 }
 
 // checkParentExists verifies that p's parent directory is registered in

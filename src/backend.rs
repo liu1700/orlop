@@ -46,6 +46,12 @@ pub struct Entry {
     pub atime: i64,
     /// Device number for block/char special files; 0 for every other kind.
     pub rdev: u64,
+    /// Modification time, unix nanoseconds, populated for regular files.
+    /// 0 means the server did not report one (old server) — callers fall
+    /// back to a manifest fetch.
+    pub mtime: i64,
+    /// Manifest CAS version, files only. 0 means unreported (old server).
+    pub version: u64,
 }
 
 pub struct MountedStore {

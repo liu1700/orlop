@@ -193,6 +193,7 @@ func serveFrames(logger *slog.Logger, state *serverState, conn io.ReadWriteClose
 	// invariant that lease cleanup can still write to the live socket.
 	defer state.conns.Unregister(connID)
 	defer tenant.leases.ReleaseAllForConn(connID)
+	defer tenant.changes.DropConn(connID)
 
 	for {
 		frame, err := dataplane.ReadFrame(conn)
@@ -215,6 +216,11 @@ func serveFrames(logger *slog.Logger, state *serverState, conn io.ReadWriteClose
 		case dataplane.OpLeaseGrant, dataplane.OpLeaseRefresh, dataplane.OpLeaseRelease:
 			f := frame
 			state.goRequest(func() { handleLeaseRequest(state, tenant, ident, writer, connID, f) })
+		case dataplane.OpChangesSubscribe:
+			// Needs the connID (the subscription is per-connection state), so it
+			// routes beside the lease ops rather than through OpTable.
+			f := frame
+			state.goRequest(func() { handleChangesSubscribe(state, tenant, ident, writer, connID, f) })
 		default:
 			if _, ok := OpTable[frame.Op]; ok {
 				f := frame
@@ -293,18 +299,21 @@ var OpTable = map[dataplane.Op]opSpec{
 	dataplane.OpChunkPut:          {"chunk_put", handleChunkPut},
 	dataplane.OpJournalQuery:      {"journal_query", handleJournalQuery},
 	dataplane.OpJournalRevertPath: {"journal_revert_path", handleJournalRevertPath},
+	dataplane.OpChangesFetch:      {"changes_fetch", handleChangesFetch},
 }
 
 // nonTableOpLabels maps the ops handled outside OpTable (ping/close,
 // connection-aware lease ops) to their metric labels. Kept here to keep all
 // label strings discoverable in one file.
 var nonTableOpLabels = map[dataplane.Op]string{
-	dataplane.OpPing:         "ping",
-	dataplane.OpClose:        "close",
-	dataplane.OpLeaseGrant:   "lease_grant",
-	dataplane.OpLeaseRefresh: "lease_refresh",
-	dataplane.OpLeaseRelease: "lease_release",
-	dataplane.OpLeaseRevoke:  "lease_revoke",
+	dataplane.OpPing:             "ping",
+	dataplane.OpClose:            "close",
+	dataplane.OpLeaseGrant:       "lease_grant",
+	dataplane.OpLeaseRefresh:     "lease_refresh",
+	dataplane.OpLeaseRelease:     "lease_release",
+	dataplane.OpLeaseRevoke:      "lease_revoke",
+	dataplane.OpChangesSubscribe: "changes_subscribe",
+	dataplane.OpChangesEvent:     "changes_event",
 }
 
 func handleRequest(s *serverState, tenant *tenantState, ident Identity, w *frameWriter, frame dataplane.Frame) {
@@ -402,7 +411,7 @@ func handleList(s *serverState, tenant *tenantState, ident Identity, w *frameWri
 		if !s.policy.Permits(policyPath(child)) {
 			continue
 		}
-		e := dataplane.EntryWire{Name: c.Name, Kind: c.Kind, Size: c.Size, Mode: c.Mode, Uid: c.Uid, Gid: c.Gid, Atime: c.Atime, InodeID: c.InodeID, Nlink: c.Nlink}
+		e := dataplane.EntryWire{Name: c.Name, Kind: c.Kind, Size: c.Size, Mode: c.Mode, Uid: c.Uid, Gid: c.Gid, Atime: c.Atime, InodeID: c.InodeID, Nlink: c.Nlink, Mtime: c.Mtime, Version: c.Version}
 		// Best-effort: ListChildren's JOIN does not cover special_nodes, so a
 		// special node lands here as "dir". Reclassify it (and carry rdev) with a
 		// targeted lookup. On error or absence we leave the "dir" default — a
@@ -443,7 +452,7 @@ func handleStat(s *serverState, tenant *tenantState, ident Identity, w *frameWri
 	var entry dataplane.EntryWire
 	switch err {
 	case nil:
-		entry = dataplane.EntryWire{Name: base, Kind: "file", Size: mf.Size, Mode: mf.Mode, Uid: mf.Uid, Gid: mf.Gid, Atime: mf.Atime, InodeID: mf.InodeID, Nlink: mf.Nlink}
+		entry = dataplane.EntryWire{Name: base, Kind: "file", Size: mf.Size, Mode: mf.Mode, Uid: mf.Uid, Gid: mf.Gid, Atime: mf.Atime, InodeID: mf.InodeID, Nlink: mf.Nlink, Mtime: mf.Mtime, Version: mf.Version}
 	default:
 		if target, mode, uid, gid, atime, isSym, sErr := tenant.manifests.SymlinkInfo(req.Path); sErr != nil {
 			writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEIO(sErr.Error()))

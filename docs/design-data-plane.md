@@ -317,8 +317,9 @@ reads.
 
 ### Op codes
 
-All ops are client→server requests except `LEASE_REVOKE`, which the server
-pushes to the client. (Codes from `cmd/orlop-server/dataplane/protocol.go`.)
+All ops are client→server requests except `LEASE_REVOKE` and
+`CHANGES_EVENT`, which the server pushes to the client. (Codes from
+`cmd/orlop-server/dataplane/protocol.go`.)
 
 | Op | Hex | Direction |
 |----|-----|-----------|
@@ -346,6 +347,14 @@ pushes to the client. (Codes from `cmd/orlop-server/dataplane/protocol.go`.)
 | `JOURNAL_REVERT_PATH` | 0x18 | client → server |
 | `MKNOD` | 0x19 | client → server |
 | `LINK` | 0x1A | client → server |
+| `CHANGES_FETCH` | 0x1B | client → server |
+| `CHANGES_SUBSCRIBE` | 0x1C | client → server |
+| `CHANGES_EVENT` | 0x1D | server → client (push) |
+
+The three `CHANGES_*` ops are the metadata change feed backing the
+client-side metadata mirror; their cursor, negotiation, and delivery
+semantics are specified in
+[`design-metadata-mirror.md`](design-metadata-mirror.md).
 
 A benchmark harness (`orlop-bench`, in `bench/`) drives synthetic filesystem
 workloads under emulated WAN to compare TCP and QUIC; TCP stays the default

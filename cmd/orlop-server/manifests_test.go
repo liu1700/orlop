@@ -48,7 +48,8 @@ const testSchemaSQL = `
 	  chunks blob not null,
 	  uid integer not null default 0,
 	  gid integer not null default 0,
-	  atime integer not null default 0
+	  atime integer not null default 0,
+	  rev integer not null default 0
 	);
 	create index manifests_inode_id on manifests(inode_id);
 	create table inode_counter (
@@ -64,6 +65,7 @@ const testSchemaSQL = `
 	  uid integer not null default 0,
 	  gid integer not null default 0,
 	  atime integer not null default 0,
+	  rev integer not null default 0,
 	  primary key (parent, name)
 	);
 	create table symlinks (
@@ -73,7 +75,8 @@ const testSchemaSQL = `
 	  mtime integer not null default 0,
 	  uid integer not null default 0,
 	  gid integer not null default 0,
-	  atime integer not null default 0
+	  atime integer not null default 0,
+	  rev integer not null default 0
 	);
 	create table special_nodes (
 	  path text primary key,
@@ -82,7 +85,19 @@ const testSchemaSQL = `
 	  mtime integer not null default 0,
 	  uid integer not null default 0,
 	  gid integer not null default 0,
-	  atime integer not null default 0
+	  atime integer not null default 0,
+	  rev integer not null default 0
+	);
+	create table change_counter (
+	  singleton integer primary key check (singleton = 1),
+	  last_rev integer not null,
+	  pruned_before_rev integer not null default 0
+	);
+	insert into change_counter(singleton, last_rev) values(1, 0);
+	create table change_tombstones (
+	  path text primary key,
+	  rev integer not null,
+	  ts_unix_ms integer not null
 	);
 	create table session_journal (
 	  session_id text not null,

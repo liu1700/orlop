@@ -95,6 +95,10 @@ type tenantState struct {
 	manifests *ManifestStore
 	journal   *SessionJournal
 	leases    *leaseManager
+	// changes fans metadata change-feed doorbells out to subscribed data
+	// connections (issue #122). Nil-safe: test fixtures that build
+	// tenantState by hand can leave it unset.
+	changes *changeNotifier
 
 	// liveMu guards closed. A data-plane store mutation (chunk Put) takes it for
 	// reading across the whole write; unregisterTenant takes it for writing to set
@@ -284,8 +288,10 @@ func openTenantState(id, name, storeRoot, dbPath string, leaseCfg leaseConfig, c
 		manifests: NewManifestStore(tdb.DB(), metrics),
 		journal:   journal,
 		leases:    newLeaseManager(leaseCfg, conns.Push, audit, metrics),
+		changes:   newChangeNotifier(),
 	}
 	ts.manifests.SetJournal(journal)
+	ts.manifests.SetChangeNotify(ts.changes.Notify)
 	leasesPath := filepath.Join(filepath.Dir(dbPath), "leases.db")
 	if _, err := os.Stat(leasesPath); err == nil {
 		if err := ts.leases.Restore(leasesPath); err != nil {

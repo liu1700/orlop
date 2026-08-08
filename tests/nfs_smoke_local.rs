@@ -63,6 +63,8 @@ impl InMemStore {
                 gid: 0,
                 atime: 0,
                 rdev: 0,
+                mtime: 0,
+                version: 0,
             },
         );
         self.dirs
@@ -125,6 +127,8 @@ impl Store for InMemStore {
                 gid: 0,
                 atime: 0,
                 rdev: 0,
+                mtime: 0,
+                version: 0,
             },
         );
         let mut dirs = self.dirs.lock();
