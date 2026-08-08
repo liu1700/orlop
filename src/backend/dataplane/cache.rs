@@ -54,6 +54,12 @@ impl ChunkCache {
         }))
     }
 
+    /// Filesystem root of this cache — the metadata mirror places its own
+    /// SQLite file under the same directory (`<root>/mirror/`).
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Default root for the persistent chunk cache:
     /// `$XDG_CACHE_HOME/orlop`, or `$HOME/.cache/orlop`. Returns `None` if
     /// neither env var is set.

@@ -28,6 +28,7 @@ use tokio_rustls::TlsConnector;
 
 use super::codec::{read_frame_async, write_frame_async, Frame};
 use super::messages::{
+    ChangesFetchRequest, ChangesFetchResponse, ChangesSubscribeRequest, ChangesSubscribeResponse,
     ChunkGetRequest, ChunkGetResponse, ChunkHasRequest, ChunkHasResponse, ChunkPutRequest,
     ChunkPutResponse, ChunkRef, DirCreateRequest, DirCreateResponse, DirRemoveRequest,
     DirRemoveResponse, EntryWire, ErrorPayload, LeaseGrantRequest, LeaseGrantResponse, LeaseMode,
@@ -36,7 +37,7 @@ use super::messages::{
     ManifestDeleteResponse, ManifestGetRequest, ManifestGetResponse, ManifestPutRequest,
     ManifestPutResponse, ManifestRenameRequest, ManifestRenameResponse, MknodRequest,
     MknodResponse, PingRequest, ReadlinkRequest, ReadlinkResponse, SetattrRequest, SetattrResponse,
-    StatRequest, StatResponse, SymlinkRequest, SymlinkResponse,
+    StatRequest, StatResponse, SymlinkRequest, SymlinkResponse, SYNC_PROTOCOL_V1,
 };
 use super::protocol::{errno, flags, Op, MAX_PAYLOAD_LEN};
 use crate::backend::tls::TlsIdentity;
@@ -130,6 +131,16 @@ struct Inner {
     next_rid: AtomicU64,
     state: Mutex<ConnState>,
     push_handler: Mutex<Option<UnboundedSender<Frame>>>,
+    /// Dedicated route for CHANGES_EVENT pushes (issue #122). Kept separate
+    /// from `push_handler` so the metadata mirror and the lease manager never
+    /// contend for one channel; frames for either slot with no handler
+    /// installed are dropped, exactly as before.
+    changes_push_handler: Mutex<Option<UnboundedSender<Frame>>>,
+    /// Bumped every time a new connection is installed. The metadata mirror
+    /// records the generation it subscribed on: a change-feed subscription
+    /// dies with its connection, so `generation changed` means `not
+    /// subscribed` no matter what the mirror's own state says.
+    conn_generation: AtomicU64,
 }
 
 enum ConnState {
@@ -182,6 +193,8 @@ impl DataClient {
                 next_rid: AtomicU64::new(1),
                 state: Mutex::new(ConnState::Disconnected),
                 push_handler: Mutex::new(None),
+                changes_push_handler: Mutex::new(None),
+                conn_generation: AtomicU64::new(0),
             }),
         })
     }
@@ -569,6 +582,47 @@ impl DataClient {
         slot.replace(tx)
     }
 
+    /// Register the CHANGES_EVENT push route (issue #122). Same set-once
+    /// semantics as `set_push_handler`; frames arriving with no handler are
+    /// dropped.
+    pub fn set_changes_push_handler(
+        &self,
+        tx: UnboundedSender<Frame>,
+    ) -> Option<UnboundedSender<Frame>> {
+        let mut slot = self.inner.changes_push_handler.lock();
+        slot.replace(tx)
+    }
+
+    /// Monotonic connection generation: bumped each time a fresh transport
+    /// connection is installed. A change-feed subscription is per-connection
+    /// server-side, so a generation change proves the subscription is gone.
+    pub fn conn_generation(&self) -> u64 {
+        self.inner.conn_generation.load(Ordering::Acquire)
+    }
+
+    /// Page the metadata change feed (issue #122). The server confines the
+    /// feed to this cert's agent subtree and answers EINVAL when it predates
+    /// the feed — callers treat that as "run mirror-less".
+    pub fn changes_fetch(&self, req: &ChangesFetchRequest) -> Result<ChangesFetchResponse> {
+        self.rpc(Op::ChangesFetch, req)
+    }
+
+    /// Register this connection for CHANGES_EVENT doorbell pushes. Returns
+    /// the server's current revision alongside the connection generation the
+    /// subscription is bound to (captured BEFORE the request, so a racing
+    /// reconnect can only make the mirror needlessly re-subscribe, never
+    /// falsely believe it is subscribed).
+    pub fn changes_subscribe(&self) -> Result<(ChangesSubscribeResponse, u64)> {
+        let generation = self.conn_generation();
+        let resp: ChangesSubscribeResponse = self.rpc(
+            Op::ChangesSubscribe,
+            &ChangesSubscribeRequest {
+                sync_protocol: SYNC_PROTOCOL_V1,
+            },
+        )?;
+        Ok((resp, generation))
+    }
+
     pub fn lease_grant(&self, path: &str, mode: LeaseMode) -> Result<LeaseGrantResponse> {
         self.rpc(
             Op::LeaseGrant,
@@ -769,6 +823,9 @@ impl Inner {
             return Ok(Arc::clone(h));
         }
         *state = ConnState::Connected(Arc::clone(&handle));
+        // New connection installed: everything bound to the old one (the
+        // change-feed subscription in particular) is gone.
+        self.conn_generation.fetch_add(1, Ordering::AcqRel);
         Ok(handle)
     }
 
@@ -933,6 +990,14 @@ async fn reader_task<R>(
                         let _ = tx.send(frame);
                     }
                     // Unmatched response RIDs are dropped (timed-out request).
+                } else if frame.op == Op::ChangesEvent {
+                    // Metadata change-feed doorbell (issue #122): its own
+                    // route so the mirror and the lease manager never share
+                    // a channel.
+                    let handler = inner.changes_push_handler.lock().clone();
+                    if let Some(tx) = handler {
+                        let _ = tx.send(frame);
+                    }
                 } else {
                     // Server-pushed frame (e.g. LeaseRevoke).
                     let handler = inner.push_handler.lock().clone();

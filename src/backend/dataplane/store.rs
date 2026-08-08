@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use super::cache::ChunkCache;
 use super::client::DataClient;
 use super::messages::{ChunkRef as WireChunkRef, EntryWire, ManifestGetResponse};
+use super::mirror::{mirror_enoent, MetadataMirror};
 use crate::backend::{BackendError, Entry, EntryKind};
 
 pub struct DataStore {
@@ -21,6 +22,11 @@ pub struct DataStore {
     cache: Arc<ChunkCache>,
     session_id: Mutex<Option<String>>,
     allocation_id: Mutex<Option<String>>,
+    /// Metadata mirror (issue #122). When present, metadata reads are served
+    /// locally under the mirror's freshness invariant and every acked
+    /// mutation is applied to it; `None` runs the pre-mirror wire path
+    /// unchanged.
+    mirror: Option<Arc<MetadataMirror>>,
 }
 
 impl DataStore {
@@ -31,7 +37,14 @@ impl DataStore {
             cache,
             session_id: Mutex::new(None),
             allocation_id: Mutex::new(None),
+            mirror: None,
         }
+    }
+
+    /// Attach the metadata mirror. Called once at construction, before the
+    /// store is shared.
+    pub fn set_mirror(&mut self, mirror: Arc<MetadataMirror>) {
+        self.mirror = Some(mirror);
     }
 
     pub fn client(&self) -> &Arc<DataClient> {
@@ -74,7 +87,13 @@ impl Store for DataStore {
     }
 
     fn entry_for(&self, path: &str) -> anyhow::Result<Option<Entry>> {
-        match self.client.stat(&self.virtual_path(path)) {
+        let vpath = self.virtual_path(path);
+        if let Some(m) = &self.mirror {
+            if let Some(answer) = m.entry_for(&vpath) {
+                return Ok(answer);
+            }
+        }
+        match self.client.stat(&vpath) {
             Ok(w) => Ok(Some(entry_from_wire(w)?)),
             Err(e) => {
                 if crate::backend::backend_errno(&e, libc::EIO) == libc::ENOENT {
@@ -158,7 +177,16 @@ impl Store for DataStore {
     }
 
     fn manifest_get(&self, path: &str) -> anyhow::Result<Manifest> {
-        let resp = self.client.manifest_get(&self.virtual_path(path))?;
+        let vpath = self.virtual_path(path);
+        if let Some(m) = &self.mirror {
+            if let Some(answer) = m.manifest_get(&vpath) {
+                return match answer {
+                    Some(mf) => Ok(mf),
+                    None => Err(mirror_enoent("manifest")),
+                };
+            }
+        }
+        let resp = self.client.manifest_get(&vpath)?;
         Ok(manifest_from_wire(resp))
     }
 
@@ -177,8 +205,9 @@ impl Store for DataStore {
                 len: c.len,
             })
             .collect();
-        self.client.manifest_put(
-            &self.virtual_path(path),
+        let vpath = self.virtual_path(path);
+        let new_version = self.client.manifest_put(
+            &vpath,
             expected_version,
             mf.size,
             mf.mode,
@@ -186,16 +215,25 @@ impl Store for DataStore {
             wire_chunks,
             self.current_session_id(),
             self.current_allocation_id(),
-        )
+        )?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_put(&vpath, mf, new_version);
+        }
+        Ok(new_version)
     }
 
     fn manifest_delete(&self, path: &str, expected_version: u64) -> anyhow::Result<()> {
+        let vpath = self.virtual_path(path);
         self.client.manifest_delete(
-            &self.virtual_path(path),
+            &vpath,
             expected_version,
             self.current_session_id(),
             self.current_allocation_id(),
-        )
+        )?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_delete(&vpath);
+        }
+        Ok(())
     }
 
     fn manifest_rename(
@@ -205,47 +243,79 @@ impl Store for DataStore {
         expected_version_from: u64,
         expected_version_to: u64,
     ) -> anyhow::Result<u64> {
-        self.client.manifest_rename(
-            &self.virtual_path(from),
-            &self.virtual_path(to),
+        let vfrom = self.virtual_path(from);
+        let vto = self.virtual_path(to);
+        let new_version = self.client.manifest_rename(
+            &vfrom,
+            &vto,
             expected_version_from,
             expected_version_to,
             self.current_session_id(),
             self.current_allocation_id(),
-        )
+        )?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_rename(&vfrom, &vto, new_version);
+        }
+        Ok(new_version)
     }
 
     fn hard_link(&self, from: &str, to: &str) -> anyhow::Result<u32> {
-        self.client.hard_link(
-            &self.virtual_path(from),
-            &self.virtual_path(to),
+        let vfrom = self.virtual_path(from);
+        let vto = self.virtual_path(to);
+        let nlink = self.client.hard_link(
+            &vfrom,
+            &vto,
             self.current_session_id(),
             self.current_allocation_id(),
-        )
+        )?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_link(&vfrom, &vto, nlink);
+        }
+        Ok(nlink)
     }
 
     fn dir_list(&self, path: &str) -> anyhow::Result<Vec<Entry>> {
-        let entries = self.client.list(&self.virtual_path(path))?;
+        let vpath = self.virtual_path(path);
+        if let Some(m) = &self.mirror {
+            if let Some(entries) = m.dir_list(&vpath) {
+                return Ok(entries);
+            }
+        }
+        let entries = self.client.list(&vpath)?;
         entries.into_iter().map(entry_from_wire).collect()
     }
 
     fn dir_create(&self, path: &str, mode: u32) -> anyhow::Result<()> {
+        let vpath = self.virtual_path(path);
         self.client
-            .dir_create(&self.virtual_path(path), mode, self.current_session_id())
+            .dir_create(&vpath, mode, self.current_session_id())?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_dir_create(&vpath, mode);
+        }
+        Ok(())
     }
 
     fn dir_remove(&self, path: &str) -> anyhow::Result<()> {
-        self.client
-            .dir_remove(&self.virtual_path(path), self.current_session_id())
+        let vpath = self.virtual_path(path);
+        self.client.dir_remove(&vpath, self.current_session_id())?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_delete(&vpath);
+        }
+        Ok(())
     }
 
     fn setattr_mode(&self, path: &str, mode: u32) -> anyhow::Result<()> {
+        let vpath = self.virtual_path(path);
         self.client.setattr(
-            &self.virtual_path(path),
+            &vpath,
             mode,
             self.current_session_id(),
             self.current_allocation_id(),
-        )
+        )?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_setattr_mode(&vpath, mode);
+        }
+        Ok(())
     }
 
     fn setattr_owner(&self, path: &str, uid: u32, gid: u32) -> anyhow::Result<()> {
@@ -261,7 +331,11 @@ impl Store for DataStore {
             gid,
             self.current_session_id(),
             self.current_allocation_id(),
-        )
+        )?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_setattr_owner(&vpath, uid, gid);
+        }
+        Ok(())
     }
 
     fn setattr_atime(&self, path: &str, atime: i64) -> anyhow::Result<()> {
@@ -274,31 +348,54 @@ impl Store for DataStore {
             atime,
             self.current_session_id(),
             self.current_allocation_id(),
-        )
+        )?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_setattr_atime(&vpath, atime);
+        }
+        Ok(())
     }
 
     fn symlink(&self, path: &str, target: &str, mode: u32) -> anyhow::Result<()> {
+        let vpath = self.virtual_path(path);
         self.client.symlink(
-            &self.virtual_path(path),
+            &vpath,
             target,
             mode,
             self.current_session_id(),
             self.current_allocation_id(),
-        )
+        )?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_symlink(&vpath, target, mode);
+        }
+        Ok(())
     }
 
     fn mknod(&self, path: &str, mode: u32, rdev: u64) -> anyhow::Result<()> {
+        let vpath = self.virtual_path(path);
         self.client.mknod(
-            &self.virtual_path(path),
+            &vpath,
             mode,
             rdev,
             self.current_session_id(),
             self.current_allocation_id(),
-        )
+        )?;
+        if let Some(m) = &self.mirror {
+            m.apply_local_mknod(&vpath, mode, rdev);
+        }
+        Ok(())
     }
 
     fn readlink(&self, path: &str) -> anyhow::Result<String> {
-        self.client.readlink(&self.virtual_path(path))
+        let vpath = self.virtual_path(path);
+        if let Some(m) = &self.mirror {
+            if let Some(answer) = m.readlink(&vpath) {
+                return match answer {
+                    Some(target) => Ok(target),
+                    None => Err(mirror_enoent("symlink")),
+                };
+            }
+        }
+        self.client.readlink(&vpath)
     }
 
     fn current_session_id(&self) -> Option<String> {
