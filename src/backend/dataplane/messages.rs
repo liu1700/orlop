@@ -491,6 +491,117 @@ pub struct LeaseRevokeRequest {
     pub reason: String,
 }
 
+// ---- metadata change feed (issue #122) ---------------------------------
+//
+// Mirrors the Go structs in cmd/orlop-server/dataplane/messages.go. The feed
+// backs the client-side metadata mirror (docs/design-metadata-mirror.md):
+// CHANGES_FETCH pages coalesced final-state entries through a compound
+// (rev, path) cursor; CHANGES_SUBSCRIBE registers the connection for
+// CHANGES_EVENT doorbell pushes carrying only the latest committed revision.
+
+/// The only change-feed protocol version this build speaks. Sent on every
+/// fetch/subscribe request and echoed by the server; anything else is EINVAL.
+/// An old server answers the ops themselves with EINVAL (unknown op), which
+/// the client reads as "no feed" and runs mirror-less.
+pub const SYNC_PROTOCOL_V1: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesFetchRequest {
+    pub sync_protocol: u32,
+    pub cursor_rev: u64,
+    pub cursor_path: String,
+    /// Page cap; the server clamps to [1, 1000], 0 means 500.
+    pub limit: u32,
+    /// Ask for each file entry's manifest chunk list so the mirror can serve
+    /// manifest reads locally too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_chunks: bool,
+}
+
+/// One coalesced final-state entry: the current state of one path (or its
+/// tombstone), stamped with the revision of the last mutation that touched
+/// it. Idempotent to apply — there is no rename opcode and no history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChangeEntryWire {
+    pub path: String,
+    pub rev: u64,
+    /// file|dir|symlink|fifo|socket|chardev|blockdev|tombstone.
+    pub kind: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub mode: u32,
+    #[serde(default)]
+    pub mtime: i64,
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub gid: u32,
+    #[serde(default)]
+    pub atime: i64,
+    #[serde(default)]
+    pub inode_id: u64,
+    #[serde(default)]
+    pub nlink: u32,
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub rdev: u64,
+    #[serde(default)]
+    pub chunks: Vec<ChunkRef>,
+    /// Distinguishes "chunk list included and empty" (a zero-length file)
+    /// from "chunk list not requested" — msgpack omitempty erases the list.
+    #[serde(default)]
+    pub has_chunks: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChangesFetchResponse {
+    pub sync_protocol: u32,
+    #[serde(default)]
+    pub entries: Vec<ChangeEntryWire>,
+    /// Cursor for the next call.
+    pub next_rev: u64,
+    #[serde(default)]
+    pub next_path: String,
+    /// The tenant's latest committed revision at serve time; the mirror is
+    /// caught up when its applied cursor reaches it.
+    pub current_rev: u64,
+    /// The cursor predates pruned tombstones: discard the mirror and restart
+    /// from (0, "").
+    #[serde(default)]
+    pub resync_required: bool,
+    /// Server-authoritative path prefix this feed covers (the cert's agent
+    /// subtree). The mirror's answerable domain: inside it a caught-up
+    /// mirror may answer ENOENT for absent paths; outside it, it must not
+    /// answer at all.
+    #[serde(default)]
+    pub subtree: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesSubscribeRequest {
+    pub sync_protocol: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChangesSubscribeResponse {
+    pub sync_protocol: u32,
+    pub current_rev: u64,
+    /// See `ChangesFetchResponse::subtree`.
+    #[serde(default)]
+    pub subtree: String,
+}
+
+/// Server-pushed conflated doorbell: only the latest committed revision, no
+/// entries. The client pulls the delta with CHANGES_FETCH.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChangesEventPush {
+    pub current_rev: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

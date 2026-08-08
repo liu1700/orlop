@@ -10,9 +10,11 @@ pub mod cache;
 pub mod client;
 pub mod codec;
 pub mod messages;
+pub mod mirror;
 pub mod protocol;
 pub mod store;
 
 pub use cache::ChunkCache;
 pub use client::{DataClient, DataClientConfig, TransportMode};
+pub use mirror::MetadataMirror;
 pub use store::DataStore;

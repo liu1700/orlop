@@ -45,6 +45,9 @@ pub enum Op {
     Readlink = 0x17,
     Mknod = 0x19,
     Link = 0x1A,
+    ChangesFetch = 0x1B,
+    ChangesSubscribe = 0x1C,
+    ChangesEvent = 0x1D,
 }
 
 impl Op {
@@ -72,6 +75,9 @@ impl Op {
             0x17 => Some(Op::Readlink),
             0x19 => Some(Op::Mknod),
             0x1A => Some(Op::Link),
+            0x1B => Some(Op::ChangesFetch),
+            0x1C => Some(Op::ChangesSubscribe),
+            0x1D => Some(Op::ChangesEvent),
             _ => None,
         }
     }

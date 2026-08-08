@@ -108,14 +108,27 @@ pub fn build_stores(
             let tls_id = tls
                 .cloned()
                 .ok_or_else(|| anyhow!("remote mount {} requires a TLS identity", cfg.name))?;
-            let dp_cfg = dataplane::DataClientConfig::new(addr, server_name, tls_id)?;
+            let dp_cfg = dataplane::DataClientConfig::new(addr.clone(), server_name, tls_id)?;
             let client = Arc::new(dataplane::DataClient::new(dp_cfg)?);
             let leases = Some(crate::lease::LeaseManager::new(Arc::clone(&client)));
-            let store: Arc<dyn crate::store::Store> = Arc::new(dataplane::DataStore::new(
-                client,
-                server_prefix,
+            let mut data_store = dataplane::DataStore::new(
+                Arc::clone(&client),
+                server_prefix.clone(),
                 Arc::clone(&chunk_cache),
-            ));
+            );
+            // Metadata mirror (issue #122): default on, ORLOP_METADATA_MIRROR=0
+            // is the kill switch. Failure to start is never fatal — the mount
+            // just runs the pre-mirror wire path.
+            if dataplane::mirror::mirror_enabled_from_env() {
+                let key = format!("{addr}|{server_prefix}");
+                match dataplane::MetadataMirror::start(client, chunk_cache.root(), &key) {
+                    Ok(m) => data_store.set_mirror(m),
+                    Err(e) => eprintln!(
+                        "orlop: metadata mirror unavailable ({e:#}); continuing without it"
+                    ),
+                }
+            }
+            let store: Arc<dyn crate::store::Store> = Arc::new(data_store);
 
             Ok(MountedStore {
                 mount_name,
