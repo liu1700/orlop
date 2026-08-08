@@ -27,7 +27,7 @@ jobs:
         # Each released tag whose database an in-place upgrade must still
         # converge. Append new tags here as they ship; drop a tag only when it
         # is no longer a supported upgrade source.
-        from: [v0.1.0, v0.2.0, v0.2.1, v0.5.1, v0.5.2, v0.5.3, v0.5.4, v0.5.5, v0.5.6, v0.5.7]
+        from: [v0.1.0, v0.2.0, v0.2.1, v0.5.1, v0.5.2, v0.5.3, v0.5.4, v0.5.5, v0.5.6, v0.5.7, v0.6.0]
     services:
       postgres:
         image: postgres:16
@@ -67,7 +67,7 @@ jobs:
       fail-fast: false
       matrix:
         # Tags that ship the embedded SQLite backend (added before v0.2.0).
-        from: [v0.2.0, v0.2.1, v0.5.1, v0.5.2, v0.5.3, v0.5.4, v0.5.5, v0.5.6, v0.5.7]
+        from: [v0.2.0, v0.2.1, v0.5.1, v0.5.2, v0.5.3, v0.5.4, v0.5.5, v0.5.6, v0.5.7, v0.6.0]
     env:
       DATABASE_URL: sqlite:/tmp/orlop.db
       CGO_ENABLED: "0"
