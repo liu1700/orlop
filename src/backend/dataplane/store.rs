@@ -285,6 +285,19 @@ impl Store for DataStore {
         entries.into_iter().map(entry_from_wire).collect()
     }
 
+    fn note_pending_unlink(&self, path: &str) -> bool {
+        match &self.mirror {
+            Some(m) => m.note_pending_unlink(&self.virtual_path(path)),
+            None => false,
+        }
+    }
+
+    fn resolve_pending_unlink(&self, path: &str, ok: bool) {
+        if let Some(m) = &self.mirror {
+            m.resolve_pending_unlink(&self.virtual_path(path), ok);
+        }
+    }
+
     fn dir_create(&self, path: &str, mode: u32) -> anyhow::Result<()> {
         let vpath = self.virtual_path(path);
         self.client

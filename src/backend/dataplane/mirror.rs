@@ -123,6 +123,13 @@ pub struct MetadataMirror {
     /// the mirror stays off for the life of the mount.
     disabled: AtomicBool,
     wake_tx: SyncSender<()>,
+    /// Paths with a pipelined unlink queued but not yet server-acked
+    /// (issue #122, gated writeback mode). Kept OUT of the entries table: a
+    /// feed reconciliation may legitimately redeliver the still-live row
+    /// before the queued delete lands, and this set keeps such rows from
+    /// resurfacing in reads. In-memory only — a crash loses the queue too,
+    /// and the feed then reconciles the truth.
+    pending_unlinks: Mutex<std::collections::HashSet<String>>,
 }
 
 impl MetadataMirror {
@@ -152,6 +159,7 @@ impl MetadataMirror {
             sub_generation: AtomicU64::new(u64::MAX),
             disabled: AtomicBool::new(false),
             wake_tx,
+            pending_unlinks: Mutex::new(std::collections::HashSet::new()),
         });
 
         mirror.spawn_doorbell_forwarder();
@@ -227,6 +235,36 @@ impl MetadataMirror {
 
     fn can_answer(&self, vpath: &str) -> bool {
         self.is_fresh() && self.in_domain(vpath)
+    }
+
+    fn is_pending_unlink(&self, vpath: &str) -> bool {
+        let pending = self.pending_unlinks.lock();
+        !pending.is_empty() && pending.contains(vpath)
+    }
+
+    /// Record a pipelined unlink before its server round trip. Returns false
+    /// when the mirror cannot absorb it (not fresh / out of domain) — the
+    /// caller must unlink synchronously instead. While pending, the path
+    /// reads as ENOENT locally even if a feed reconciliation redelivers the
+    /// still-live row.
+    pub fn note_pending_unlink(&self, vpath: &str) -> bool {
+        if !self.can_answer(vpath) {
+            return false;
+        }
+        self.pending_unlinks.lock().insert(vpath.to_string());
+        true
+    }
+
+    /// A queued unlink completed. On success the row is dropped for real;
+    /// on failure the mirror's local view was a lie — wipe and rehydrate.
+    pub fn resolve_pending_unlink(&self, vpath: &str, ok: bool) {
+        self.pending_unlinks.lock().remove(vpath);
+        if ok {
+            self.apply_local_delete(vpath);
+        } else {
+            let _ = self.wipe();
+            let _ = self.wake_tx.try_send(());
+        }
     }
 
     // ── one sync pass (worker thread) ───────────────────────────────────
@@ -379,6 +417,9 @@ impl MetadataMirror {
         if !self.can_answer(vpath) {
             return None;
         }
+        if self.is_pending_unlink(vpath) {
+            return Some(None);
+        }
         let db = self.db.lock();
         let row = query_row(&db, vpath)?;
         drop(db);
@@ -410,6 +451,9 @@ impl MetadataMirror {
         drop(db);
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
+            if self.is_pending_unlink(&r.path) {
+                continue;
+            }
             out.push(row_to_entry(&r)?);
         }
         Some(out)
@@ -420,6 +464,9 @@ impl MetadataMirror {
     pub fn readlink(&self, vpath: &str) -> Option<Option<String>> {
         if !self.can_answer(vpath) {
             return None;
+        }
+        if self.is_pending_unlink(vpath) {
+            return Some(None);
         }
         let db = self.db.lock();
         let row = query_row(&db, vpath)?;
@@ -434,6 +481,9 @@ impl MetadataMirror {
     pub fn manifest_get(&self, vpath: &str) -> Option<Option<Manifest>> {
         if !self.can_answer(vpath) {
             return None;
+        }
+        if self.is_pending_unlink(vpath) {
+            return Some(None);
         }
         let db = self.db.lock();
         let row = query_row(&db, vpath)?;

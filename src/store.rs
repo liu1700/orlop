@@ -88,6 +88,22 @@ pub trait Store: Send + Sync {
     fn dir_create(&self, path: &str, mode: u32) -> anyhow::Result<()>;
     fn dir_remove(&self, path: &str) -> anyhow::Result<()>;
 
+    // Pipelined-unlink hooks (issue #122, gated writeback mode). A store
+    // that keeps a local metadata cache must reflect a queued unlink BEFORE
+    // its server round trip, or the next lookup resurrects the file the
+    // kernel was just told is gone.
+
+    /// Record that an unlink of `path` has been queued but not yet sent.
+    /// Returns false when the store cannot absorb it (no fresh local
+    /// metadata view) — the caller must unlink synchronously instead.
+    fn note_pending_unlink(&self, _path: &str) -> bool {
+        false
+    }
+
+    /// A queued unlink finished. `ok=false` means the server refused it and
+    /// any local view claiming the path is gone must recover.
+    fn resolve_pending_unlink(&self, _path: &str, _ok: bool) {}
+
     // The setattr_* primitives work on files, directories, and symlinks alike
     // (no manifest required), are store-and-readback only (no permission
     // enforcement), and default to an error — `DataStore` implements them
