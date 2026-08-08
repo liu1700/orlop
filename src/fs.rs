@@ -63,6 +63,9 @@ pub struct GatewayFs {
     /// from the create reply (size=0) hide bytes flushed later in the same
     /// mount session — see issue #135.
     notifier: Arc<OnceLock<Notifier>>,
+    /// Pipelined unlink queue (issue #122, gated writeback mode:
+    /// `ORLOP_METADATA_PIPELINE=1`). `None` keeps every unlink synchronous.
+    unlink_pipe: Option<Arc<crate::unlink_pipe::UnlinkPipe>>,
 }
 
 const COMMAND_CACHE_CAPACITY: usize = 1024;
@@ -127,6 +130,7 @@ pub struct GatewayHandoff {
     mounts: Arc<Vec<MountedStore>>,
     state: Arc<Mutex<State>>,
     recovery_leases: Arc<Mutex<Vec<Arc<crate::lease::LeaseHandle>>>>,
+    unlink_pipe: Option<Arc<crate::unlink_pipe::UnlinkPipe>>,
 }
 
 impl State {
@@ -273,6 +277,14 @@ impl GatewayHandoff {
     /// The caller must first park the fuser dispatch loop. A flush error aborts
     /// the handoff; no partially-dirty state is sent to the successor.
     pub fn prepare(&self) -> anyhow::Result<HandoffSnapshot> {
+        // Handoff is a fence: queued unlinks must be server-durable before
+        // the successor takes over (the queue does not survive the handoff),
+        // and a queued failure aborts like any flush error would.
+        if let Some(pipe) = &self.unlink_pipe {
+            if let Some(errno) = pipe.drain_check() {
+                anyhow::bail!("pipelined unlink failed with errno {errno} before handoff");
+            }
+        }
         let handles: Vec<(u64, Arc<Mutex<write_handle::WriteHandle>>)> = {
             let state = self.state.lock();
             state
@@ -521,6 +533,22 @@ impl GatewayFs {
             )),
             state: Arc::new(Mutex::new(State::new(ROOT_INO + 1, by_ino, by_path))),
             notifier: Arc::new(OnceLock::new()),
+            unlink_pipe: crate::unlink_pipe::pipeline_enabled_from_env()
+                .then(crate::unlink_pipe::UnlinkPipe::start),
+        }
+    }
+
+    /// Drain the pipelined-unlink queue if one is running (issue #122).
+    /// `consume_error` marks the error-reporting fences (flush/fsync,
+    /// fsyncdir, rmdir, rename, unmount); mutating ops drain without
+    /// consuming so a queued failure still surfaces at the next true fence.
+    fn unlink_fence(&self, consume_error: bool) -> Option<i32> {
+        let pipe = self.unlink_pipe.as_ref()?;
+        if consume_error {
+            pipe.drain_check()
+        } else {
+            pipe.drain_wait();
+            None
         }
     }
 
@@ -681,6 +709,7 @@ impl GatewayFs {
             mounts: Arc::clone(&self.mounts),
             state: Arc::clone(&self.state),
             recovery_leases: Arc::new(Mutex::new(Vec::new())),
+            unlink_pipe: self.unlink_pipe.clone(),
         }
     }
 
@@ -1573,6 +1602,7 @@ impl Filesystem for GatewayFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        self.unlink_fence(false);
         let (mount_idx, full, rel) = match self.resolve_child(parent, name) {
             Ok(t) => t,
             Err(e) => {
@@ -1833,6 +1863,12 @@ impl Filesystem for GatewayFs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        // Pipelined-unlink fence: a queued delete failure reports here,
+        // before this flush's own result (writeback-error style).
+        if let Some(errno) = self.unlink_fence(true) {
+            reply.error(errno);
+            return;
+        }
         let handle = match self.state.lock().get_write_handle(fh) {
             Some(h) => h,
             None => {
@@ -1890,6 +1926,31 @@ impl Filesystem for GatewayFs {
 
     fn fsync(&mut self, req: &Request<'_>, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         self.flush(req, ino, fh, 0, reply);
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Directory fsync is a durability fence for the pipelined-unlink
+        // queue: POSIX makes fsync(parent dir) the point at which an unlink
+        // is durable, and that is exactly the contract here.
+        match self.unlink_fence(true) {
+            Some(errno) => reply.error(errno),
+            None => reply.ok(),
+        }
+    }
+
+    fn destroy(&mut self) {
+        // Unmount fence: drain queued unlinks; nowhere left to report an
+        // error, so log it (same disclosure model as a failed release flush).
+        if let Some(errno) = self.unlink_fence(true) {
+            eprintln!("orlop: warning: pipelined unlink failed with errno {errno} at unmount");
+        }
     }
 
     fn release(
@@ -1972,6 +2033,23 @@ impl Filesystem for GatewayFs {
                 return;
             }
         };
+        // Pipelined mode (issue #122, ORLOP_METADATA_PIPELINE=1): ack once
+        // the CAS-tagged delete is queued. The store's local view serves
+        // ENOENT for the path immediately; the fences (fsync/flush, rmdir,
+        // rename, unmount) drain the queue and surface any failure. Falls
+        // back to the synchronous path when the queue cannot absorb it.
+        if let Some(pipe) = &self.unlink_pipe {
+            if pipe.try_enqueue(
+                Arc::clone(&self.mounts[mount_idx].store),
+                rel.clone(),
+                cur.version,
+            ) {
+                self.state.lock().evict_node(&full);
+                self.audit_write(req, mount_idx, event::UNLINK, &full, true);
+                reply.ok();
+                return;
+            }
+        }
         if let Err(e) = store.manifest_delete(&rel, cur.version) {
             self.audit_write(req, mount_idx, event::UNLINK, &full, false);
             reply.error(backend_errno(&e, EIO));
@@ -1990,6 +2068,7 @@ impl Filesystem for GatewayFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        self.unlink_fence(false);
         let (source, parent) = {
             let state = self.state.lock();
             (
@@ -2070,6 +2149,12 @@ impl Filesystem for GatewayFs {
     }
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        // Fence: queued unlinks under this directory must land (or fail
+        // loudly) before the server checks it is empty.
+        if let Some(errno) = self.unlink_fence(true) {
+            reply.error(errno);
+            return;
+        }
         let (mount_idx, full, rel) = match self.resolve_child(parent, name) {
             Ok(t) => t,
             Err(e) => {
@@ -2105,6 +2190,7 @@ impl Filesystem for GatewayFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        self.unlink_fence(false);
         let (mount_idx, full, rel) = match self.resolve_child(parent, name) {
             Ok(t) => t,
             Err(e) => {
@@ -2166,6 +2252,11 @@ impl Filesystem for GatewayFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        // Fence: a rename's subtree may intersect queued deletes.
+        if let Some(errno) = self.unlink_fence(true) {
+            reply.error(errno);
+            return;
+        }
         let (from_parent_node, to_parent_node) = {
             let state = self.state.lock();
             let from = state.by_ino.get(&parent).cloned();
@@ -2311,6 +2402,7 @@ impl Filesystem for GatewayFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        self.unlink_fence(false);
         // Resolve the node and mount.
         let node = {
             let state = self.state.lock();
@@ -2514,6 +2606,7 @@ impl Filesystem for GatewayFs {
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        self.unlink_fence(false);
         let parent_node = {
             let state = self.state.lock();
             state.by_ino.get(&parent).cloned()
@@ -2621,6 +2714,7 @@ impl Filesystem for GatewayFs {
         rdev: u32,
         reply: ReplyEntry,
     ) {
+        self.unlink_fence(false);
         let (mount_idx, full, rel) = match self.resolve_child(parent, name) {
             Ok(t) => t,
             Err(e) => {

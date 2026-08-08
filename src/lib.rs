@@ -25,5 +25,6 @@ pub mod mounts;
 pub mod nfs;
 pub mod policy;
 pub mod store;
+pub mod unlink_pipe;
 pub mod util;
 pub mod write_handle;
