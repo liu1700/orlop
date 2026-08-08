@@ -85,8 +85,17 @@ deployment, `migrate up` stops with an unresolved-owner count if placement
 cannot be inferred; restore those `server_vms` rows (or create the matching
 owner reservation explicitly) and rerun the idempotent migration.
 
-v0.5.4, v0.5.5, v0.5.6 and v0.5.7 ship **no migration**, so unlike the two upgrades
+v0.5.4 through v0.6.0 ship **no control-plane migration**, so unlike the two upgrades
 above they roll back with a plain image revert and need no backup step.
+
+v0.6.0 changes both halves, compatibly (the metadata change feed + client
+mirror, #122): the server applies additive columns and tables to each
+per-tenant data-plane SQLite database at open (`rev` columns,
+`change_counter`, `change_tombstones`) — automatic, idempotent, and ignored
+by an older server after a rollback. The wire changes are new op codes plus
+append-only msgpack fields, negotiated explicitly: an old client never sees
+the feed, and a new client against an old server runs mirror-less. Either
+half can roll independently.
 
 v0.5.7 is an orlop-server-only change (tenant registration no longer holds the
 server-wide lock across JuiceFS filesystem I/O, so a cold-cache registration can't
