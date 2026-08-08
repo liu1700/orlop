@@ -176,18 +176,23 @@ impl Store for DataStore {
             .collect())
     }
 
-    fn chunk_put_many(&self, items: &[(ChunkHash, Vec<u8>)]) -> anyhow::Result<()> {
+    fn chunk_put_many(&self, items: Vec<(ChunkHash, Vec<u8>)>) -> anyhow::Result<()> {
         if items.is_empty() {
             return Ok(());
         }
-        let payloads: Vec<(Vec<u8>, Vec<u8>)> =
-            items.iter().map(|(h, b)| (h.to_vec(), b.clone())).collect();
+        // Persist into the read cache while the owned upload buffers are still
+        // available, then move those buffers into the wire client. This keeps
+        // one copy of each chunk instead of cloning the whole batch.
+        for (hash, bytes) in &items {
+            self.cache.put(hash, bytes)?;
+        }
+        let payloads = items
+            .into_iter()
+            .map(|(hash, bytes)| (hash.to_vec(), bytes))
+            .collect();
         let _stored = self
             .client
             .chunk_put_many(payloads, self.current_session_id())?;
-        for (hash, bytes) in items {
-            self.cache.put(hash, bytes)?;
-        }
         Ok(())
     }
 

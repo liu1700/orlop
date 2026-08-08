@@ -85,8 +85,13 @@ deployment, `migrate up` stops with an unresolved-owner count if placement
 cannot be inferred; restore those `server_vms` rows (or create the matching
 owner reservation explicitly) and rerun the idempotent migration.
 
-v0.5.4 through v0.6.0 ship **no control-plane migration**, so unlike the two upgrades
+v0.5.4 through v0.6.1 ship **no control-plane migration**, so unlike the two upgrades
 above they roll back with a plain image revert and need no backup step.
+
+v0.6.1 is a mount-client-only change: spilled-file flushes now use single-pass
+streaming CDC and a process-wide bounded upload pipeline instead of
+rematerializing the full file in memory (#131). The wire protocol and both
+server components are unchanged, so the mount client can roll independently.
 
 v0.6.0 changes both halves, compatibly (the metadata change feed + client
 mirror, #122): the server applies additive columns and tables to each
