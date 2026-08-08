@@ -71,6 +71,21 @@ impl DataStore {
     fn virtual_path(&self, path: &str) -> String {
         join_virtual_path(&self.mount_path, path)
     }
+
+    /// The server's setattr handler chmods to the request's mode before
+    /// applying owner/atime, so those calls must carry the CURRENT mode to
+    /// keep the chmod a no-op. A fresh mirror answers without the stat round
+    /// trip (issue #122).
+    fn stat_mode_for_setattr(&self, vpath: &str) -> anyhow::Result<u32> {
+        if let Some(m) = &self.mirror {
+            match m.entry_for(vpath) {
+                Some(Some(e)) => return Ok(e.mode),
+                Some(None) => return Err(mirror_enoent("path")),
+                None => {}
+            }
+        }
+        Ok(self.client.stat(vpath)?.mode)
+    }
 }
 
 // ── Store trait impl ─────────────────────────────────────────────────────────
@@ -323,7 +338,7 @@ impl Store for DataStore {
         // the owner change, so carry the path's CURRENT mode to keep the chmod a
         // no-op. stat is the source of truth for the current mode of any kind.
         let vpath = self.virtual_path(path);
-        let cur_mode = self.client.stat(&vpath)?.mode;
+        let cur_mode = self.stat_mode_for_setattr(&vpath)?;
         self.client.setattr_owner(
             &vpath,
             cur_mode,
@@ -341,7 +356,7 @@ impl Store for DataStore {
     fn setattr_atime(&self, path: &str, atime: i64) -> anyhow::Result<()> {
         // Same current-mode preservation as setattr_owner.
         let vpath = self.virtual_path(path);
-        let cur_mode = self.client.stat(&vpath)?.mode;
+        let cur_mode = self.stat_mode_for_setattr(&vpath)?;
         self.client.setattr_atime(
             &vpath,
             cur_mode,

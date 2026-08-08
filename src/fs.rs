@@ -1591,18 +1591,18 @@ impl Filesystem for GatewayFs {
             return;
         }
 
-        // Acquire a write lease if the mount supports leases.
-        let lease_handle = match self.acquire_write_lease(req, mount_idx, &full) {
-            Ok(h) => h,
-            Err(e) => {
-                self.audit.record(
-                    self.write_audit_event(req, mount_idx, event::CREATE, &full, false)
-                        .with_mode(mode),
-                );
-                reply.error(backend_errno(&e, EIO));
-                return;
-            }
-        };
+        // Overlap the lease grant with the manifest insert (issue #122):
+        // they are independent round trips (a lease is grantable before the
+        // path exists, and manifest_put tolerates the caller's own lease in
+        // either order), and small-file creation otherwise pays them back to
+        // back. If the put fails, the detached grant's handle drops and
+        // releases itself; if the grant fails after the put landed, the
+        // create degrades to write-through instead of erroring - the file
+        // already exists server-side.
+        let lease_task = self.mounts[mount_idx].leases.clone().map(|lm| {
+            let path = full.clone();
+            std::thread::spawn(move || lm.acquire_exclusive(&path))
+        });
 
         let mtime_ns = now_ns();
         let mf = Manifest {
@@ -1620,6 +1620,23 @@ impl Filesystem for GatewayFs {
                 return;
             }
         };
+
+        let lease_handle = match lease_task {
+            None => None,
+            Some(task) => match task.join() {
+                Ok(Ok(h)) => h,
+                Ok(Err(_)) | Err(_) => None,
+            },
+        };
+        if lease_handle.is_none() && self.mounts[mount_idx].leases.is_some() {
+            self.audit.record(AuditEvent::simple(
+                event::LEASE_DENIED,
+                &full,
+                true,
+                self.identity_for_req(req)
+                    .with_session(self.session_for(mount_idx)),
+            ));
+        }
 
         let mut state = self.state.lock();
         let node = self.intern_node(
