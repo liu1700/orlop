@@ -335,6 +335,9 @@ Also exposed:
 
 | Metric | Type | Labels |
 |---|---|---|
+| `orlop_chunk_batch_duration_seconds` | histogram | `operation` (`has`, `delete`) |
+| `orlop_chunk_batch_size` | histogram | `operation` (`has`, `delete`) |
+| `orlop_chunk_batch_items_total` | counter | `operation`; `result` (`present`, `absent`, `deleted`, `missing`, `error`) |
 | `orlop_journal_writes_total` | counter | `op`, `allocation_id` |
 | `orlop_journal_query_duration_seconds` | histogram | none |
 | `orlop_journal_rows_total` | gauge | `allocation_id` |
@@ -346,3 +349,10 @@ Also exposed:
 `orlop_agent_path_denied_total` increments when a connection whose cert carries
 an `/agent/<id>` SAN touches a path outside that agent's subtree, the same
 event that writes an `allowed: false` op line to `audit.log`.
+
+`orlop_chunk_batch_items_total{operation="has"}` supplies the dedup hit ratio
+without a per-hash label. Pair its rate and the batch-duration quantiles with
+JuiceFS's FUSE-operation and metadata-engine metrics to see whether a slow
+presence probe is local scheduling, a FUSE lookup, or a Redis command. Delete
+outcomes distinguish an actual unlink from an already-missing idempotent GC
+item; any `result="error"` increase should alert.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -101,16 +102,20 @@ func (s *serverState) purgeAgentData(w http.ResponseWriter, r *http.Request) {
 //
 // Phase 2 (per-hash CAS, mirrors gcLoop.deleteGCBatch): for each hash the
 // purge touched, delete its chunks row only if refcount is still 0, then
-// unlink the file. Re-asserting `refcount = 0` in the DELETE means a
-// concurrent manifest write that re-referenced the hash keeps its chunk —
-// the same protection the background GC relies on. Unlink runs outside the
-// transaction; a crash in between leaves an orphan file, exactly the orphan
-// class the GC comment already documents.
+// unlink the file. The admin purge holds every hash-shard lock across both
+// phases; this rare operation therefore cannot race a manifest reference into
+// the row-delete/unlink gap. Unlink still runs outside the transaction, so a
+// crash in between leaves the same tolerable orphan-file class as GC.
 func purgeAgentSubtree(t *tenantState, agentID string) (agentPurgeResult, error) {
 	var result agentPurgeResult
 	prefix := "/" + agentID
 	likePrefix := escapeLike(prefix) + "/%"
 	db := t.db.DB()
+	// Phase 1 discovers its hashes under the SQLite write transaction. Taking
+	// all 256 first-byte locks before that transaction preserves the global
+	// hash-lock -> DB-lock order and avoids a deadlock with manifest commits.
+	unlockHashes := t.chunks.lockAllHashes()
+	defer unlockHashes()
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -212,24 +217,34 @@ func purgeAgentSubtree(t *tenantState, agentID string) (agentPurgeResult, error)
 		return result, err
 	}
 	result.ChunkRowsDeleted = int64(len(deleted))
-	for _, hash := range deleted {
-		if p, perr := t.chunks.Path(hash[:]); perr == nil {
-			if fi, serr := os.Stat(p); serr == nil {
-				result.BytesFreed += uint64(fi.Size())
+	hashes := make([][]byte, len(deleted))
+	for i, chunk := range deleted {
+		hashes[i] = chunk.hash[:]
+		size := chunk.size
+		if size == 0 {
+			// Legacy/applyChunkRefDelta rows may not carry the physical size.
+			if p, perr := t.chunks.Path(chunk.hash[:]); perr == nil {
+				if fi, serr := os.Stat(p); serr == nil {
+					size = uint64(fi.Size())
+				}
 			}
 		}
-		if err := t.chunks.Delete(hash[:]); err != nil {
-			// Orphan file; tolerable, same class the GC loop logs-and-continues on.
-			continue
-		}
+		result.BytesFreed += size
 	}
+	// Errors leave tolerable orphan files and are reclaimed by a later scrub.
+	_, _ = t.chunks.deleteManyUnlocked(hashes)
 	return result, nil
 }
 
 // deletePurgedChunkRows removes the chunks rows for the given hashes when
 // (and only when) their refcount is still 0 at delete time, returning the
 // hashes whose rows were actually deleted. Same CAS shape as deleteGCBatch.
-func deletePurgedChunkRows(db *sql.DB, delta map[[HashLen]byte]int) ([][HashLen]byte, error) {
+type purgedChunk struct {
+	hash [HashLen]byte
+	size uint64
+}
+
+func deletePurgedChunkRows(db *sql.DB, delta map[[HashLen]byte]int) ([]purgedChunk, error) {
 	if len(delta) == 0 {
 		return nil, nil
 	}
@@ -239,21 +254,26 @@ func deletePurgedChunkRows(db *sql.DB, delta map[[HashLen]byte]int) ([][HashLen]
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.Prepare(`delete from chunks where hash = ? and refcount = 0`)
+	stmt, err := tx.Prepare(`delete from chunks where hash = ? and refcount = 0 returning size`)
 	if err != nil {
 		return nil, err
 	}
 	defer stmt.Close()
 
-	deleted := make([][HashLen]byte, 0, len(delta))
+	deleted := make([]purgedChunk, 0, len(delta))
 	for hash := range delta {
-		res, err := stmt.Exec(hash[:])
+		var size int64
+		err := stmt.QueryRow(hash[:]).Scan(&size)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			deleted = append(deleted, hash)
+		if size < 0 {
+			return nil, fmt.Errorf("negative chunk size for %x: %d", hash[:4], size)
 		}
+		deleted = append(deleted, purgedChunk{hash: hash, size: uint64(size)})
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err

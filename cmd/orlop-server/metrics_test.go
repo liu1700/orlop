@@ -17,6 +17,8 @@ func TestMetricsExposesAllSeries(t *testing.T) {
 	m.chunkState("cached")
 	m.chunkState("deduped")
 	m.chunkState("fetched")
+	m.observeChunkBatch("has", time.Now().Add(-10*time.Millisecond), 8, map[string]int{"present": 6, "absent": 2})
+	m.observeChunkBatch("delete", time.Now().Add(-5*time.Millisecond), 3, map[string]int{"deleted": 2, "missing": 1})
 	m.leaseAcquired("/file")
 
 	srv := httptest.NewServer(m.handler())
@@ -38,6 +40,12 @@ func TestMetricsExposesAllSeries(t *testing.T) {
 		`orlop_chunks_total{state="cached"} 1`,
 		`orlop_chunks_total{state="deduped"} 1`,
 		`orlop_chunks_total{state="fetched"} 1`,
+		`orlop_chunk_batch_duration_seconds_count{operation="has"} 1`,
+		`orlop_chunk_batch_size_count{operation="delete"} 1`,
+		`orlop_chunk_batch_items_total{operation="has",result="present"} 6`,
+		`orlop_chunk_batch_items_total{operation="has",result="absent"} 2`,
+		`orlop_chunk_batch_items_total{operation="delete",result="deleted"} 2`,
+		`orlop_chunk_batch_items_total{operation="delete",result="missing"} 1`,
 		`orlop_lease_held{path="/file"} 1`,
 	} {
 		if !strings.Contains(body, want) {

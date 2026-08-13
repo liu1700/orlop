@@ -18,11 +18,14 @@ import (
 // will need to switch to a sampled histogram, but the spec calls for a per-
 // path gauge so we honour it here.
 type serverMetrics struct {
-	registry    *prometheus.Registry
-	opDuration  *prometheus.HistogramVec
-	bytesTotal  *prometheus.CounterVec
-	chunksTotal *prometheus.CounterVec
-	leaseHeld   *prometheus.GaugeVec
+	registry           *prometheus.Registry
+	opDuration         *prometheus.HistogramVec
+	bytesTotal         *prometheus.CounterVec
+	chunksTotal        *prometheus.CounterVec
+	leaseHeld          *prometheus.GaugeVec
+	chunkBatchDuration *prometheus.HistogramVec
+	chunkBatchSize     *prometheus.HistogramVec
+	chunkBatchItems    *prometheus.CounterVec
 
 	// Journal metrics.
 	journalWrites      *prometheus.CounterVec
@@ -67,6 +70,20 @@ func newServerMetrics() *serverMetrics {
 			Name: "orlop_lease_held",
 			Help: "1 while a lease is held on the labelled path, otherwise the time series is removed.",
 		}, []string{"path"}),
+		chunkBatchDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "orlop_chunk_batch_duration_seconds",
+			Help:    "Latency of shard-aware chunk existence and delete batches.",
+			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 14),
+		}, []string{"operation"}),
+		chunkBatchSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "orlop_chunk_batch_size",
+			Help:    "Number of hashes submitted to a shard-aware chunk batch.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 11),
+		}, []string{"operation"}),
+		chunkBatchItems: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "orlop_chunk_batch_items_total",
+			Help: "Chunk batch items by operation and outcome.",
+		}, []string{"operation", "result"}),
 		journalWrites: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "orlop_journal_writes_total",
 			Help: "Journal rows written, by op and allocation.",
@@ -100,6 +117,7 @@ func newServerMetrics() *serverMetrics {
 	}
 	reg.MustRegister(
 		sm.opDuration, sm.bytesTotal, sm.chunksTotal, sm.leaseHeld,
+		sm.chunkBatchDuration, sm.chunkBatchSize, sm.chunkBatchItems,
 		sm.journalWrites, sm.journalQueryDur, sm.journalRows, sm.journalRevertTotal,
 		sm.sessionForgeryRejected, sm.sessionRebindTotal, sm.agentPathDenied,
 	)
@@ -159,6 +177,22 @@ func (m *serverMetrics) chunkState(state string) {
 		return
 	}
 	m.chunksTotal.WithLabelValues(state).Inc()
+}
+
+// observeChunkBatch records one bounded-cardinality batch. Callers provide
+// only fixed result names: present/absent for has, and deleted/missing/error
+// for delete.
+func (m *serverMetrics) observeChunkBatch(operation string, started time.Time, size int, results map[string]int) {
+	if m == nil {
+		return
+	}
+	m.chunkBatchDuration.WithLabelValues(operation).Observe(time.Since(started).Seconds())
+	m.chunkBatchSize.WithLabelValues(operation).Observe(float64(size))
+	for result, count := range results {
+		if count > 0 {
+			m.chunkBatchItems.WithLabelValues(operation, result).Add(float64(count))
+		}
+	}
 }
 
 // leaseAcquired raises orlop_lease_held{path}=1 and refcounts overlapping

@@ -895,17 +895,25 @@ func handleChunkHas(s *serverState, tenant *tenantState, ident Identity, w *fram
 	for i := 0; i < n; i++ {
 		hashes[i] = req.Hashes[i*HashLen : (i+1)*HashLen]
 	}
+	started := time.Now()
 	present, err := tenant.chunks.HasMany(hashes)
 	if err != nil {
+		s.metrics.observeChunkBatch("has", started, n, map[string]int{"error": n})
 		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEIO(err.Error()))
 		return
 	}
 	bitmap := make([]byte, (n+7)/8)
+	presentCount := 0
 	for i, p := range present {
 		if p {
+			presentCount++
 			bitmap[i/8] |= 1 << (i % 8)
 		}
 	}
+	s.metrics.observeChunkBatch("has", started, n, map[string]int{
+		"present": presentCount,
+		"absent":  n - presentCount,
+	})
 	sendResp(w, frame, dataplane.ChunkHasResponse{Present: bitmap})
 	s.metrics.observeOp("chunk_has", "out", uint64(len(bitmap)))
 	s.recordChunkHasAudit(ident, uint64(n), true)

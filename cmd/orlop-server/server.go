@@ -278,6 +278,8 @@ func openTenantState(id, name, storeRoot, dbPath string, leaseCfg leaseConfig, c
 		_ = tdb.Close()
 		return nil, err
 	}
+	manifests := NewManifestStore(tdb.DB(), metrics)
+	manifests.SetChunkStore(chunks)
 	ts := &tenantState{
 		id:        id,
 		name:      name,
@@ -285,7 +287,7 @@ func openTenantState(id, name, storeRoot, dbPath string, leaseCfg leaseConfig, c
 		storeRoot: storeRoot,
 		routesDB:  dbPath,
 		chunks:    chunks,
-		manifests: NewManifestStore(tdb.DB(), metrics),
+		manifests: manifests,
 		journal:   journal,
 		leases:    newLeaseManager(leaseCfg, conns.Push, audit, metrics),
 		changes:   newChangeNotifier(),
