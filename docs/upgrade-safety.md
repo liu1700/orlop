@@ -23,6 +23,9 @@ check the control plane runs at boot.
 | v0.5.4 | HEAD | Postgres, SQLite |
 | v0.5.5 | HEAD | Postgres, SQLite |
 | v0.5.6 | HEAD | Postgres, SQLite |
+| v0.5.7 | HEAD | Postgres, SQLite |
+| v0.6.0 | HEAD | Postgres, SQLite |
+| v0.6.1 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -85,8 +88,17 @@ deployment, `migrate up` stops with an unresolved-owner count if placement
 cannot be inferred; restore those `server_vms` rows (or create the matching
 owner reservation explicitly) and rerun the idempotent migration.
 
-v0.5.4 through v0.6.1 ship **no control-plane migration**, so unlike the two upgrades
+v0.5.4 through v0.6.2 ship **no control-plane migration**, so unlike the two upgrades
 above they roll back with a plain image revert and need no backup step.
+
+v0.6.2 is an orlop-server-only optimization for JuiceFS-backed chunk stores:
+duplicate existence probes collapse into one stat, definitely absent hash
+shards skip remote stats, and GC overlaps deletes through a process-wide
+bounded worker pool (#133). Manifest commit, agent purge, and GC now share the
+same deterministic hash-shard locks, so a manifest cannot commit a chunk while
+GC removes it. The wire protocol, control-plane schema, and mount client are
+unchanged. The server can roll independently; Plori still pins all release
+images together to prevent deployment drift.
 
 v0.6.1 is a mount-client-only change: spilled-file flushes now use single-pass
 streaming CDC and a process-wide bounded upload pipeline instead of
