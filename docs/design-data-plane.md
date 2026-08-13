@@ -260,6 +260,32 @@ landing between select and delete leaves the chunk alive. Each sweep emits a
 a just-unreferenced chunk back from collection until it has aged past the
 window, rather than deleting it the instant its refcount hits zero.
 
+GC holds deterministic first-byte hash locks from the conditional metadata-row
+delete through the file unlink. A manifest commit takes the same locks, verifies
+that every referenced chunk is a regular file, and holds them through its
+refcount transaction. Therefore either the manifest commits first and the GC
+predicate protects it, or GC finishes first and the manifest is rejected as
+referencing a missing chunk. This also covers manifest restore/revert paths that
+reuse the same commit primitive.
+
+Chunk existence probes and post-commit GC unlinks are grouped by the first
+hash byte. Presence collapses repeated hashes and skips definitely absent
+shards, then keeps any remaining exact stats serial because real JuiceFS tests
+showed concurrent lookup outliers could regress p99 in a fully populated store.
+GC uses at most 16 process-wide shard workers, overlapping remote unlink latency
+without allowing a large batch to create unbounded I/O.
+Presence still comes from an exact `lstat` of a fixed-length, hex-derived hash
+path and rejects non-regular final entries—no index is allowed to return
+"present"—so the optimization cannot report a missing chunk as present.
+The internal `objects` tree is server-owned and is never exposed as a client
+path. At startup the store records which of the 256 shard directories exist;
+a definitely absent shard skips all per-hash stats, and `Put` publishes the
+hint before it writes. An unsupported live external writer can therefore cause
+one redundant upload, never a false-present response; that `Put` reconciles the
+hint, and a restart rebuilds it from disk. GC opens each touched shard once and
+uses descriptor-relative deletes. All hashes are validated before a delete
+batch starts, and missing files remain successful idempotent deletes.
+
 The **client cache** is collected independently: LRU eviction down to a byte
 budget (default 2 GiB, configurable), picking victims by `last_access`. Losing
 a cached chunk only costs a refetch, so the cache index is kept lightweight and

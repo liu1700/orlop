@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 
 	"lukechampine.com/blake3"
 )
@@ -14,13 +16,41 @@ import (
 // HashLen is the wire length of a chunk hash. BLAKE3-32.
 const HashLen = 32
 
+// The process-wide delete pool keeps GC from creating an unbounded number of
+// goroutines or FUSE metadata operations.
+const maxChunkDeleteWorkers = 16
+
+type chunkWorkerPool struct {
+	once  sync.Once
+	size  int
+	tasks chan func()
+}
+
+func (p *chunkWorkerPool) submit(task func()) {
+	p.once.Do(func() {
+		p.tasks = make(chan func(), p.size*16)
+		for range p.size {
+			go func() {
+				for task := range p.tasks {
+					task()
+				}
+			}()
+		}
+	})
+	p.tasks <- task
+}
+
+var chunkDeletePool = chunkWorkerPool{size: maxChunkDeleteWorkers}
+
 // ChunkStore writes content-addressed blobs into <root>/<first-2-hex>/<hash-hex>.
 // Same instance is safe for concurrent use — every write goes through a temp
 // file that's rename()'d into place, so partial writes never become visible
 // and racing writers of the same hash see deterministic content (BLAKE3 of
 // the bytes is the filename).
 type ChunkStore struct {
-	root string
+	root       string
+	hashLocks  [256]sync.Mutex
+	knownShard [256]atomic.Bool
 }
 
 // NewChunkStore returns a store rooted at <storeRoot>/objects.
@@ -29,7 +59,19 @@ func NewChunkStore(storeRoot string) (*ChunkStore, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", root, err)
 	}
-	return &ChunkStore{root: root}, nil
+	cs := &ChunkStore{root: root}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read chunk root %s: %w", root, err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		decoded, err := hex.DecodeString(name)
+		if err == nil && len(decoded) == 1 && entry.IsDir() {
+			cs.knownShard[decoded[0]].Store(true)
+		}
+	}
+	return cs, nil
 }
 
 // Path is the canonical filesystem location for a hash.
@@ -43,17 +85,11 @@ func (cs *ChunkStore) Path(hash []byte) (string, error) {
 
 // Has returns whether the chunk is present on disk. Stat-based, cheap.
 func (cs *ChunkStore) Has(hash []byte) (bool, error) {
-	p, err := cs.Path(hash)
+	present, err := cs.HasMany([][]byte{hash})
 	if err != nil {
 		return false, err
 	}
-	if _, err := os.Stat(p); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+	return present[0], nil
 }
 
 // Get returns the chunk bytes. Hash verification is left to the caller —
@@ -75,6 +111,15 @@ func (cs *ChunkStore) Get(hash []byte) ([]byte, error) {
 // touching disk. Idempotent: if the chunk already exists, returns false
 // (not stored, already there); otherwise true.
 func (cs *ChunkStore) Put(hash, data []byte) (bool, error) {
+	unlock, err := cs.lockHashes([][]byte{hash})
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	return cs.putUnlocked(hash, data)
+}
+
+func (cs *ChunkStore) putUnlocked(hash, data []byte) (bool, error) {
 	if len(hash) != HashLen {
 		return false, fmt.Errorf("hash must be %d bytes, got %d", HashLen, len(hash))
 	}
@@ -86,6 +131,10 @@ func (cs *ChunkStore) Put(hash, data []byte) (bool, error) {
 			hex.EncodeToString(computed[:]),
 		)
 	}
+	// From this point, a false shard-presence hint would only cause a redundant
+	// upload. Publish the hint before stat/mkdir so concurrent HasMany calls
+	// verify the exact file instead of assuming the whole shard is absent.
+	cs.knownShard[hash[0]].Store(true)
 	p, err := cs.Path(hash)
 	if err != nil {
 		return false, err
@@ -140,27 +189,229 @@ func (cs *ChunkStore) Put(hash, data []byte) (bool, error) {
 // return nil. Does not touch any DB row — refcount management is the
 // caller's responsibility.
 func (cs *ChunkStore) Delete(hash []byte) error {
-	p, err := cs.Path(hash)
+	results, err := cs.DeleteMany([][]byte{hash})
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("chunk delete %x: %w", hash[:4], err)
-	}
-	return nil
+	return results[0].Err
 }
 
 // HasMany returns a parallel boolean slice for the requested hashes.
 // Each `hashes[i]` should be HashLen bytes; the i-th boolean reflects
 // whether that chunk is present.
 func (cs *ChunkStore) HasMany(hashes [][]byte) ([]bool, error) {
-	out := make([]bool, len(hashes))
-	for i, h := range hashes {
-		ok, err := cs.Has(h)
+	// A mature store commonly has all 256 shard directories. When every hash is
+	// unique and every shard is known, preserve the old stable serial lookup
+	// path: batching cannot reduce operation count and concurrent lookup tails
+	// were worse on JuiceFS. Duplicate or definitely-absent batches take the
+	// optimized path below.
+	allKnownUnique := true
+	seen := make(map[[HashLen]byte]struct{}, len(hashes))
+	for i, hash := range hashes {
+		if len(hash) != HashLen {
+			return nil, fmt.Errorf("hash[%d] must be %d bytes, got %d", i, HashLen, len(hash))
+		}
+		var key [HashLen]byte
+		copy(key[:], hash)
+		if _, duplicate := seen[key]; duplicate || !cs.knownShard[hash[0]].Load() {
+			allKnownUnique = false
+		}
+		seen[key] = struct{}{}
+	}
+	if allKnownUnique {
+		out := make([]bool, len(hashes))
+		for i, hash := range hashes {
+			p, _ := cs.Path(hash)
+			info, err := os.Lstat(p)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("has[%d]: %w", i, err)
+			}
+			if !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("has[%d]: not a regular file", i)
+			}
+			out[i] = true
+		}
+		return out, nil
+	}
+
+	out, itemErrs, err := runChunkBatch(cs, hashes, true, chunkBatchHas, func(shard *chunkShard, name string) (bool, error) {
+		return visitChunkShard(shard, name, chunkBatchHas)
+	})
+	if err != nil {
+		return nil, err
+	}
+	for i, err := range itemErrs {
 		if err != nil {
 			return nil, fmt.Errorf("has[%d]: %w", i, err)
 		}
-		out[i] = ok
 	}
 	return out, nil
+}
+
+// ChunkDeleteResult reports whether an item was removed. A missing item is a
+// successful idempotent delete with Deleted=false and Err=nil.
+type ChunkDeleteResult struct {
+	Deleted bool
+	Err     error
+}
+
+// DeleteMany removes chunks in a bounded, shard-aware batch. Hashes are all
+// validated before the first unlink, so malformed input cannot cause a
+// partially applied batch.
+func (cs *ChunkStore) DeleteMany(hashes [][]byte) ([]ChunkDeleteResult, error) {
+	unlock, err := cs.lockHashes(hashes)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return cs.deleteManyUnlocked(hashes)
+}
+
+func (cs *ChunkStore) deleteManyUnlocked(hashes [][]byte) ([]ChunkDeleteResult, error) {
+	deleted, itemErrs, err := runChunkBatch(cs, hashes, false, chunkBatchDelete, func(shard *chunkShard, name string) (bool, error) {
+		return visitChunkShard(shard, name, chunkBatchDelete)
+	})
+	if err != nil {
+		return nil, err
+	}
+	results := make([]ChunkDeleteResult, len(hashes))
+	for i := range results {
+		results[i] = ChunkDeleteResult{Deleted: deleted[i], Err: itemErrs[i]}
+	}
+	return results, nil
+}
+
+// lockHashes serializes chunk publication, manifest validation/commit, and GC
+// deletion by the first hash byte. Locks are always acquired in byte order, so
+// overlapping manifest and GC batches cannot deadlock. All hashes are
+// validated before the first lock is taken.
+func (cs *ChunkStore) lockHashes(hashes [][]byte) (func(), error) {
+	var needed [256]bool
+	for i, hash := range hashes {
+		if len(hash) != HashLen {
+			return nil, fmt.Errorf("hash[%d] must be %d bytes, got %d", i, HashLen, len(hash))
+		}
+		needed[hash[0]] = true
+	}
+	locked := make([]int, 0, len(hashes))
+	for i := range needed {
+		if needed[i] {
+			cs.hashLocks[i].Lock()
+			locked = append(locked, i)
+		}
+	}
+	return func() {
+		for i := len(locked) - 1; i >= 0; i-- {
+			cs.hashLocks[locked[i]].Unlock()
+		}
+	}, nil
+}
+
+func (cs *ChunkStore) lockAllHashes() func() {
+	for i := range cs.hashLocks {
+		cs.hashLocks[i].Lock()
+	}
+	return func() {
+		for i := len(cs.hashLocks) - 1; i >= 0; i-- {
+			cs.hashLocks[i].Unlock()
+		}
+	}
+}
+
+type chunkBatchItem struct {
+	indices []int
+	name    string
+}
+
+type chunkBatchShard struct {
+	name  string
+	items []chunkBatchItem
+}
+
+// runChunkBatch groups hashes by their first byte, optionally collapses exact
+// duplicates, opens each shard directory once, and processes at most
+// a bounded number of shards concurrently. Platform helpers use exact
+// generated hash paths for presence and descriptor-relative deletes where the
+// OS supports them.
+func runChunkBatch(cs *ChunkStore, hashes [][]byte, deduplicate bool, operation chunkBatchOperation, visit func(*chunkShard, string) (bool, error)) ([]bool, []error, error) {
+	results := make([]bool, len(hashes))
+	itemErrs := make([]error, len(hashes))
+	if len(hashes) == 0 {
+		return results, itemErrs, nil
+	}
+
+	grouped := make(map[string][]chunkBatchItem)
+	seen := make(map[string]int)
+	for i, hash := range hashes {
+		if len(hash) != HashLen {
+			return nil, nil, fmt.Errorf("hash[%d] must be %d bytes, got %d", i, HashLen, len(hash))
+		}
+		name := hex.EncodeToString(hash)
+		shard := name[:2]
+		if operation == chunkBatchHas && !cs.knownShard[hash[0]].Load() {
+			continue
+		}
+		if deduplicate {
+			if offset, ok := seen[name]; ok {
+				items := grouped[shard]
+				items[offset].indices = append(items[offset].indices, i)
+				grouped[shard] = items
+				continue
+			}
+			seen[name] = len(grouped[shard])
+		}
+		grouped[shard] = append(grouped[shard], chunkBatchItem{indices: []int{i}, name: name})
+	}
+
+	process := func(group chunkBatchShard) {
+		shard, err := openChunkShard(filepath.Join(cs.root, group.name), operation)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if err != nil {
+			for _, item := range group.items {
+				for _, index := range item.indices {
+					itemErrs[index] = fmt.Errorf("open shard %s: %w", group.name, err)
+				}
+			}
+			return
+		}
+		for _, item := range group.items {
+			result, err := visit(shard, item.name)
+			for _, index := range item.indices {
+				results[index], itemErrs[index] = result, err
+			}
+		}
+		_ = closeChunkShard(shard)
+	}
+
+	uniqueCount := 0
+	for _, items := range grouped {
+		uniqueCount += len(items)
+	}
+	// JuiceFS benchmarks showed that concurrent positive/negative lookups can
+	// add 10ms-class FUSE outliers. Presence gets its win from exact duplicate
+	// collapse and definitely-absent shard hints; keep the remaining lstats
+	// serial so a populated long-lived store never regresses p99.
+	if operation == chunkBatchHas || uniqueCount <= 2 {
+		for name, items := range grouped {
+			process(chunkBatchShard{name: name, items: items})
+		}
+		return results, itemErrs, nil
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(len(grouped))
+	for name, items := range grouped {
+		group := chunkBatchShard{name: name, items: items}
+		chunkDeletePool.submit(func() {
+			defer wg.Done()
+			process(group)
+		})
+	}
+	wg.Wait()
+	return results, itemErrs, nil
 }

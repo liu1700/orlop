@@ -18,6 +18,9 @@ type gcLoop struct {
 	// time.Now.
 	clock  func() time.Time
 	logger *slog.Logger
+	// beforeUnlink is a test-only race hook invoked after the conditional row
+	// delete commits while the matching chunk locks are still held.
+	beforeUnlink func()
 }
 
 type sweepResult struct {
@@ -123,16 +126,57 @@ func (g *gcLoop) sweepTenant(ctx context.Context, t *tenantState, cutoff int64, 
 			}
 			break // single batch is enough for a dry-run report
 		}
-		deleted, freed, err := deleteGCBatch(db, candidates, cutoff)
-		if err != nil {
-			return result, fmt.Errorf("delete batch: %w", err)
+		candidateHashes := make([][]byte, len(candidates))
+		for i := range candidates {
+			candidateHashes[i] = candidates[i].hash
 		}
-		// File unlinks. Errors are logged-and-continue: orphan files are
-		// tolerable, missing files are no-ops.
-		for _, c := range deleted {
-			if err := t.chunks.Delete(c.hash); err != nil {
-				g.logger.Warn("gc unlink failed", "tenant", t.id, "error", err)
+		unlock, err := t.chunks.lockHashes(candidateHashes)
+		if err != nil {
+			return result, fmt.Errorf("lock batch chunks: %w", err)
+		}
+		var deleted []gcCandidate
+		var freed uint64
+		batchErr := func() error {
+			defer unlock()
+			deleted, freed, err = deleteGCBatch(db, candidates, cutoff)
+			if err != nil {
+				return fmt.Errorf("delete batch: %w", err)
 			}
+			if g.beforeUnlink != nil {
+				g.beforeUnlink()
+			}
+			// File unlinks run outside the transaction in a bounded shard-aware
+			// batch. The hash locks remain held from the conditional row delete
+			// through unlink, so a manifest commit either protects the row first
+			// or observes the missing file after GC completes.
+			hashes := make([][]byte, len(deleted))
+			for i := range deleted {
+				hashes[i] = deleted[i].hash
+			}
+			unlinkStarted := time.Now()
+			unlinkResults, unlinkErr := t.chunks.deleteManyUnlocked(hashes)
+			outcomes := map[string]int{}
+			if unlinkErr != nil {
+				outcomes["error"] = len(hashes)
+				g.logger.Warn("gc unlink batch failed", "tenant", t.id, "error", unlinkErr)
+			} else {
+				for i, unlink := range unlinkResults {
+					switch {
+					case unlink.Err != nil:
+						outcomes["error"]++
+						g.logger.Warn("gc unlink failed", "tenant", t.id, "hash", fmt.Sprintf("%x", deleted[i].hash[:4]), "error", unlink.Err)
+					case unlink.Deleted:
+						outcomes["deleted"]++
+					default:
+						outcomes["missing"]++
+					}
+				}
+			}
+			g.state.metrics.observeChunkBatch("delete", unlinkStarted, len(hashes), outcomes)
+			return nil
+		}()
+		if batchErr != nil {
+			return result, batchErr
 		}
 		result.Count += uint64(len(deleted))
 		result.BytesFreed += freed

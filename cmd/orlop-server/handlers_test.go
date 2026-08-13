@@ -46,6 +46,12 @@ func newTestState(t *testing.T, allow, deny []string) *serverState {
 	if err != nil {
 		t.Fatalf("newServerState: %v", err)
 	}
+	// Most protocol fixtures below construct manifests with synthetic hashes to
+	// test auth, journaling, and CAS behavior without uploading chunk files.
+	// Production state keeps this guard enabled; GC tests use their own rig and
+	// exercise the chunk-presence invariant directly.
+	tenant, _ := state.tenant(testTenant)
+	tenant.manifests.SetChunkStore(nil)
 	t.Cleanup(func() { _ = state.Close() })
 	return state
 }

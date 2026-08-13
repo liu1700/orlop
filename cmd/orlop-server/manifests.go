@@ -110,6 +110,9 @@ func specialNodeKind(mode uint32) string {
 type ManifestStore struct {
 	db      *sql.DB
 	metrics *serverMetrics
+	// chunks gates manifest refcount commits against GC unlinks. Nil in unit
+	// tests that exercise metadata in isolation.
+	chunks *ChunkStore
 	// journal is the live-event sink; when non-nil, Put/Delete/Rename
 	// broadcast each committed journal entry through its pub/sub. Set by
 	// tenantState construction via SetJournal; nil in unit tests that
@@ -138,6 +141,13 @@ func (m *ManifestStore) SetJournal(j *SessionJournal) {
 // notifications. Same construction-time contract as SetJournal.
 func (m *ManifestStore) SetChangeNotify(fn func(rev uint64)) {
 	m.onChange = fn
+}
+
+// SetChunkStore enables the production invariant that every newly committed
+// manifest reference is present on disk at commit time. Safe to call once at
+// construction; not safe to swap concurrently with writes.
+func (m *ManifestStore) SetChunkStore(chunks *ChunkStore) {
+	m.chunks = chunks
 }
 
 // notifyChange rings the change-feed doorbell after a committed mutation.
@@ -201,6 +211,11 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 	if sessionID != "" && allocationID == "" {
 		return 0, fmt.Errorf("manifest_put: empty allocation_id required")
 	}
+	unlockChunks, err := m.lockAndValidateChunks(mf.Chunks)
+	if err != nil {
+		return 0, err
+	}
+	defer unlockChunks()
 
 	tx, err := m.db.Begin()
 	if err != nil {
@@ -363,6 +378,32 @@ func (m *ManifestStore) Put(p string, expectedVersion uint64, mf Manifest, sessi
 	}
 	m.notifyChange(rev)
 	return newVersion, nil
+}
+
+func (m *ManifestStore) lockAndValidateChunks(chunks []ChunkRef) (func(), error) {
+	if m.chunks == nil || len(chunks) == 0 {
+		return func() {}, nil
+	}
+	hashes := make([][]byte, len(chunks))
+	for i := range chunks {
+		hashes[i] = chunks[i].Hash[:]
+	}
+	unlock, err := m.chunks.lockHashes(hashes)
+	if err != nil {
+		return nil, fmt.Errorf("lock manifest chunks: %w", err)
+	}
+	present, err := m.chunks.HasMany(hashes)
+	if err != nil {
+		unlock()
+		return nil, fmt.Errorf("validate manifest chunks: %w", err)
+	}
+	for i, ok := range present {
+		if !ok {
+			unlock()
+			return nil, fmt.Errorf("manifest references missing chunk %x", hashes[i][:4])
+		}
+	}
+	return unlock, nil
 }
 
 // Link creates a second directory entry for the same regular-file inode.

@@ -274,6 +274,73 @@ func TestGCConcurrentRefcountBumpMidBatch(t *testing.T) {
 	_ = c
 }
 
+func TestGCAndManifestCommitCannotCreateMissingReference(t *testing.T) {
+	r := newGCTestRig(t)
+	h := r.putChunk(t, "gc-manifest-race", 0, r.clock().Add(-2*time.Hour).Unix())
+
+	gcReachedUnlink := make(chan struct{})
+	releaseGC := make(chan struct{})
+	g := &gcLoop{
+		state:  r.state,
+		cfg:    r.cfg,
+		clock:  r.clock,
+		logger: r.logger,
+		beforeUnlink: func() {
+			close(gcReachedUnlink)
+			<-releaseGC
+		},
+	}
+	sweepDone := make(chan error, 1)
+	go func() {
+		_, err := g.sweepTenant(
+			context.Background(), r.tenant,
+			r.clock().Add(-time.Hour).Unix(), r.clock().Add(time.Minute),
+		)
+		sweepDone <- err
+	}()
+	<-gcReachedUnlink
+
+	putStarted := make(chan struct{})
+	putDone := make(chan error, 1)
+	go func() {
+		close(putStarted)
+		_, err := r.tenant.manifests.Put("/race", 0, Manifest{
+			Path: "/race",
+			Size: uint64(len("gc-manifest-race")),
+			Chunks: []ChunkRef{{
+				Hash: h,
+				Len:  uint32(len("gc-manifest-race")),
+			}},
+		}, "", "", "")
+		putDone <- err
+	}()
+	<-putStarted
+	select {
+	case err := <-putDone:
+		close(releaseGC)
+		t.Fatalf("manifest Put completed while GC held the chunk lock: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseGC)
+
+	if err := <-sweepDone; err != nil {
+		t.Fatalf("sweepTenant: %v", err)
+	}
+	if err := <-putDone; err == nil || !strings.Contains(err.Error(), "missing chunk") {
+		t.Fatalf("manifest Put after GC = %v, want missing-chunk rejection", err)
+	}
+	if _, err := r.tenant.manifests.Get("/race"); !errors.Is(err, ErrManifestNotFound) {
+		t.Fatalf("racing manifest was committed: %v", err)
+	}
+	p, err := r.cs.Path(h[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("GC chunk path still exists: %v", err)
+	}
+}
+
 func TestGCBatchedDeletes(t *testing.T) {
 	r := newGCTestRig(t)
 	r.cfg.BatchSize = 5
@@ -290,6 +357,13 @@ func TestGCBatchedDeletes(t *testing.T) {
 	for i, h := range hashes {
 		if r.chunkExists(t, h) {
 			t.Errorf("chunk %d not swept", i)
+		}
+		p, err := r.cs.Path(h[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("chunk %d file still present after batched GC: %v", i, err)
 		}
 	}
 }
