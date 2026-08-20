@@ -212,6 +212,52 @@ func TestQuotaBurstMarginConfig(t *testing.T) {
 	}
 }
 
+func TestBackingWriteGuardConfig(t *testing.T) {
+	base := "tenant: { id: t1, name: t1, store: { type: local, root: /tmp/t1 }, routes: { type: sqlite, path: /tmp/t1/routes.db } }\n"
+	load := func(body string) Config {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	// ext4 (default): a full quota returns ENOSPC synchronously, so no watchdog
+	// or guard is wired.
+	if got := load(base); got.BackingWriteTimeout != 0 || got.GuardBackingCapacity {
+		t.Errorf("ext4: timeout=%v guard=%v, want 0/false", got.BackingWriteTimeout, got.GuardBackingCapacity)
+	}
+
+	// juicefs (enforce off so the mount-root/meta-url checks are skipped): guard
+	// on, watchdog defaulted.
+	jfs := load(base + "quota:\n  backend: juicefs\n  enforce: false\n")
+	if jfs.BackingWriteTimeout != defaultBackingWriteTimeout {
+		t.Errorf("juicefs default timeout = %v, want %v", jfs.BackingWriteTimeout, defaultBackingWriteTimeout)
+	}
+	if !jfs.GuardBackingCapacity {
+		t.Error("juicefs should enable the capacity guard")
+	}
+
+	// Explicit override wins.
+	if got := load(base + "quota:\n  backend: juicefs\n  enforce: false\n  backing_write_timeout_ms: 5000\n").BackingWriteTimeout; got != 5*time.Second {
+		t.Errorf("override timeout = %v, want 5s", got)
+	}
+
+	// Explicit 0 is a deliberate disable, but the statfs guard stays on.
+	off := load(base + "quota:\n  backend: juicefs\n  enforce: false\n  backing_write_timeout_ms: 0\n")
+	if off.BackingWriteTimeout != 0 {
+		t.Errorf("explicit-0 timeout = %v, want 0 (disabled)", off.BackingWriteTimeout)
+	}
+	if !off.GuardBackingCapacity {
+		t.Error("explicit-0 timeout should still keep the capacity guard on")
+	}
+}
+
 func TestSingularTenantNestedOverridesTopLevel(t *testing.T) {
 	dir := t.TempDir()
 	path := writeConfig(t, `

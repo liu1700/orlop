@@ -26,6 +26,10 @@ func TestStorageErrToWirePreservesCapacityErrnos(t *testing.T) {
 		{"enospc", fmt.Errorf("write chunk: %w", syscall.ENOSPC), dataplane.ErrnoENOSPC},
 		{"edquot", fmt.Errorf("sync chunk: %w", syscall.EDQUOT), dataplane.ErrnoEDQUOT},
 		{"sqlite full", fmt.Errorf("commit manifest: %w", sqliteCodeError(13)), dataplane.ErrnoENOSPC},
+		// The issue #135 backing-store sentinels must surface as EDQUOT so the
+		// FUSE client fails the write cleanly instead of hanging.
+		{"backing stall", errBackingStall, dataplane.ErrnoEDQUOT},
+		{"backing quota", errBackingQuota, dataplane.ErrnoEDQUOT},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

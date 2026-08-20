@@ -67,6 +67,25 @@ type serverState struct {
 	// newServerState (some tests) runs unbounded.
 	connSem chan struct{}
 	reqSem  chan struct{}
+
+	// chunkStoreOpts bounds/guards every tenant's backing chunk writes against a
+	// full JuiceFS directory quota (issue #135). Derived from Config once and
+	// passed to openTenantState at boot and dynamic registration.
+	chunkStoreOpts []ChunkStoreOption
+}
+
+// chunkStoreOptions derives the per-tenant ChunkStore guards from config
+// (issue #135). Empty on the ext4 backend, where a full quota returns ENOSPC
+// synchronously and needs no watchdog.
+func chunkStoreOptions(cfg Config) []ChunkStoreOption {
+	var opts []ChunkStoreOption
+	if cfg.BackingWriteTimeout > 0 {
+		opts = append(opts, WithBackingWriteTimeout(cfg.BackingWriteTimeout))
+	}
+	if cfg.GuardBackingCapacity {
+		opts = append(opts, WithCapacityGuard(newBackingCapacity()))
+	}
+	return opts
 }
 
 // adminConfig holds config for the dynamic tenant registration endpoint.
@@ -157,9 +176,10 @@ func newServerState(cfg Config, identifier Identifier, logger *slog.Logger) (*se
 	conns := newConnRegistry()
 	metrics := newServerMetrics()
 	leaseCfg := cfg.Lease.Effective()
+	chunkOpts := chunkStoreOptions(cfg)
 	tenants := make(map[string]*tenantState, len(cfg.Tenants))
 	for _, tenant := range cfg.Tenants {
-		ts, err := openTenantState(tenant.ID, tenant.Name, tenant.StoreRoot, tenant.RoutesDB, leaseCfg, conns, audit, metrics)
+		ts, err := openTenantState(tenant.ID, tenant.Name, tenant.StoreRoot, tenant.RoutesDB, leaseCfg, conns, audit, metrics, chunkOpts...)
 		if err != nil {
 			_ = audit.Close()
 			_ = closeTenants(tenants)
@@ -180,7 +200,7 @@ func newServerState(cfg Config, identifier Identifier, logger *slog.Logger) (*se
 			if _, dup := tenants[rt.ID]; dup {
 				continue // static config wins
 			}
-			ts, err := openTenantState(rt.ID, rt.Name, rt.StoreRoot, rt.RoutesDB, leaseCfg, conns, audit, metrics)
+			ts, err := openTenantState(rt.ID, rt.Name, rt.StoreRoot, rt.RoutesDB, leaseCfg, conns, audit, metrics, chunkOpts...)
 			if err != nil {
 				logger.Warn("skipping registered tenant: open failed", "tenant_id", rt.ID, "error", err)
 				continue
@@ -241,6 +261,7 @@ func newServerState(cfg Config, identifier Identifier, logger *slog.Logger) (*se
 		certRevocations: newCertRevocationRegistry(),
 		connSem:         make(chan struct{}, maxDataPlaneSessions),
 		reqSem:          make(chan struct{}, maxInFlightRequests),
+		chunkStoreOpts:  chunkOpts,
 		adminCfg: adminConfig{
 			TenantsRoot:           cfg.TenantsRoot,
 			MetadataRoot:          cfg.MetadataRoot,
@@ -254,7 +275,7 @@ func newServerState(cfg Config, identifier Identifier, logger *slog.Logger) (*se
 // dbPath is routes.db (the metadata dir); leases.db is co-located beside it, so
 // both the latency-critical SQLite files follow metadata_root (e.g. an NVMe disk)
 // while the chunk store stays under storeRoot (e.g. JuiceFS).
-func openTenantState(id, name, storeRoot, dbPath string, leaseCfg leaseConfig, conns *connRegistry, audit *AuditLog, metrics *serverMetrics) (*tenantState, error) {
+func openTenantState(id, name, storeRoot, dbPath string, leaseCfg leaseConfig, conns *connRegistry, audit *AuditLog, metrics *serverMetrics, chunkOpts ...ChunkStoreOption) (*tenantState, error) {
 	// The metadata dir may differ from storeRoot (split disks) and may not exist
 	// yet on the boot-reopen path; create it before opening the SQLite handle.
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
@@ -264,7 +285,7 @@ func openTenantState(id, name, storeRoot, dbPath string, leaseCfg leaseConfig, c
 	if err != nil {
 		return nil, err
 	}
-	chunks, err := NewChunkStore(storeRoot)
+	chunks, err := NewChunkStore(storeRoot, chunkOpts...)
 	if err != nil {
 		_ = tdb.Close()
 		return nil, err
