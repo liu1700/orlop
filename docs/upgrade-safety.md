@@ -26,6 +26,7 @@ check the control plane runs at boot.
 | v0.5.7 | HEAD | Postgres, SQLite |
 | v0.6.0 | HEAD | Postgres, SQLite |
 | v0.6.1 | HEAD | Postgres, SQLite |
+| v0.6.2 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -88,8 +89,15 @@ deployment, `migrate up` stops with an unresolved-owner count if placement
 cannot be inferred; restore those `server_vms` rows (or create the matching
 owner reservation explicitly) and rerun the idempotent migration.
 
-v0.5.4 through v0.6.2 ship **no control-plane migration**, so unlike the two upgrades
+v0.5.4 through v0.6.3 ship **no control-plane migration**, so unlike the two upgrades
 above they roll back with a plain image revert and need no backup step.
+
+v0.6.3 preserves backing-store capacity errors across the data-plane boundary:
+filesystem `EDQUOT`/`ENOSPC` and SQLite `SQLITE_FULL` now reach the Linux FUSE
+caller as `EDQUOT`/`ENOSPC` instead of being rewritten to `EIO` or `EINVAL`
+(#135). The wire shape and control-plane schema are unchanged, and existing
+clients already accept arbitrary errno values, so the server can roll
+independently.
 
 v0.6.2 is an orlop-server-only optimization for JuiceFS-backed chunk stores:
 duplicate existence probes collapse into one stat, definitely absent hash
