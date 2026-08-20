@@ -89,8 +89,17 @@ deployment, `migrate up` stops with an unresolved-owner count if placement
 cannot be inferred; restore those `server_vms` rows (or create the matching
 owner reservation explicitly) and rerun the idempotent migration.
 
-v0.5.4 through v0.6.3 ship **no control-plane migration**, so unlike the two upgrades
+v0.5.4 through v0.6.4 ship **no control-plane migration**, so unlike the two upgrades
 above they roll back with a plain image revert and need no backup step.
+
+v0.6.4 extends the same capacity path for JuiceFS-backed deployments: a full
+directory quota that stalls the backing write/`fsync` instead of returning an
+errno now surfaces as `EDQUOT` to the FUSE caller, through a pre-write `statfs`
+guard and a bounded write watchdog on the orlop-server data plane (#135). The
+wire shape and control-plane schema are unchanged, so the server rolls
+independently; the 20s watchdog default is tunable via
+`quota.backing_write_timeout_ms` and applies only to the `juicefs` quota
+backend.
 
 v0.6.3 preserves backing-store capacity errors across the data-plane boundary:
 filesystem `EDQUOT`/`ENOSPC` and SQLite `SQLITE_FULL` now reach the Linux FUSE

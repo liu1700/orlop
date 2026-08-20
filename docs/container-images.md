@@ -21,7 +21,7 @@ automatically. Each push also prints an immutable digest; pin it for
 reproducible deploys:
 
 ```bash
-docker pull ghcr.io/liu1700/orlop-control:v0.6.3
+docker pull ghcr.io/liu1700/orlop-control:v0.6.4
 # or, pinned by digest (printed by the images job):
 docker pull ghcr.io/liu1700/orlop-control@sha256:<digest>
 ```
@@ -48,7 +48,7 @@ it is idempotent and self-checks the schema — see
 docker run --rm \
   -e DATABASE_URL="postgres://user:pw@db:5432/orlop?sslmode=disable" \
   -e ORLOP_SECRETS_BACKEND=postgres \
-  ghcr.io/liu1700/orlop-control:v0.6.3 migrate up
+  ghcr.io/liu1700/orlop-control:v0.6.4 migrate up
 ```
 
 ## `orlop-server`
