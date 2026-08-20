@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"lukechampine.com/blake3"
 )
@@ -51,15 +52,49 @@ type ChunkStore struct {
 	root       string
 	hashLocks  [256]sync.Mutex
 	knownShard [256]atomic.Bool
+
+	// writeTimeout bounds a single chunk write+fsync. 0 disables the watchdog
+	// (the write is done inline). Set on the juicefs backend, where a full
+	// directory quota stalls fsync instead of returning EDQUOT (issue #135).
+	writeTimeout time.Duration
+	// capacity, when non-nil, pre-rejects a write that would not fit in the
+	// backing store's free space (issue #135). Nil disables the guard.
+	capacity *backingCapacity
+	// syncFn is a test seam for the write+fsync step; nil in production uses the
+	// real os.File.Write + Sync. Tests inject a blocking or erroring fn to
+	// exercise the write watchdog without a real stalled filesystem.
+	syncFn func(f *os.File, data []byte) error
+}
+
+// ChunkStoreOption configures a ChunkStore at construction.
+type ChunkStoreOption func(*ChunkStore)
+
+// WithBackingWriteTimeout bounds a single chunk write+fsync; past it the write
+// is abandoned and putUnlocked returns errBackingStall (issue #135). Zero or
+// negative leaves the watchdog off.
+func WithBackingWriteTimeout(d time.Duration) ChunkStoreOption {
+	return func(cs *ChunkStore) {
+		if d > 0 {
+			cs.writeTimeout = d
+		}
+	}
+}
+
+// WithCapacityGuard enables the pre-write statfs capacity guard (issue #135).
+func WithCapacityGuard(c *backingCapacity) ChunkStoreOption {
+	return func(cs *ChunkStore) { cs.capacity = c }
 }
 
 // NewChunkStore returns a store rooted at <storeRoot>/objects.
-func NewChunkStore(storeRoot string) (*ChunkStore, error) {
+func NewChunkStore(storeRoot string, opts ...ChunkStoreOption) (*ChunkStore, error) {
 	root := filepath.Join(storeRoot, "objects")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", root, err)
 	}
 	cs := &ChunkStore{root: root}
+	for _, opt := range opts {
+		opt(cs)
+	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, fmt.Errorf("read chunk root %s: %w", root, err)
@@ -142,6 +177,16 @@ func (cs *ChunkStore) putUnlocked(hash, data []byte) (bool, error) {
 	if _, err := os.Stat(p); err == nil {
 		return false, nil
 	}
+	// Pre-write capacity guard (issue #135): reject a write that would not fit
+	// in the backing store's free space with EDQUOT, before touching the data
+	// path that stalls when a JuiceFS directory quota is full. Placed after the
+	// dedup stat so a re-put of already-stored content (which writes nothing) is
+	// never rejected.
+	if cs.capacity != nil {
+		if err := cs.capacity.check(cs.root, int64(len(data))); err != nil {
+			return false, err
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return false, fmt.Errorf("mkdir %s: %w", filepath.Dir(p), err)
 	}
@@ -164,25 +209,76 @@ func (cs *ChunkStore) putUnlocked(hash, data []byte) (bool, error) {
 		cleanupTmp()
 		return false, fmt.Errorf("chmod chunk: %w", err)
 	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		cleanupTmp()
-		return false, fmt.Errorf("write chunk: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		cleanupTmp()
-		return false, fmt.Errorf("sync chunk: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		cleanupTmp()
-		return false, fmt.Errorf("close chunk: %w", err)
+	// syncWriteClose owns tmp on every non-nil return (it closes and removes it,
+	// abandoning a stalled write in the background), so no cleanupTmp() here.
+	if err := cs.syncWriteClose(tmp, tmpName, data); err != nil {
+		return false, err
 	}
 	if err := os.Rename(tmpName, p); err != nil {
 		cleanupTmp()
 		return false, fmt.Errorf("rename %s -> %s: %w", tmpName, p, err)
 	}
 	return true, nil
+}
+
+// syncWriteClose writes data to tmp, fsyncs, and closes it, leaving tmpName
+// ready to rename on a nil return. On any error it closes and removes tmp.
+//
+// When writeTimeout is set and the write+fsync blocks past it — a full JuiceFS
+// directory quota stalls fsync instead of returning EDQUOT (issue #135) — it
+// abandons the operation and returns errBackingStall so the caller fails the
+// request promptly. The stalled syscall cannot be interrupted, so its fd and
+// temp file are reclaimed in the background once the backing store finally
+// returns; the rename never runs, so no partial chunk becomes visible.
+func (cs *ChunkStore) syncWriteClose(tmp *os.File, tmpName string, data []byte) error {
+	if cs.writeTimeout <= 0 {
+		if err := cs.writeSync(tmp, data); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("write chunk: %w", err)
+		}
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("close chunk: %w", err)
+		}
+		return nil
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cs.writeSync(tmp, data) }()
+
+	timer := time.NewTimer(cs.writeTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		closeErr := tmp.Close()
+		if err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("write chunk: %w", err)
+		}
+		return nil
+	case <-timer.C:
+		go func() {
+			<-done // wait out the stalled syscall so cleanup cannot race it
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+		}()
+		return errBackingStall
+	}
+}
+
+// writeSync writes data to f and fsyncs it, honoring the syncFn test seam.
+func (cs *ChunkStore) writeSync(f *os.File, data []byte) error {
+	if cs.syncFn != nil {
+		return cs.syncFn(f, data)
+	}
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // Delete removes the on-disk file for hash. Idempotent: missing files

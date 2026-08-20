@@ -48,6 +48,13 @@ type rawQuota struct {
 	// (e.g. /jfs). Required when backend is "juicefs": tenant dirs under
 	// tenants_root map to quota paths relative to this root.
 	JuicefsMountRoot string `yaml:"juicefs_mount_root"`
+	// BackingWriteTimeoutMS bounds a single chunk write+fsync to the backing
+	// store. On a full JuiceFS directory quota the fsync blocks instead of
+	// returning EDQUOT (issue #135); this cap turns that stall into an EDQUOT
+	// the client surfaces, keeping the mount usable. nil ->
+	// defaultBackingWriteTimeout for the juicefs backend, disabled for ext4;
+	// 0 disables.
+	BackingWriteTimeoutMS *int64 `yaml:"backing_write_timeout_ms"`
 }
 
 type rawStore struct {
@@ -275,7 +282,22 @@ type Config struct {
 	// is idempotent, so eventual application is safe. Defaults true; set
 	// ORLOP_QUOTA_APPLY_ASYNC=0 to apply inline (the old behavior).
 	QuotaApplyAsync bool
+	// BackingWriteTimeout bounds a single chunk write+fsync to the backing
+	// store, converting a full-quota fsync stall into EDQUOT (issue #135).
+	// 0 disables the watchdog. Defaulted for the juicefs backend.
+	BackingWriteTimeout time.Duration
+	// GuardBackingCapacity pre-rejects a chunk write with EDQUOT when a statfs
+	// of the backing store shows less free space than the incoming chunk
+	// (issue #135). Enabled for the juicefs backend, whose directory quota
+	// surfaces through statfs.
+	GuardBackingCapacity bool
 }
+
+// defaultBackingWriteTimeout bounds a chunk write+fsync on the juicefs backend
+// when quota.backing_write_timeout_ms is unset. Well under the FUSE client's
+// request patience and a k3s node-health window, generous enough not to trip
+// on a slow-but-healthy fsync.
+const defaultBackingWriteTimeout = 20 * time.Second
 
 // defaultQuotaBurstMarginBytes is the ext4 hard-limit burst buffer applied above
 // a tenant's accounted grant when quota.burst_margin_bytes is unset.
@@ -319,6 +341,17 @@ func resolveQuotaBurstMargin(v *int64) int64 {
 		return 0
 	}
 	return *v
+}
+
+// resolveBackingWriteTimeout maps the optional millisecond config value to a
+// duration. nil (unset) and non-positive both yield 0; the backend switch
+// applies defaultBackingWriteTimeout for juicefs only when the field was unset,
+// so an explicit 0 stays a deliberate operator disable.
+func resolveBackingWriteTimeout(ms *int64) time.Duration {
+	if ms == nil || *ms <= 0 {
+		return 0
+	}
+	return time.Duration(*ms) * time.Millisecond
 }
 
 type TenantConfig struct {
@@ -405,6 +438,7 @@ func LoadConfig(path string) (Config, error) {
 		QuotaJuicefsMountRoot: absOrSelf(raw.Quota.JuicefsMountRoot),
 		QuotaJuicefsMetaURL:   os.Getenv("ORLOP_JFS_META_URL"),
 		QuotaApplyAsync:       envBoolDefault("ORLOP_QUOTA_APPLY_ASYNC", true),
+		BackingWriteTimeout:   resolveBackingWriteTimeout(raw.Quota.BackingWriteTimeoutMS),
 	}
 
 	if cfg.OpsBind == "" {
@@ -422,6 +456,16 @@ func LoadConfig(path string) (Config, error) {
 			if cfg.QuotaJuicefsMetaURL == "" {
 				return Config{}, fmt.Errorf("ORLOP_JFS_META_URL is required for the juicefs quota backend")
 			}
+		}
+		// A full JuiceFS directory quota stalls the backing fsync instead of
+		// returning EDQUOT (issue #135). Guard the data-plane write path so the
+		// stall surfaces as EDQUOT rather than a hung mount: a statfs pre-check
+		// (the quota shows through statfs) plus a write watchdog for the lag
+		// window. The watchdog default applies only when unset, so an explicit
+		// backing_write_timeout_ms: 0 stays a deliberate disable.
+		cfg.GuardBackingCapacity = true
+		if raw.Quota.BackingWriteTimeoutMS == nil {
+			cfg.BackingWriteTimeout = defaultBackingWriteTimeout
 		}
 	default:
 		return Config{}, fmt.Errorf("quota.backend must be \"ext4\" or \"juicefs\", got %q", cfg.QuotaBackend)

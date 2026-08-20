@@ -178,7 +178,7 @@ func (s *serverState) registerTenant(w http.ResponseWriter, r *http.Request) {
 	}
 
 	routesDB := filepath.Join(metaTenantDir, "routes.db")
-	ts, err := openTenantState(req.TenantID, req.Name, storeRoot, routesDB, s.adminCfg.LeaseCfg, s.conns, s.audit, s.metrics)
+	ts, err := openTenantState(req.TenantID, req.Name, storeRoot, routesDB, s.adminCfg.LeaseCfg, s.conns, s.audit, s.metrics, s.chunkStoreOpts...)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "open_tenant_failed", err.Error())
 		return
