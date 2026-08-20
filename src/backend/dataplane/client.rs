@@ -1262,4 +1262,15 @@ mod parse_response_tests {
         assert!(backend_recovery(&err).is_none());
         assert_eq!(crate::backend::backend_errno(&err, libc::EIO), libc::ENOENT);
     }
+
+    #[test]
+    fn parse_response_preserves_capacity_errno() {
+        for expected in [errno::ENOSPC, errno::EDQUOT] {
+            let payload =
+                rmp_serde::to_vec_named(&ErrorPayload::new(expected, "quota full")).unwrap();
+            let frame = Frame::error_response(Op::ChunkPut, 1, payload);
+            let err = parse_response(Op::ChunkPut, frame).expect_err("error frame");
+            assert_eq!(crate::backend::backend_errno(&err, libc::EIO), expected);
+        }
+    }
 }

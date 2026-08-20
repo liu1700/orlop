@@ -2,13 +2,47 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"syscall"
 	"testing"
 
 	"github.com/liu1700/orlop/cmd/orlop-server/dataplane"
 	"github.com/vmihailenco/msgpack/v5"
 	"lukechampine.com/blake3"
 )
+
+type sqliteCodeError int
+
+func (e sqliteCodeError) Error() string { return "sqlite full" }
+func (e sqliteCodeError) Code() int     { return int(e) }
+
+func TestStorageErrToWirePreservesCapacityErrnos(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int32
+	}{
+		{"enospc", fmt.Errorf("write chunk: %w", syscall.ENOSPC), dataplane.ErrnoENOSPC},
+		{"edquot", fmt.Errorf("sync chunk: %w", syscall.EDQUOT), dataplane.ErrnoEDQUOT},
+		{"sqlite full", fmt.Errorf("commit manifest: %w", sqliteCodeError(13)), dataplane.ErrnoENOSPC},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := storageErrToWire(tt.err, dataplane.ErrnoEIO)
+			if got.Errno != tt.want {
+				t.Fatalf("errno = %d, want %d", got.Errno, tt.want)
+			}
+		})
+	}
+}
+
+func TestStorageErrToWireKeepsCallerFallback(t *testing.T) {
+	got := storageErrToWire(errors.New("hash mismatch"), dataplane.ErrnoEINVAL)
+	if got.Errno != dataplane.ErrnoEINVAL {
+		t.Fatalf("errno = %d, want EINVAL (%d)", got.Errno, dataplane.ErrnoEINVAL)
+	}
+}
 
 // Issue #103: when a CAS conflict propagates a *VersionConflictError,
 // buildCasConflictHint surfaces the server's actual version on the wire so

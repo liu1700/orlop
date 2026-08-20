@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -562,7 +563,7 @@ func handleManifestPut(s *serverState, tenant *tenantState, ident Identity, w *f
 			writeFrameError(w, frame.Op, frame.RID, payload)
 			return
 		}
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEIO(err.Error()))
+		writeFrameError(w, frame.Op, frame.RID, storageErrToWire(err, dataplane.ErrnoEIO))
 		return
 	}
 	sendResp(w, frame, dataplane.ManifestPutResponse{Version: newVersion})
@@ -604,8 +605,25 @@ func manifestErrToWire(err error) dataplane.ErrorPayload {
 	case errors.Is(err, ErrIsDir):
 		return dataplane.ErrEISDIR(err.Error())
 	default:
-		return dataplane.ErrEIO(err.Error())
+		return storageErrToWire(err, dataplane.ErrnoEIO)
 	}
+}
+
+// storageErrToWire preserves capacity errors from the backing filesystem at
+// the data-plane boundary. SQLite reports a full backing store as SQLITE_FULL
+// (primary result code 13), which is the metadata-path equivalent of ENOSPC.
+func storageErrToWire(err error, fallback int32) dataplane.ErrorPayload {
+	switch {
+	case errors.Is(err, syscall.EDQUOT):
+		return dataplane.ErrEDQUOT(err.Error())
+	case errors.Is(err, syscall.ENOSPC):
+		return dataplane.ErrENOSPC(err.Error())
+	}
+	var sqliteErr interface{ Code() int }
+	if errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == 13 { // SQLITE_FULL
+		return dataplane.ErrENOSPC(err.Error())
+	}
+	return dataplane.ErrorPayload{Errno: fallback, Message: err.Error()}
 }
 
 func handleManifestDelete(s *serverState, tenant *tenantState, ident Identity, w *frameWriter, frame dataplane.Frame) {
@@ -941,7 +959,7 @@ func handleChunkPut(s *serverState, tenant *tenantState, ident Identity, w *fram
 			writeFrameError(w, frame.Op, frame.RID, dataplane.ErrESTALE(err.Error()))
 			return
 		}
-		writeFrameError(w, frame.Op, frame.RID, dataplane.ErrEINVAL(err.Error()))
+		writeFrameError(w, frame.Op, frame.RID, storageErrToWire(err, dataplane.ErrnoEINVAL))
 		return
 	}
 	// Track the chunk with refcount 0 so one that is uploaded here but whose manifest commit never

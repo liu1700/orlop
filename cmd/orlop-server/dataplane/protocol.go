@@ -142,7 +142,9 @@ const (
 	ErrnoEEXIST    int32 = 17
 	ErrnoENOTDIR   int32 = 20
 	ErrnoEISDIR    int32 = 21
+	ErrnoENOSPC    int32 = 28
 	ErrnoENOTEMPTY int32 = 39
+	ErrnoEDQUOT    int32 = 122
 	ErrnoESTALE    int32 = 116
 	ErrnoEBUSY     int32 = 16
 )
