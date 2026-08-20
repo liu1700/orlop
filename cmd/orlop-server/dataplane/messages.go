@@ -102,6 +102,8 @@ func ErrENOENT(msg string) ErrorPayload    { return ErrorPayload{Errno: ErrnoENO
 func ErrEINVAL(msg string) ErrorPayload    { return ErrorPayload{Errno: ErrnoEINVAL, Message: msg} }
 func ErrESTALE(msg string) ErrorPayload    { return ErrorPayload{Errno: ErrnoESTALE, Message: msg} }
 func ErrEEXIST(msg string) ErrorPayload    { return ErrorPayload{Errno: ErrnoEEXIST, Message: msg} }
+func ErrENOSPC(msg string) ErrorPayload    { return ErrorPayload{Errno: ErrnoENOSPC, Message: msg} }
+func ErrEDQUOT(msg string) ErrorPayload    { return ErrorPayload{Errno: ErrnoEDQUOT, Message: msg} }
 func ErrENOTEMPTY(msg string) ErrorPayload { return ErrorPayload{Errno: ErrnoENOTEMPTY, Message: msg} }
 func ErrENOTDIR(msg string) ErrorPayload   { return ErrorPayload{Errno: ErrnoENOTDIR, Message: msg} }
 func ErrEISDIR(msg string) ErrorPayload    { return ErrorPayload{Errno: ErrnoEISDIR, Message: msg} }

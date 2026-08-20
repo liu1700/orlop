@@ -107,7 +107,9 @@ pub mod errno {
     pub const EXDEV: i32 = 18;
     pub const ENOTDIR: i32 = 20;
     pub const EISDIR: i32 = 21;
+    pub const ENOSPC: i32 = 28;
     pub const ENOTEMPTY: i32 = 39;
+    pub const EDQUOT: i32 = 122;
     pub const EBUSY: i32 = 16;
     /// Custom: stale or unknown lease id (maps to EINVAL on the FUSE layer).
     pub const LEASE_UNKNOWN: i32 = 100;
