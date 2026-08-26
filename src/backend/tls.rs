@@ -1,9 +1,22 @@
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+
 /// Client-side mTLS identity used to dial the per-tenant `orlop-server`.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlsIdentity {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
     pub ca_pem: Vec<u8>,
+}
+
+/// Renewal-aware identity source shared by every data-plane connection for a
+/// hosted mount. Existing TLS sessions keep their negotiated identity; the
+/// next dial snapshots the latest cert/key pair.
+pub type SharedTlsIdentity = Arc<RwLock<TlsIdentity>>;
+
+pub fn shared_tls_identity(identity: TlsIdentity) -> SharedTlsIdentity {
+    Arc::new(RwLock::new(identity))
 }
 
 impl TlsIdentity {

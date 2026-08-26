@@ -73,6 +73,24 @@ func (q *Queries) GetAgentEnrollment(ctx context.Context, id pgtype.UUID) (Agent
 	return i, err
 }
 
+const getEnrollmentByFingerprint = `-- name: GetEnrollmentByFingerprint :one
+SELECT id, user_id, cert_serial, cert_not_after, enrolled_at FROM agent_enrollments
+WHERE lower(cert_serial) = lower($1)
+`
+
+func (q *Queries) GetEnrollmentByFingerprint(ctx context.Context, lower string) (AgentEnrollment, error) {
+	row := q.db.QueryRow(ctx, getEnrollmentByFingerprint, lower)
+	var i AgentEnrollment
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.CertSerial,
+		&i.CertNotAfter,
+		&i.EnrolledAt,
+	)
+	return i, err
+}
+
 const listActiveEnrollmentsForUser = `-- name: ListActiveEnrollmentsForUser :many
 SELECT id, user_id, cert_serial, cert_not_after, enrolled_at FROM agent_enrollments
 WHERE user_id = $1 AND cert_not_after > now()

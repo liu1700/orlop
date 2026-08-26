@@ -15,22 +15,24 @@ const acquireMountLease = `-- name: AcquireMountLease :one
 UPDATE disk_allocations
    SET bound_agent_id   = $2,
        bound_at         = CASE WHEN bound_agent_id = $2 THEN bound_at ELSE now() END,
-       lease_expires_at = now() + $3::interval
+       lease_expires_at = now() + $3::interval,
+       mount_lease_token_hash = $4::text
  WHERE id = $1
    AND revoked_at IS NULL
-   AND ($4::boolean
+   AND ($5::boolean
         OR bound_agent_id IS NULL
         OR bound_agent_id = $2
         OR lease_expires_at IS NULL
         OR lease_expires_at <= now())
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 type AcquireMountLeaseParams struct {
-	ID           pgtype.UUID
-	BoundAgentID pgtype.UUID
-	Ttl          pgtype.Interval
-	Force        bool
+	ID             pgtype.UUID
+	BoundAgentID   pgtype.UUID
+	Ttl            pgtype.Interval
+	LeaseTokenHash string
+	Force          bool
 }
 
 // Claim the allocation for $2 and set a fresh mount lease. An allocation belongs to a
@@ -50,6 +52,7 @@ func (q *Queries) AcquireMountLease(ctx context.Context, arg AcquireMountLeasePa
 		arg.ID,
 		arg.BoundAgentID,
 		arg.Ttl,
+		arg.LeaseTokenHash,
 		arg.Force,
 	)
 	var i DiskAllocation
@@ -66,6 +69,7 @@ func (q *Queries) AcquireMountLease(ctx context.Context, arg AcquireMountLeasePa
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
@@ -78,7 +82,7 @@ UPDATE disk_allocations
    AND user_id = $2
    AND revoked_at IS NULL
    AND bound_agent_id IS NULL
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 type BindAllocationParams struct {
@@ -103,6 +107,7 @@ func (q *Queries) BindAllocation(ctx context.Context, arg BindAllocationParams) 
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
@@ -141,11 +146,12 @@ const forceReleaseMountLease = `-- name: ForceReleaseMountLease :one
 UPDATE disk_allocations
    SET bound_agent_id   = NULL,
        bound_at         = NULL,
-       lease_expires_at = NULL
+       lease_expires_at = NULL,
+       mount_lease_token_hash = NULL
  WHERE id = $1
    AND user_id = $2
    AND revoked_at IS NULL
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 type ForceReleaseMountLeaseParams struct {
@@ -169,12 +175,13 @@ func (q *Queries) ForceReleaseMountLease(ctx context.Context, arg ForceReleaseMo
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
 
 const getAllocation = `-- name: GetAllocation :one
-SELECT id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id FROM disk_allocations WHERE id = $1
+SELECT id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash FROM disk_allocations WHERE id = $1
 `
 
 func (q *Queries) GetAllocation(ctx context.Context, id pgtype.UUID) (DiskAllocation, error) {
@@ -193,12 +200,13 @@ func (q *Queries) GetAllocation(ctx context.Context, id pgtype.UUID) (DiskAlloca
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
 
 const getAllocationByAgent = `-- name: GetAllocationByAgent :one
-SELECT id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id FROM disk_allocations
+SELECT id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash FROM disk_allocations
 WHERE agent_id = $1 AND revoked_at IS NULL
 `
 
@@ -221,6 +229,7 @@ func (q *Queries) GetAllocationByAgent(ctx context.Context, agentID pgtype.Text)
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
@@ -228,7 +237,7 @@ func (q *Queries) GetAllocationByAgent(ctx context.Context, agentID pgtype.Text)
 const insertAllocation = `-- name: InsertAllocation :one
 INSERT INTO disk_allocations (user_id, size_bytes)
 VALUES ($1, $2)
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 type InsertAllocationParams struct {
@@ -252,12 +261,13 @@ func (q *Queries) InsertAllocation(ctx context.Context, arg InsertAllocationPara
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
 
 const listAllocationsForUser = `-- name: ListAllocationsForUser :many
-SELECT id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id FROM disk_allocations
+SELECT id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash FROM disk_allocations
 WHERE user_id = $1 AND user_id IS NOT NULL AND revoked_at IS NULL
 ORDER BY created_at DESC
 `
@@ -284,6 +294,7 @@ func (q *Queries) ListAllocationsForUser(ctx context.Context, userID pgtype.UUID
 			&i.AgentID,
 			&i.PurgedAt,
 			&i.TenantID,
+			&i.MountLeaseTokenHash,
 		); err != nil {
 			return nil, err
 		}
@@ -361,7 +372,7 @@ UPDATE disk_allocations
  WHERE id = $1
    AND revoked_at IS NOT NULL
    AND purged_at IS NULL
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 // CAS-claim the purge of a revoked allocation: only one caller transitions
@@ -383,6 +394,7 @@ func (q *Queries) MarkAllocationPurged(ctx context.Context, id pgtype.UUID) (Dis
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
@@ -409,28 +421,50 @@ func (q *Queries) ReassignAgentAllocation(ctx context.Context, arg ReassignAgent
 
 const refreshMountLease = `-- name: RefreshMountLease :one
 UPDATE disk_allocations
-   SET lease_expires_at = now() + $3::interval
+   SET bound_agent_id = $2,
+       lease_expires_at = now() + $3::interval,
+       mount_lease_token_hash = CASE
+           WHEN $4::text <> ''
+           THEN $4::text
+           ELSE mount_lease_token_hash
+       END
  WHERE id = $1
-   AND bound_agent_id = $2
    AND revoked_at IS NULL
    AND lease_expires_at IS NOT NULL
    AND lease_expires_at > now()
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+   AND (($5::text <> ''
+         AND mount_lease_token_hash = $5::text)
+        OR ($5::text = ''
+            AND mount_lease_token_hash IS NULL
+            AND bound_agent_id = $2))
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 type RefreshMountLeaseParams struct {
-	ID           pgtype.UUID
-	BoundAgentID pgtype.UUID
-	Ttl          pgtype.Interval
+	ID                pgtype.UUID
+	BoundAgentID      pgtype.UUID
+	Ttl               pgtype.Interval
+	NewLeaseTokenHash string
+	LeaseTokenHash    string
 }
 
+// The token is the stable identity of one mount process. It survives leaf-cert
+// renewal (which changes bound_agent_id) but a takeover replaces it, so a
+// displaced process cannot refresh its way back in. Legacy clients omit the
+// token and retain the enrollment-id guard during a rolling upgrade.
 // Expiry remains a hard boundary (issue #95): after it, the holder must go
 // through AcquireMountLease so renewal follows the same takeover rules as any
 // other claimant. Matching bound_agent_id only proves that no takeover has
 // committed yet; without the expiry guard, a stale refresh can win a race
 // against a waiter and resurrect ownership after its promised deadline.
 func (q *Queries) RefreshMountLease(ctx context.Context, arg RefreshMountLeaseParams) (DiskAllocation, error) {
-	row := q.db.QueryRow(ctx, refreshMountLease, arg.ID, arg.BoundAgentID, arg.Ttl)
+	row := q.db.QueryRow(ctx, refreshMountLease,
+		arg.ID,
+		arg.BoundAgentID,
+		arg.Ttl,
+		arg.NewLeaseTokenHash,
+		arg.LeaseTokenHash,
+	)
 	var i DiskAllocation
 	err := row.Scan(
 		&i.ID,
@@ -445,6 +479,7 @@ func (q *Queries) RefreshMountLease(ctx context.Context, arg RefreshMountLeasePa
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
@@ -453,19 +488,26 @@ const releaseMountLease = `-- name: ReleaseMountLease :one
 UPDATE disk_allocations
    SET bound_agent_id   = NULL,
        bound_at         = NULL,
-       lease_expires_at = NULL
+       lease_expires_at = NULL,
+       mount_lease_token_hash = NULL
  WHERE id = $1
-   AND (bound_agent_id = $2 OR bound_agent_id IS NULL)
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+   AND (bound_agent_id IS NULL
+        OR ($3::text <> ''
+            AND mount_lease_token_hash = $3::text)
+        OR ($3::text = ''
+            AND mount_lease_token_hash IS NULL
+            AND bound_agent_id = $2))
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 type ReleaseMountLeaseParams struct {
-	ID           pgtype.UUID
-	BoundAgentID pgtype.UUID
+	ID             pgtype.UUID
+	BoundAgentID   pgtype.UUID
+	LeaseTokenHash string
 }
 
 func (q *Queries) ReleaseMountLease(ctx context.Context, arg ReleaseMountLeaseParams) (DiskAllocation, error) {
-	row := q.db.QueryRow(ctx, releaseMountLease, arg.ID, arg.BoundAgentID)
+	row := q.db.QueryRow(ctx, releaseMountLease, arg.ID, arg.BoundAgentID, arg.LeaseTokenHash)
 	var i DiskAllocation
 	err := row.Scan(
 		&i.ID,
@@ -480,6 +522,7 @@ func (q *Queries) ReleaseMountLease(ctx context.Context, arg ReleaseMountLeasePa
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
@@ -489,7 +532,7 @@ UPDATE disk_allocations
    SET revoked_at = COALESCE(revoked_at, now())
  WHERE id = $1
    AND user_id = $2
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 type RevokeAllocationParams struct {
@@ -513,6 +556,7 @@ func (q *Queries) RevokeAllocation(ctx context.Context, arg RevokeAllocationPara
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
@@ -523,7 +567,7 @@ UPDATE disk_allocations
  WHERE id = $1
    AND user_id = $2
    AND revoked_at IS NULL
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 type UpdateAllocationSizeParams struct {
@@ -551,6 +595,7 @@ func (q *Queries) UpdateAllocationSize(ctx context.Context, arg UpdateAllocation
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }
@@ -560,7 +605,7 @@ INSERT INTO disk_allocations (user_id, agent_id, tenant_id, size_bytes)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (agent_id) WHERE revoked_at IS NULL
 DO UPDATE SET user_id = EXCLUDED.user_id
-RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id
+RETURNING id, user_id, size_bytes, created_at, revoked_at, bound_agent_id, bound_at, lease_expires_at, expires_at, agent_id, purged_at, tenant_id, mount_lease_token_hash
 `
 
 type UpsertAgentAllocationParams struct {
@@ -598,6 +643,7 @@ func (q *Queries) UpsertAgentAllocation(ctx context.Context, arg UpsertAgentAllo
 		&i.AgentID,
 		&i.PurgedAt,
 		&i.TenantID,
+		&i.MountLeaseTokenHash,
 	)
 	return i, err
 }

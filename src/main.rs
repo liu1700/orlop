@@ -6,12 +6,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use parking_lot::RwLock;
 use reqwest::StatusCode;
 use serde::Deserialize;
 
 use orlop::agents_md;
 use orlop::audit;
-use orlop::backend::{self, build_stores, TlsIdentity};
+use orlop::backend::{
+    self, build_stores, build_stores_shared, SharedTlsIdentity, TlsIdentity,
+};
 use orlop::config::{Config, EvictionAction, HostedConfig, MountConfig};
 use orlop::enroll::{self, EnrolledCert};
 use orlop::login;
@@ -932,20 +935,55 @@ struct CertManager {
 }
 
 #[derive(Clone)]
+struct CertRotationTargets {
+    data_plane_identity: SharedTlsIdentity,
+    mount_lease: Option<MountLeaseClient>,
+}
+
+impl CertRotationTargets {
+    fn publish(&self, enrolled: &EnrolledCert) -> anyhow::Result<()> {
+        let tls = enroll::load_identity(enrolled).with_context(|| {
+            format!("load renewed identity from {}", enrolled.cert_dir.display())
+        })?;
+        // Build and validate the new reqwest client before publishing either
+        // runtime view, so a malformed renewal cannot strand half the mount on
+        // the new cert and half on the old one.
+        if let Some(client) = &self.mount_lease {
+            // An older control plane cannot rebind a live lease across
+            // enrollment rows. Keep using the still-valid old control identity
+            // until a post-upgrade refresh bootstraps the optional lease token.
+            if client.lease_token().is_some() {
+                client.rotate_identity(enrolled.cert_serial.clone(), &tls)?;
+            }
+        }
+        *self.data_plane_identity.write() = tls;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 struct MountLeaseClient {
-    client: reqwest::blocking::Client,
+    auth: Arc<RwLock<MountLeaseAuth>>,
+    lease_token: Arc<RwLock<Option<String>>>,
     base_url: String,
     allocation_id: String,
-    agent_fingerprint: String,
     /// Acquire with `{"force": true}`: displace a lease that is still live for
     /// a different enrollment (the control plane otherwise answers 409
     /// lease_live). Only affects acquire; refresh/release never send it.
     takeover: bool,
 }
 
+#[derive(Clone)]
+struct MountLeaseAuth {
+    client: reqwest::blocking::Client,
+    agent_fingerprint: String,
+}
+
 #[derive(Deserialize)]
 struct MountLeaseResp {
     expires_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    lease_token: Option<String>,
 }
 
 struct MountLeaseManager {
@@ -960,6 +998,7 @@ struct MountLeaseManager {
 // of the control plane). The server rejects unsafe TTLs that do not leave
 // several of these intervals for refresh and retry.
 const MIN_MOUNT_LEASE_REFRESH_WAIT: Duration = Duration::from_secs(1);
+const MOUNT_LEASE_TOKEN_HEADER: &str = "X-Orlop-Mount-Lease-Token";
 
 impl MountLeaseManager {
     fn acquire(
@@ -979,6 +1018,7 @@ impl MountLeaseManager {
             mountpoint,
             on_eviction,
             takeover,
+            None,
             true,
         )
     }
@@ -992,6 +1032,7 @@ impl MountLeaseManager {
         mountpoint: PathBuf,
         on_eviction: EvictionAction,
         takeover: bool,
+        resume_lease_token: Option<String>,
         release_on_drop: bool,
     ) -> anyhow::Result<Self> {
         let client = MountLeaseClient::new(
@@ -1001,11 +1042,13 @@ impl MountLeaseManager {
             tls,
             takeover,
         )?;
-        let lease = client.acquire()?;
-        eprintln!(
-            "acquired mount lease until {}",
-            lease.expires_at.to_rfc3339()
-        );
+        let (lease, verb) = if let Some(token) = resume_lease_token {
+            *client.lease_token.write() = Some(token);
+            (client.refresh()?, "resumed")
+        } else {
+            (client.acquire()?, "acquired")
+        };
+        eprintln!("{verb} mount lease until {}", lease.expires_at.to_rfc3339());
 
         let (stop, rx) = mpsc::channel();
         let thread_client = client.clone();
@@ -1120,45 +1163,49 @@ impl MountLeaseClient {
         tls: TlsIdentity,
         takeover: bool,
     ) -> anyhow::Result<Self> {
-        let identity =
-            reqwest::Identity::from_pem(&tls.pem_bundle()).context("parse client TLS identity")?;
-        let client = reqwest::blocking::Client::builder()
-            .identity(identity)
-            .timeout(Duration::from_secs(10))
-            .build()
-            .context("build mount lease HTTP client")?;
+        let auth = Self::build_auth(agent_fingerprint, &tls)?;
         Ok(Self {
-            client,
+            auth: Arc::new(RwLock::new(auth)),
+            lease_token: Arc::new(RwLock::new(None)),
             base_url: control_plane_url.trim_end_matches('/').to_string(),
             allocation_id,
-            agent_fingerprint,
             takeover,
         })
     }
 
     fn acquire(&self) -> anyhow::Result<MountLeaseResp> {
-        let mut body = self.body();
+        let (client, mut body) = self.request_snapshot(false);
         // Only include the key when set: an older control plane decodes the
         // lease body with DisallowUnknownFields and would 400 on it.
         if self.takeover {
             body["force"] = serde_json::Value::Bool(true);
         }
-        self.post_lease("", "acquire", &body)
+        let lease = self.post_lease(&client, "", "acquire", &body)?;
+        *self.lease_token.write() = lease.lease_token.clone();
+        Ok(lease)
     }
 
     fn refresh(&self) -> anyhow::Result<MountLeaseResp> {
-        self.post_lease("/refresh", "refresh", &self.body())
+        let (client, body) = self.request_snapshot(true);
+        let lease = self.post_lease(&client, "/refresh", "refresh", &body)?;
+        if let Some(token) = lease.lease_token.as_ref() {
+            *self.lease_token.write() = Some(token.clone());
+        }
+        Ok(lease)
     }
 
     fn post_lease(
         &self,
+        client: &reqwest::blocking::Client,
         suffix: &str,
         op: &str,
         body: &serde_json::Value,
     ) -> anyhow::Result<MountLeaseResp> {
-        let resp = self
-            .client
+        let resp = client
             .post(self.url(suffix))
+            // Capability negotiation belongs in a header so an older control
+            // plane ignores it instead of rejecting an unknown JSON field.
+            .header(MOUNT_LEASE_TOKEN_HEADER, "1")
             .json(body)
             .send()
             .with_context(|| format!("POST {}", self.url(suffix)))?;
@@ -1166,10 +1213,11 @@ impl MountLeaseClient {
     }
 
     fn release(&self) -> anyhow::Result<()> {
-        let resp = self
-            .client
+        let (client, body) = self.request_snapshot(true);
+        let resp = client
             .delete(self.url(""))
-            .json(&self.body())
+            .header(MOUNT_LEASE_TOKEN_HEADER, "1")
+            .json(&body)
             .send()
             .with_context(|| format!("DELETE {}", self.url("")))?;
         if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
@@ -1200,8 +1248,47 @@ impl MountLeaseClient {
         )
     }
 
-    fn body(&self) -> serde_json::Value {
-        serde_json::json!({ "agent_fingerprint": self.agent_fingerprint })
+    /// Atomically pair the HTTP client's mTLS identity with the matching
+    /// serial in the JSON body. This avoids a renewal race that direct-mTLS
+    /// control deployments reject as a fingerprint/certificate mismatch.
+    fn request_snapshot(
+        &self,
+        include_lease_token: bool,
+    ) -> (reqwest::blocking::Client, serde_json::Value) {
+        let auth = self.auth.read();
+        let mut body = serde_json::json!({
+            "agent_fingerprint": auth.agent_fingerprint,
+        });
+        if include_lease_token {
+            if let Some(token) = self.lease_token.read().as_ref() {
+                body["lease_token"] = serde_json::Value::String(token.clone());
+            }
+        }
+        (auth.client.clone(), body)
+    }
+
+    fn rotate_identity(&self, agent_fingerprint: String, tls: &TlsIdentity) -> anyhow::Result<()> {
+        let auth = Self::build_auth(agent_fingerprint, tls)?;
+        *self.auth.write() = auth;
+        Ok(())
+    }
+
+    fn lease_token(&self) -> Option<String> {
+        self.lease_token.read().clone()
+    }
+
+    fn build_auth(agent_fingerprint: String, tls: &TlsIdentity) -> anyhow::Result<MountLeaseAuth> {
+        let identity =
+            reqwest::Identity::from_pem(&tls.pem_bundle()).context("parse client TLS identity")?;
+        let client = reqwest::blocking::Client::builder()
+            .identity(identity)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("build mount lease HTTP client")?;
+        Ok(MountLeaseAuth {
+            client,
+            agent_fingerprint,
+        })
     }
 }
 
@@ -1236,6 +1323,12 @@ fn classify_lease_error(status: StatusCode, body: &str, op: &str) -> anyhow::Err
     // 119 401s/hour against a deleted allocation).
     if status == StatusCode::UNAUTHORIZED && body.contains("invalid_client") {
         return anyhow::anyhow!("mount lease lost");
+    }
+    // An expired enrollment is recoverable: the certificate-renewal loop may
+    // publish a fresh identity after this request. Keep it off the terminal
+    // eviction substrings so the healthy filesystem is not aborted meanwhile.
+    if status == StatusCode::UNAUTHORIZED && body.contains("expired_client") {
+        return anyhow::anyhow!("{op} mount lease waiting for certificate renewal: {status}");
     }
     anyhow::anyhow!("{op} mount lease failed: {status} {body}")
 }
@@ -1325,8 +1418,16 @@ impl CertManager {
         creds_override: Option<&Path>,
         initial: EnrolledCert,
         audit: audit::AuditLog,
+        rotation_targets: CertRotationTargets,
     ) -> anyhow::Result<Self> {
-        Self::start_with_cleanup(hosted, creds_override, initial, audit, true)
+        Self::start_with_cleanup(
+            hosted,
+            creds_override,
+            initial,
+            audit,
+            rotation_targets,
+            true,
+        )
     }
 
     fn start_with_cleanup(
@@ -1334,6 +1435,7 @@ impl CertManager {
         creds_override: Option<&Path>,
         initial: EnrolledCert,
         audit: audit::AuditLog,
+        rotation_targets: CertRotationTargets,
         shred_on_drop: bool,
     ) -> anyhow::Result<Self> {
         let cert_dir = cert_dir_for_hosted(&hosted, creds_override)?;
@@ -1357,7 +1459,14 @@ impl CertManager {
         let (stop, rx) = mpsc::channel();
         let thread_cert_dir = cert_dir.clone();
         let handle = thread::spawn(move || {
-            cert_renewal_loop(&rx, &mut tokens, &thread_cert_dir, initial, &audit);
+            cert_renewal_loop(
+                &rx,
+                &mut tokens,
+                &thread_cert_dir,
+                initial,
+                &audit,
+                &rotation_targets,
+            );
         });
         Ok(Self {
             stop,
@@ -1391,6 +1500,7 @@ fn cert_renewal_loop(
     cert_dir: &Path,
     mut current: EnrolledCert,
     audit: &audit::AuditLog,
+    rotation_targets: &CertRotationTargets,
 ) {
     let mut failure_count = 0u32;
     loop {
@@ -1411,7 +1521,10 @@ fn cert_renewal_loop(
         // in-cluster — unit tests cover the response parsing.
         maybe_refresh_enroll_token(tokens, cert_dir);
 
-        match enroll_with_tokens(tokens, cert_dir, audit) {
+        match enroll_with_tokens(tokens, cert_dir, audit).and_then(|enrolled| {
+            rotation_targets.publish(&enrolled)?;
+            Ok(enrolled)
+        }) {
             Ok(enrolled) => {
                 eprintln!(
                     "renewed hosted client certificate serial={} expires_at={}",
@@ -1655,10 +1768,10 @@ fn resolve_eviction_action(
 /// `orlop mount --from-env` entry point: synthesizes a hosted `Config` +
 /// on-disk `Credentials` from [`EnvMountSpec`] and routes through the standard
 /// `run_mount_payload` engine, including `CertManager` renewal (re-enrolls
-/// ~10 min before the 1h cert expires). Note the live mTLS connection does NOT
-/// hot-swap a renewed cert — rustls captured the identity at dial time, so it
-/// takes effect on the next dial. Intentional: the common one-shot pod exits
-/// before the renewal ever fires.
+/// ~10 min before the 1h cert expires). Existing mTLS sessions keep the identity
+/// negotiated at dial time; renewal atomically publishes the new cert to the
+/// lease client and to the shared identity source used by the next data-plane
+/// dial.
 fn run_env_mount(
     no_inject: bool,
     on_eviction: Option<EvictionAction>,
@@ -1843,6 +1956,7 @@ fn run_mount_payload(
             let enrolled = enroll_for_mount(&hosted, creds_override, &audit)?;
             let tls = enroll::load_identity(&enrolled)
                 .with_context(|| format!("load identity from {}", enrolled.cert_dir.display()))?;
+            let shared_tls = backend::shared_tls_identity(tls.clone());
             let allocation_id = enrolled.allocation_id.clone().ok_or_else(|| {
                 anyhow!(
                     "no allocation_id in enrollment response; the host must re-enroll \
@@ -1894,7 +2008,11 @@ fn run_mount_payload(
                 addr: Some(addr),
                 server_name: None,
             };
-            let backends = build_stores(&[mount_cfg], Some(&tls), Arc::clone(&chunk_cache))?;
+            let backends = build_stores_shared(
+                &[mount_cfg],
+                Some(&shared_tls),
+                Arc::clone(&chunk_cache),
+            )?;
             for b in &backends {
                 b.store.set_allocation_id(Some(allocation_id.clone()));
                 // Ensure the agent's disk dir exists so its mount root is writable.
@@ -1908,8 +2026,17 @@ fn run_mount_payload(
                 }
             }
             let handoff_enrolled = enrolled.clone();
-            let cert_manager = CertManager::start(hosted, creds_override, enrolled, audit.clone())
-                .with_context(|| "start hosted client certificate renewal task")?;
+            let cert_manager = CertManager::start(
+                hosted,
+                creds_override,
+                enrolled,
+                audit.clone(),
+                CertRotationTargets {
+                    data_plane_identity: shared_tls,
+                    mount_lease: lease_manager.as_ref().map(|manager| manager.client.clone()),
+                },
+            )
+            .with_context(|| "start hosted client certificate renewal task")?;
             (
                 backends,
                 Some(cert_manager),
@@ -2021,6 +2148,9 @@ fn run_mount_payload(
             mountpoint: mountpoint.clone(),
             credentials: creds_override.map(Path::to_path_buf),
             enrolled: handoff_enrolled,
+            mount_lease_token: _lease_manager
+                .as_ref()
+                .and_then(|manager| manager.client.lease_token()),
         };
         let _handoff_service =
             orlop::handoff::Service::start(runtime, fuse_fd, gateway, Arc::clone(&gate))
@@ -2123,15 +2253,18 @@ fn prepare_handoff_successor(
     )?;
 
     let (backends, cert_manager, lease_manager) = if let Some(hosted) = cfg.hosted.clone() {
-        let enrolled = runtime
+        let mut enrolled = runtime
             .enrolled
             .clone()
             .ok_or_else(|| anyhow!("hosted handoff did not include enrollment metadata"))?;
+        enroll::refresh_cert_metadata_from_dir(&mut enrolled)
+            .context("refresh handoff certificate metadata from disk")?;
         if chrono::Utc::now() >= enrolled.expires_at {
             anyhow::bail!("cannot resume with an expired client certificate");
         }
         let tls = enroll::load_identity(&enrolled)
             .with_context(|| format!("load identity from {}", enrolled.cert_dir.display()))?;
+        let shared_tls = backend::shared_tls_identity(tls.clone());
         let allocation_id = enrolled
             .allocation_id
             .clone()
@@ -2149,9 +2282,11 @@ fn prepare_handoff_successor(
                 // A predecessor built before on_eviction existed serialized no
                 // value; keep its era's behavior (clean unmount) in that case.
                 cfg.on_eviction.unwrap_or(EvictionAction::Unmount),
-                // The successor re-acquires under the SAME enrollment (the
-                // transferred cert), which a live lease never blocks.
+                // A token-aware successor refreshes the predecessor's lease;
+                // an older transfer without a token falls back to the legacy
+                // same-enrollment acquire path.
                 false,
+                runtime.mount_lease_token.clone(),
                 false,
             )?)
         };
@@ -2164,7 +2299,11 @@ fn prepare_handoff_successor(
             addr: Some(enrolled.server_addr.clone()),
             server_name: None,
         };
-        let backends = build_stores(&[mount_cfg], Some(&tls), Arc::clone(&chunk_cache))?;
+        let backends = build_stores_shared(
+            &[mount_cfg],
+            Some(&shared_tls),
+            Arc::clone(&chunk_cache),
+        )?;
         for backend in &backends {
             backend.store.set_allocation_id(Some(allocation_id.clone()));
         }
@@ -2173,6 +2312,10 @@ fn prepare_handoff_successor(
             runtime.credentials.as_deref(),
             enrolled,
             audit.clone(),
+            CertRotationTargets {
+                data_plane_identity: shared_tls,
+                mount_lease: lease_manager.as_ref().map(|manager| manager.client.clone()),
+            },
             false,
         )
         .context("start successor certificate renewal task")?;
@@ -2497,6 +2640,20 @@ mod lease_error_classification {
     }
 
     #[test]
+    fn unauthorized_expired_client_is_retryable() {
+        let e = classify_lease_error(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"expired_client"}"#,
+            "refresh",
+        );
+        let msg = e.to_string();
+        for terminal in ["revoked", "lease lost", "already mounted by another agent"] {
+            assert!(!msg.contains(terminal), "{msg:?} matched {terminal:?}");
+        }
+        assert!(msg.contains("certificate renewal"), "msg = {msg}");
+    }
+
+    #[test]
     fn other_5xx_stays_retryable() {
         let e = classify_lease_error(StatusCode::BAD_GATEWAY, "upstream timeout", "refresh");
         let msg = e.to_string();
@@ -2507,6 +2664,46 @@ mod lease_error_classification {
                 "transient {msg:?} accidentally classified as terminal ({terminal})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mount_lease_auth_rotation {
+    use super::*;
+
+    fn client() -> MountLeaseClient {
+        MountLeaseClient {
+            auth: Arc::new(RwLock::new(MountLeaseAuth {
+                client: reqwest::blocking::Client::new(),
+                agent_fingerprint: "OLD-SERIAL".into(),
+            })),
+            lease_token: Arc::new(RwLock::new(Some("lease-capability".into()))),
+            base_url: "http://127.0.0.1".into(),
+            allocation_id: "alloc".into(),
+            takeover: false,
+        }
+    }
+
+    #[test]
+    fn refresh_snapshot_tracks_rotated_serial_and_preserves_lease_token() {
+        let client = client();
+        let (_, before) = client.request_snapshot(true);
+        assert_eq!(before["agent_fingerprint"], "OLD-SERIAL");
+        assert_eq!(before["lease_token"], "lease-capability");
+
+        client.auth.write().agent_fingerprint = "NEW-SERIAL".into();
+        let (_, after) = client.request_snapshot(true);
+        assert_eq!(after["agent_fingerprint"], "NEW-SERIAL");
+        assert_eq!(after["lease_token"], "lease-capability");
+    }
+
+    #[test]
+    fn legacy_acquire_response_without_token_stays_compatible() {
+        let lease: MountLeaseResp = serde_json::from_str(
+            r#"{"expires_at":"2026-08-26T12:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(lease.lease_token.is_none());
     }
 }
 

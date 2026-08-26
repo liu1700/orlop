@@ -85,7 +85,8 @@ RETURNING *;
 UPDATE disk_allocations
    SET bound_agent_id   = $2,
        bound_at         = CASE WHEN bound_agent_id = $2 THEN bound_at ELSE now() END,
-       lease_expires_at = now() + sqlc.arg(ttl)::interval
+       lease_expires_at = now() + sqlc.arg(ttl)::interval,
+       mount_lease_token_hash = sqlc.arg(lease_token_hash)::text
  WHERE id = $1
    AND revoked_at IS NULL
    AND (sqlc.arg(force)::boolean
@@ -96,34 +97,55 @@ UPDATE disk_allocations
 RETURNING *;
 
 -- name: RefreshMountLease :one
+-- The token is the stable identity of one mount process. It survives leaf-cert
+-- renewal (which changes bound_agent_id) but a takeover replaces it, so a
+-- displaced process cannot refresh its way back in. Legacy clients omit the
+-- token and retain the enrollment-id guard during a rolling upgrade.
 -- Expiry remains a hard boundary (issue #95): after it, the holder must go
 -- through AcquireMountLease so renewal follows the same takeover rules as any
 -- other claimant. Matching bound_agent_id only proves that no takeover has
 -- committed yet; without the expiry guard, a stale refresh can win a race
 -- against a waiter and resurrect ownership after its promised deadline.
 UPDATE disk_allocations
-   SET lease_expires_at = now() + sqlc.arg(ttl)::interval
+   SET bound_agent_id = $2,
+       lease_expires_at = now() + sqlc.arg(ttl)::interval,
+       mount_lease_token_hash = CASE
+           WHEN sqlc.arg(new_lease_token_hash)::text <> ''
+           THEN sqlc.arg(new_lease_token_hash)::text
+           ELSE mount_lease_token_hash
+       END
  WHERE id = $1
-   AND bound_agent_id = $2
    AND revoked_at IS NULL
    AND lease_expires_at IS NOT NULL
    AND lease_expires_at > now()
+   AND ((sqlc.arg(lease_token_hash)::text <> ''
+         AND mount_lease_token_hash = sqlc.arg(lease_token_hash)::text)
+        OR (sqlc.arg(lease_token_hash)::text = ''
+            AND mount_lease_token_hash IS NULL
+            AND bound_agent_id = $2))
 RETURNING *;
 
 -- name: ReleaseMountLease :one
 UPDATE disk_allocations
    SET bound_agent_id   = NULL,
        bound_at         = NULL,
-       lease_expires_at = NULL
+       lease_expires_at = NULL,
+       mount_lease_token_hash = NULL
  WHERE id = $1
-   AND (bound_agent_id = $2 OR bound_agent_id IS NULL)
+   AND (bound_agent_id IS NULL
+        OR (sqlc.arg(lease_token_hash)::text <> ''
+            AND mount_lease_token_hash = sqlc.arg(lease_token_hash)::text)
+        OR (sqlc.arg(lease_token_hash)::text = ''
+            AND mount_lease_token_hash IS NULL
+            AND bound_agent_id = $2))
 RETURNING *;
 
 -- name: ForceReleaseMountLease :one
 UPDATE disk_allocations
    SET bound_agent_id   = NULL,
        bound_at         = NULL,
-       lease_expires_at = NULL
+       lease_expires_at = NULL,
+       mount_lease_token_hash = NULL
  WHERE id = $1
    AND user_id = $2
    AND revoked_at IS NULL

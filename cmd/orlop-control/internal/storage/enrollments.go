@@ -24,4 +24,7 @@ type EnrollmentStore interface {
 	// GetActiveEnrollmentByFingerprint resolves the unexpired enrollment whose
 	// cert serial matches fingerprint (case-insensitive), or ErrNotFound.
 	GetActiveEnrollmentByFingerprint(ctx context.Context, fingerprint string) (AgentEnrollment, error)
+	// GetEnrollmentByFingerprint also resolves an expired row. It lets auth
+	// distinguish a renewable expired credential from an unknown/revoked one.
+	GetEnrollmentByFingerprint(ctx context.Context, fingerprint string) (AgentEnrollment, error)
 }

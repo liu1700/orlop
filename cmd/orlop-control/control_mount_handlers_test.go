@@ -46,6 +46,24 @@ func mountBody(fp string) *bytes.Reader {
 	return bytes.NewReader(body)
 }
 
+func mountBodyWithToken(fp, token string) *bytes.Reader {
+	body, _ := json.Marshal(map[string]string{
+		"agent_fingerprint": fp,
+		"lease_token":       token,
+	})
+	return bytes.NewReader(body)
+}
+
+func mountTokenRequest(method, url string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(mountLeaseTokenHeader, "1")
+	return http.DefaultClient.Do(req)
+}
+
 func mountSeedAgent(t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID) (pgtype.UUID, string) {
 	t.Helper()
 	q := sqlcdb.New(pool)
@@ -89,8 +107,9 @@ func TestMountLeaseAcquireConflictRefreshAndRelease(t *testing.T) {
 		t.Fatalf("acquire status = %d body = %s", resp.StatusCode, body)
 	}
 	var acquired struct {
-		LeaseID   string `json:"lease_id"`
-		ExpiresAt string `json:"expires_at"`
+		LeaseID    string `json:"lease_id"`
+		LeaseToken string `json:"lease_token"`
+		ExpiresAt  string `json:"expires_at"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&acquired); err != nil {
 		t.Fatal(err)
@@ -98,6 +117,9 @@ func TestMountLeaseAcquireConflictRefreshAndRelease(t *testing.T) {
 	resp.Body.Close()
 	if acquired.LeaseID != uuidString(allocation.ID) || acquired.ExpiresAt == "" {
 		t.Fatalf("bad acquire response: %+v", acquired)
+	}
+	if acquired.LeaseToken != "" {
+		t.Fatalf("legacy acquire unexpectedly received token %q", acquired.LeaseToken)
 	}
 
 	// The SAME agent re-acquiring its own live lease now TAKES OVER (200), not 409:
@@ -122,17 +144,183 @@ func TestMountLeaseAcquireConflictRefreshAndRelease(t *testing.T) {
 		resp.Body.Close()
 		t.Fatalf("refresh status = %d body = %s", resp.StatusCode, body)
 	}
+	var refreshed struct {
+		LeaseToken string `json:"lease_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&refreshed); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
 	resp.Body.Close()
+	if refreshed.LeaseToken != "" {
+		t.Fatalf("legacy refresh unexpectedly received token %q", refreshed.LeaseToken)
+	}
 
-	req, _ := http.NewRequest(http.MethodDelete, url, mountBody(fp))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err = http.DefaultClient.Do(req)
+	// A capable v0.6.5 client can adopt a pre-upgrade, tokenless lease on its
+	// first refresh. The header is ignored by old control planes.
+	resp, err = mountTokenRequest(http.MethodPost, url+"/refresh", mountBody(fp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&refreshed); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || refreshed.LeaseToken == "" {
+		t.Fatalf("capable refresh status=%d token=%q", resp.StatusCode, refreshed.LeaseToken)
+	}
+
+	resp, err = mountTokenRequest(http.MethodDelete, url, mountBodyWithToken(fp, refreshed.LeaseToken))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("release status = %d", resp.StatusCode)
+	}
+}
+
+func TestMountLeaseTokenBridgesCertificateRenewalAndTakeoverInvalidatesIt(t *testing.T) {
+	pool := httpOpenTestPool(t)
+	srv, svc := httpStartServer(t, pool)
+	cookie, _ := httpSeedAdmin(t, pool, svc)
+	userID := dashGetUserID(t, cookie, srv.URL)
+	asvc := dashAllocSvc(pool)
+	allocation, err := asvc.Allocate(context.Background(), userID, dashGiB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent1, fp1 := mountSeedAgent(t, pool, userID)
+	agentRenewed, fpRenewed := mountSeedAgent(t, pool, userID)
+	_, fpTakeover := mountSeedAgent(t, pool, userID)
+	mountBindAgentID(t, pool, allocation.ID)
+	url := srv.URL + "/api/allocations/" + uuidString(allocation.ID) + "/mount"
+
+	resp, err := mountTokenRequest(http.MethodPost, url, mountBody(fp1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acquired struct {
+		LeaseToken string `json:"lease_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&acquired); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || acquired.LeaseToken == "" {
+		t.Fatalf("acquire status=%d token=%q", resp.StatusCode, acquired.LeaseToken)
+	}
+	// Once a lease has a token, omitting it must not fall back to the legacy
+	// enrollment guard; that would let a displaced process bypass takeover.
+	resp, err = http.Post(url+"/refresh", "application/json", mountBody(fp1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "already_mounted") {
+		t.Fatalf("token omission status=%d body=%s", resp.StatusCode, body)
+	}
+
+	// Renewal creates a new enrollment row. The opaque token proves this is
+	// still the same mount and atomically rebinds the live lease.
+	resp, err = mountTokenRequest(http.MethodPost, url+"/refresh", mountBodyWithToken(fpRenewed, acquired.LeaseToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("renewed refresh status=%d body=%s", resp.StatusCode, body)
+	}
+	row, err := sqlcdb.New(pool).GetAllocation(context.Background(), allocation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.BoundAgentID.Valid || row.BoundAgentID.Bytes != agentRenewed.Bytes {
+		t.Fatalf("bound enrollment = %+v, want %s", row.BoundAgentID, uuidString(agentRenewed))
+	}
+
+	// A stop immediately after rotation can release with the same token.
+	resp, err = mountTokenRequest(http.MethodDelete, url, mountBodyWithToken(fpRenewed, acquired.LeaseToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("renewed release status=%d", resp.StatusCode)
+	}
+
+	// Re-acquire, then force a takeover. The takeover mints a different token,
+	// so the displaced process cannot refresh its way back in.
+	resp, err = mountTokenRequest(http.MethodPost, url, mountBody(fp1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old struct {
+		LeaseToken string `json:"lease_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&old); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	forced, _ := json.Marshal(map[string]any{"agent_fingerprint": fpTakeover, "force": true})
+	resp, err = mountTokenRequest(http.MethodPost, url, bytes.NewReader(forced))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("forced takeover status=%d", resp.StatusCode)
+	}
+
+	resp, err = mountTokenRequest(http.MethodPost, url+"/refresh", mountBodyWithToken(fp1, old.LeaseToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "already_mounted") {
+		t.Fatalf("displaced refresh status=%d body=%s", resp.StatusCode, body)
+	}
+
+	_ = agent1 // documents that fp1 belongs to the original enrollment
+}
+
+func TestMountLeaseExpiredEnrollmentIsRetryableAuthError(t *testing.T) {
+	pool := httpOpenTestPool(t)
+	srv, svc := httpStartServer(t, pool)
+	cookie, _ := httpSeedAdmin(t, pool, svc)
+	userID := dashGetUserID(t, cookie, srv.URL)
+	asvc := dashAllocSvc(pool)
+	allocation, err := asvc.Allocate(context.Background(), userID, dashGiB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountBindAgentID(t, pool, allocation.ID)
+	fp := "A1B2C3EXPIRED"
+	_, err = sqlcdb.New(pool).CreateAgentEnrollment(context.Background(), sqlcdb.CreateAgentEnrollmentParams{
+		UserID:       userID,
+		CertSerial:   fp,
+		CertNotAfter: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(
+		srv.URL+"/api/allocations/"+uuidString(allocation.ID)+"/mount/refresh",
+		"application/json", mountBody(fp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(string(body), "expired_client") {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
 	}
 }
 

@@ -77,6 +77,7 @@ type Querier interface {
 	// agent id, a globally-unique UUID, so a lookup by agent_id alone resolves to
 	// at most one live row.
 	GetAllocationByAgent(ctx context.Context, agentID pgtype.Text) (DiskAllocation, error)
+	GetEnrollmentByFingerprint(ctx context.Context, lower string) (AgentEnrollment, error)
 	GetServerPoolByDataAddr(ctx context.Context, dataAddr string) (ServerPool, error)
 	GetServerVMByTenant(ctx context.Context, tenantID string) (ServerVm, error)
 	GetTenant(ctx context.Context, id string) (Tenant, error)
@@ -120,6 +121,10 @@ type Querier interface {
 	// buffer returns to 'available'. Operator-set 'unavailable' servers are left
 	// untouched.
 	ReconcileServerStatus(ctx context.Context, bufferFraction float64) error
+	// The token is the stable identity of one mount process. It survives leaf-cert
+	// renewal (which changes bound_agent_id) but a takeover replaces it, so a
+	// displaced process cannot refresh its way back in. Legacy clients omit the
+	// token and retain the enrollment-id guard during a rolling upgrade.
 	// Expiry remains a hard boundary (issue #95): after it, the holder must go
 	// through AcquireMountLease so renewal follows the same takeover rules as any
 	// other claimant. Matching bound_agent_id only proves that no takeover has

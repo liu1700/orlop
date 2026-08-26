@@ -34,3 +34,9 @@ func (s *Store) GetActiveEnrollmentByFingerprint(ctx context.Context, fingerprin
 		 WHERE lower(cert_serial) = lower(?) AND cert_not_after > ?`,
 		fingerprint, nowMicros()))
 }
+
+func (s *Store) GetEnrollmentByFingerprint(ctx context.Context, fingerprint string) (storage.AgentEnrollment, error) {
+	return scanEnrollment(s.db.QueryRowContext(ctx,
+		`SELECT id, user_id, cert_serial, cert_not_after FROM agent_enrollments
+		 WHERE lower(cert_serial) = lower(?)`, fingerprint))
+}

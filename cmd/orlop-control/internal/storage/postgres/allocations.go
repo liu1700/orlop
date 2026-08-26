@@ -133,12 +133,13 @@ func (s *Store) ListPurgePendingAllocations(ctx context.Context, limit int32) ([
 
 // --- mount leases ---
 
-func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, force bool) (storage.Allocation, error) {
+func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, force bool, leaseTokenHash string) (storage.Allocation, error) {
 	row, err := s.q.AcquireMountLease(ctx, sqlcdb.AcquireMountLeaseParams{
-		ID:           pgUUID(allocID),
-		BoundAgentID: pgUUID(agentEnrollmentID),
-		Ttl:          ttlInterval(ttl),
-		Force:        force,
+		ID:             pgUUID(allocID),
+		BoundAgentID:   pgUUID(agentEnrollmentID),
+		Ttl:            ttlInterval(ttl),
+		Force:          force,
+		LeaseTokenHash: leaseTokenHash,
 	})
 	if err != nil {
 		return storage.Allocation{}, mapErr(err)
@@ -146,11 +147,13 @@ func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentI
 	return allocation(row), nil
 }
 
-func (s *Store) RefreshMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (storage.Allocation, error) {
+func (s *Store) RefreshMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, leaseTokenHash, newLeaseTokenHash string) (storage.Allocation, error) {
 	row, err := s.q.RefreshMountLease(ctx, sqlcdb.RefreshMountLeaseParams{
-		ID:           pgUUID(allocID),
-		BoundAgentID: pgUUID(agentEnrollmentID),
-		Ttl:          ttlInterval(ttl),
+		ID:                pgUUID(allocID),
+		BoundAgentID:      pgUUID(agentEnrollmentID),
+		Ttl:               ttlInterval(ttl),
+		LeaseTokenHash:    leaseTokenHash,
+		NewLeaseTokenHash: newLeaseTokenHash,
 	})
 	if err != nil {
 		return storage.Allocation{}, mapErr(err)
@@ -158,10 +161,11 @@ func (s *Store) RefreshMountLease(ctx context.Context, allocID, agentEnrollmentI
 	return allocation(row), nil
 }
 
-func (s *Store) ReleaseMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID) (storage.Allocation, error) {
+func (s *Store) ReleaseMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, leaseTokenHash string) (storage.Allocation, error) {
 	row, err := s.q.ReleaseMountLease(ctx, sqlcdb.ReleaseMountLeaseParams{
-		ID:           pgUUID(allocID),
-		BoundAgentID: pgUUID(agentEnrollmentID),
+		ID:             pgUUID(allocID),
+		BoundAgentID:   pgUUID(agentEnrollmentID),
+		LeaseTokenHash: leaseTokenHash,
 	})
 	if err != nil {
 		return storage.Allocation{}, mapErr(err)

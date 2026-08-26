@@ -151,6 +151,9 @@ func TestAgentEnrollments(t *testing.T) {
 	if _, err := s.GetActiveEnrollmentByFingerprint(ctx, "expired"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expired fingerprint err = %v, want ErrNotFound", err)
 	}
+	if expired, err := s.GetEnrollmentByFingerprint(ctx, "expired"); err != nil || expired.CertSerial != "EXPIRED" {
+		t.Fatalf("unfiltered expired enrollment = %+v, err %v", expired, err)
+	}
 }
 
 func TestAPITokens(t *testing.T) {

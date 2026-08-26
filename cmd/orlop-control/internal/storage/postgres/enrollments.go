@@ -34,3 +34,11 @@ func (s *Store) GetActiveEnrollmentByFingerprint(ctx context.Context, fingerprin
 	}
 	return enrollment(e), nil
 }
+
+func (s *Store) GetEnrollmentByFingerprint(ctx context.Context, fingerprint string) (storage.AgentEnrollment, error) {
+	e, err := s.q.GetEnrollmentByFingerprint(ctx, fingerprint)
+	if err != nil {
+		return storage.AgentEnrollment{}, mapErr(err)
+	}
+	return enrollment(e), nil
+}

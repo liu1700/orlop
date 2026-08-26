@@ -40,7 +40,7 @@ use super::messages::{
     StatRequest, StatResponse, SymlinkRequest, SymlinkResponse, SYNC_PROTOCOL_V1,
 };
 use super::protocol::{errno, flags, Op, MAX_PAYLOAD_LEN};
-use crate::backend::tls::TlsIdentity;
+use crate::backend::tls::{shared_tls_identity, SharedTlsIdentity, TlsIdentity};
 use crate::backend::BackendError;
 
 /// Defaults.
@@ -85,7 +85,7 @@ pub struct DataClientConfig {
     pub addr: String,
     /// SNI / server name for cert verification. Usually the host part of `addr`.
     pub server_name: String,
-    pub tls: TlsIdentity,
+    pub tls: SharedTlsIdentity,
     pub transport: TransportMode,
     pub quic_connect_timeout: Duration,
     pub request_timeout: Duration,
@@ -98,6 +98,14 @@ impl DataClientConfig {
         addr: impl Into<String>,
         server_name: impl Into<String>,
         tls: TlsIdentity,
+    ) -> Result<Self> {
+        Self::new_shared(addr, server_name, shared_tls_identity(tls))
+    }
+
+    pub fn new_shared(
+        addr: impl Into<String>,
+        server_name: impl Into<String>,
+        tls: SharedTlsIdentity,
     ) -> Result<Self> {
         Ok(Self {
             addr: addr.into(),
@@ -123,8 +131,6 @@ pub struct DataClient {
 
 struct Inner {
     cfg: DataClientConfig,
-    rustls_config: Arc<rustls::ClientConfig>,
-    quic_config: quinn::ClientConfig,
     /// `Some(Tcp)` or `Some(Quic)` after a successful dial; `None` before.
     /// Never `Some(Auto)` — Auto is the *config* mode, not a dialed outcome.
     preferred_transport: Mutex<Option<TransportMode>>,
@@ -171,8 +177,9 @@ struct QuicConnectionGuard {
 
 impl DataClient {
     pub fn new(cfg: DataClientConfig) -> Result<Self> {
-        let rustls_config = Arc::new(build_rustls_config(&cfg.tls)?);
-        let quic_config = build_quic_config(Arc::clone(&rustls_config), cfg.heartbeat_interval)?;
+        // Validate the initial identity eagerly. Renewed identities are built
+        // by the same enrollment path and snapshotted on each later dial.
+        build_rustls_config(&cfg.tls.read())?;
         // Worker count is sized for parallel chunk_get / chunk_put fan-out:
         // each in-flight RPC is one polled task, and our typical batch is
         // 4-32 chunks per FUSE read or per flush. Threads are I/O-bound so
@@ -187,8 +194,6 @@ impl DataClient {
             runtime: Arc::new(runtime),
             inner: Arc::new(Inner {
                 cfg,
-                rustls_config,
-                quic_config,
                 preferred_transport: Mutex::new(None),
                 next_rid: AtomicU64::new(1),
                 state: Mutex::new(ConnState::Disconnected),
@@ -875,7 +880,8 @@ impl Inner {
 
         let server_name = ServerName::try_from(self.cfg.server_name.clone())
             .context("invalid TLS server name")?;
-        let connector = TlsConnector::from(Arc::clone(&self.rustls_config));
+        let rustls_config = Arc::new(build_rustls_config(&self.cfg.tls.read())?);
+        let connector = TlsConnector::from(rustls_config);
         let tls = connector
             .connect(server_name, tcp)
             .await
@@ -916,7 +922,9 @@ impl Inner {
             SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         };
         let mut endpoint = quinn::Endpoint::client(bind_addr).context("create QUIC endpoint")?;
-        endpoint.set_default_client_config(self.quic_config.clone());
+        let rustls_config = Arc::new(build_rustls_config(&self.cfg.tls.read())?);
+        let quic_config = build_quic_config(rustls_config, self.cfg.heartbeat_interval)?;
+        endpoint.set_default_client_config(quic_config);
         let connecting = endpoint
             .connect(socket_addr, &self.cfg.server_name)
             .context("start QUIC connect for data-plane mount")?;
@@ -1179,6 +1187,23 @@ mod transport_mode_tests {
     fn rejects_unknown_orlop_transport_value() {
         let err = TransportMode::from_env_value(Some("h3")).unwrap_err();
         assert!(err.to_string().contains("ORLOP_TRANSPORT"), "{err}");
+    }
+
+    #[test]
+    fn shared_config_observes_renewed_tls_identity_for_the_next_dial() {
+        fn identity(marker: u8) -> TlsIdentity {
+            TlsIdentity {
+                cert_pem: vec![marker],
+                key_pem: vec![marker + 1],
+                ca_pem: vec![marker + 2],
+            }
+        }
+
+        let shared = shared_tls_identity(identity(1));
+        let cfg = DataClientConfig::new_shared("127.0.0.1:1", "localhost", shared.clone()).unwrap();
+        *shared.write() = identity(9);
+
+        assert_eq!(*cfg.tls.read(), identity(9));
     }
 }
 

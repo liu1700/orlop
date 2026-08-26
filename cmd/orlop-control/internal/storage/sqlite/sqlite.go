@@ -79,11 +79,50 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("apply sqlite schema: %w", err)
 	}
+	// CREATE TABLE IF NOT EXISTS does not add columns to an existing SQLite
+	// database. Bridge the v0.6.4 schema forward before any lease query can use
+	// the renewal-continuity token column.
+	if err := ensureMountLeaseTokenColumn(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	if err := validateOwnerCapacityLedger(ctx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}
 	return New(pool), nil
+}
+
+func ensureMountLeaseTokenColumn(ctx context.Context, pool *sql.DB) error {
+	rows, err := pool.QueryContext(ctx, `PRAGMA table_info(disk_allocations)`)
+	if err != nil {
+		return fmt.Errorf("inspect sqlite disk_allocations schema: %w", err)
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("inspect sqlite disk_allocations column: %w", err)
+		}
+		if name == "mount_lease_token_hash" {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("inspect sqlite disk_allocations schema: %w", err)
+	}
+	if found {
+		return nil
+	}
+	if _, err := pool.ExecContext(ctx,
+		`ALTER TABLE disk_allocations ADD COLUMN mount_lease_token_hash TEXT`); err != nil {
+		return fmt.Errorf("upgrade sqlite mount lease token schema: %w", err)
+	}
+	return nil
 }
 
 // validateOwnerCapacityLedger prevents the startup-time schema bridge from

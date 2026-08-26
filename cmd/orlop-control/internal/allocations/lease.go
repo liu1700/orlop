@@ -25,10 +25,17 @@ import (
 // audit-logged. Mount exclusivity is otherwise enforced by the handler's ownership check
 // + the data-plane cert.
 func (s *Service) AcquireMountLease(ctx context.Context, allocationID, agentID pgtype.UUID, ttl time.Duration, force bool) (Allocation, error) {
+	return s.AcquireMountLeaseWithToken(ctx, allocationID, agentID, ttl, force, "")
+}
+
+// AcquireMountLeaseWithToken is the protocol-aware acquire path. tokenHash is
+// empty for legacy clients and a SHA-256 digest for clients that can preserve
+// lease continuity across certificate renewal.
+func (s *Service) AcquireMountLeaseWithToken(ctx context.Context, allocationID, agentID pgtype.UUID, ttl time.Duration, force bool, tokenHash string) (Allocation, error) {
 	if force {
 		s.logLiveTakeover(ctx, allocationID, agentID)
 	}
-	row, err := s.store.AcquireMountLease(ctx, toUUID(allocationID), toUUID(agentID), ttl, force)
+	row, err := s.store.AcquireMountLease(ctx, toUUID(allocationID), toUUID(agentID), ttl, force, tokenHash)
 	if err == nil {
 		return fromStorage(row), nil
 	}
@@ -91,8 +98,10 @@ func (s *Service) classifyLeaseMiss(ctx context.Context, allocationID, agentID p
 		if acquired {
 			return ErrAlreadyMounted
 		}
-		// Refresh would succeed in this state, so this branch is unreachable.
-		return fmt.Errorf("classify: refresh miss with live lease (state=%+v)", cur)
+		// A token-aware refresh can miss even when the enrollment still matches:
+		// a re-acquire/takeover replaced its continuity token. Treat that stale
+		// holder exactly like any other displaced agent.
+		return ErrWrongAgent
 	}
 	if cur.BoundAgentID == nil || *cur.BoundAgentID != agent {
 		if acquired {
@@ -116,7 +125,13 @@ func (s *Service) classifyLeaseMiss(ctx context.Context, allocationID, agentID p
 // binding, ErrRevoked if the allocation was revoked, or ErrNotFound if the
 // allocation id is unknown.
 func (s *Service) RefreshMountLease(ctx context.Context, allocationID, agentID pgtype.UUID, ttl time.Duration) (Allocation, error) {
-	row, err := s.store.RefreshMountLease(ctx, toUUID(allocationID), toUUID(agentID), ttl)
+	return s.RefreshMountLeaseWithToken(ctx, allocationID, agentID, ttl, "", "")
+}
+
+// RefreshMountLeaseWithToken permits a renewed enrollment to replace the
+// per-certificate binding only when it presents the token minted by acquire.
+func (s *Service) RefreshMountLeaseWithToken(ctx context.Context, allocationID, agentID pgtype.UUID, ttl time.Duration, tokenHash, newTokenHash string) (Allocation, error) {
+	row, err := s.store.RefreshMountLease(ctx, toUUID(allocationID), toUUID(agentID), ttl, tokenHash, newTokenHash)
 	if err == nil {
 		return fromStorage(row), nil
 	}
@@ -131,7 +146,13 @@ func (s *Service) RefreshMountLease(ctx context.Context, allocationID, agentID p
 // already-Free allocation is a no-op.
 // Errors with ErrWrongAgent if the binding belongs to a different agent.
 func (s *Service) ReleaseMountLease(ctx context.Context, allocationID, agentID pgtype.UUID) error {
-	row, err := s.store.ReleaseMountLease(ctx, toUUID(allocationID), toUUID(agentID))
+	return s.ReleaseMountLeaseWithToken(ctx, allocationID, agentID, "")
+}
+
+// ReleaseMountLeaseWithToken mirrors refresh continuity so a mount stopped
+// immediately after certificate rotation can still clear its lease.
+func (s *Service) ReleaseMountLeaseWithToken(ctx context.Context, allocationID, agentID pgtype.UUID, tokenHash string) error {
+	row, err := s.store.ReleaseMountLease(ctx, toUUID(allocationID), toUUID(agentID), tokenHash)
 	if err == nil {
 		// Revoke the released agent's leaf so a leaked copy can't keep mounting
 		// until its TTL lapses (issue #5).
@@ -148,7 +169,7 @@ func (s *Service) ReleaseMountLease(ctx context.Context, allocationID, agentID p
 	if gerr != nil {
 		return fmt.Errorf("get after release miss: %w", gerr)
 	}
-	if cur.BoundAgentID != nil && *cur.BoundAgentID != toUUID(agentID) {
+	if cur.BoundAgentID != nil && (*cur.BoundAgentID != toUUID(agentID) || tokenHash != "") {
 		return ErrWrongAgent
 	}
 	return fmt.Errorf("release: zero rows but no guard matched (state=%+v)", cur)

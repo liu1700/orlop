@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
@@ -18,6 +19,31 @@ func TestVerifySchemaFresh(t *testing.T) {
 
 	if err := s.VerifySchema(ctx); err != nil {
 		t.Fatalf("fresh schema should verify clean; got %v", err)
+	}
+}
+
+func TestOpenUpgradesLegacyMountLeaseTokenColumn(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.ExecContext(ctx,
+		`ALTER TABLE disk_allocations DROP COLUMN mount_lease_token_hash`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen legacy database: %v", err)
+	}
+	defer s.Close()
+	if err := s.VerifySchema(ctx); err != nil {
+		t.Fatalf("upgraded schema: %v", err)
 	}
 }
 

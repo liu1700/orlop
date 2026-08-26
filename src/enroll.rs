@@ -284,6 +284,29 @@ pub fn cert_serial_from_dir(cert_dir: &Path) -> anyhow::Result<String> {
     Ok(parse_serial(&cert_pem))
 }
 
+/// Refresh the certificate-derived fields of handoff metadata from the files
+/// on disk. The renewal loop atomically replaces those files, while a live
+/// handoff's serialized `EnrolledCert` is only a mount-time snapshot.
+pub fn refresh_cert_metadata_from_dir(enrolled: &mut EnrolledCert) -> anyhow::Result<()> {
+    let cert_pem = fs::read(&enrolled.cert_path)
+        .with_context(|| format!("read {}", enrolled.cert_path.display()))?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&cert_pem)
+        .map_err(|e| anyhow::anyhow!("parse {} PEM: {e}", enrolled.cert_path.display()))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|e| anyhow::anyhow!("parse {} certificate: {e}", enrolled.cert_path.display()))?;
+    enrolled.cert_serial = cert
+        .tbs_certificate
+        .serial
+        .to_bytes_be()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    enrolled.expires_at = DateTime::from_timestamp(cert.validity().not_after.timestamp(), 0)
+        .ok_or_else(|| anyhow::anyhow!("certificate expiry is outside chrono's range"))?;
+    Ok(())
+}
+
 fn parse_serial(cert_pem: &[u8]) -> String {
     use x509_parser::pem::parse_x509_pem;
     let Ok((_, pem)) = parse_x509_pem(cert_pem) else {
@@ -540,5 +563,21 @@ gz6ouG0MNrc8wNu++RoOct9R7cQmNOQvk+4qQCEYZXiqKwffFEz0xg==
         assert!(bundle
             .windows(b"BEGIN CERTIFICATE".len())
             .any(|w| w == b"BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn refresh_cert_metadata_uses_current_file_for_handoff() {
+        let dir = Tmp::new();
+        let mut enrolled = persist(dir.path(), sample_resp()).unwrap();
+        enrolled.cert_serial = "stale".into();
+        enrolled.expires_at = Utc::now() - chrono::Duration::hours(1);
+
+        refresh_cert_metadata_from_dir(&mut enrolled).unwrap();
+
+        assert_eq!(enrolled.cert_serial, "0d");
+        assert_eq!(
+            enrolled.expires_at.to_rfc3339(),
+            "2026-05-01T02:04:32+00:00"
+        );
     }
 }
