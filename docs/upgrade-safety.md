@@ -101,6 +101,13 @@ older control plane does not understand renewal continuity tokens, roll out the
 v0.6.5 control plane before v0.6.5 mount clients. The migration is additive and
 nullable, so a database rollback is unnecessary if the binary must be reverted.
 
+The release fixes long-lived hosted mounts aborting with exit 69 at the original
+one-hour certificate boundary (#140). Certificate renewal now publishes the new
+identity to control-plane lease refreshes and subsequent TCP/QUIC data-plane
+dials; the opaque lease token safely rebinds the live lease to the renewed
+enrollment without allowing a displaced holder to undo a takeover. Live handoff
+also reloads current certificate metadata and carries the same lease token.
+
 v0.6.4 extends the same capacity path for JuiceFS-backed deployments: a full
 directory quota that stalls the backing write/`fsync` instead of returning an
 errno now surfaces as `EDQUOT` to the FUSE caller, through a pre-write `statfs`
