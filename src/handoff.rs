@@ -20,6 +20,10 @@ pub struct RuntimeSpec {
     pub mountpoint: PathBuf,
     pub credentials: Option<PathBuf>,
     pub enrolled: Option<EnrolledCert>,
+    /// Opaque control-plane mount capability. Stable across certificate
+    /// renewal and live handoff; absent when talking to an older control plane.
+    #[serde(default)]
+    pub mount_lease_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

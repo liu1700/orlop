@@ -11,7 +11,7 @@ pub mod tls;
 
 pub mod dataplane;
 
-pub use tls::TlsIdentity;
+pub use tls::{shared_tls_identity, SharedTlsIdentity, TlsIdentity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -66,6 +66,17 @@ pub fn build_stores(
     tls: Option<&TlsIdentity>,
     chunk_cache: Arc<dataplane::ChunkCache>,
 ) -> anyhow::Result<Vec<MountedStore>> {
+    let shared_tls = tls.map(|identity| shared_tls_identity(identity.clone()));
+    build_stores_shared(configs, shared_tls.as_ref(), chunk_cache)
+}
+
+/// Build stores whose future data-plane connections observe certificate
+/// renewal through a shared identity source.
+pub fn build_stores_shared(
+    configs: &[MountConfig],
+    tls: Option<&SharedTlsIdentity>,
+    chunk_cache: Arc<dataplane::ChunkCache>,
+) -> anyhow::Result<Vec<MountedStore>> {
     configs
         .iter()
         .map(|cfg| {
@@ -108,7 +119,8 @@ pub fn build_stores(
             let tls_id = tls
                 .cloned()
                 .ok_or_else(|| anyhow!("remote mount {} requires a TLS identity", cfg.name))?;
-            let dp_cfg = dataplane::DataClientConfig::new(addr.clone(), server_name, tls_id)?;
+            let dp_cfg =
+                dataplane::DataClientConfig::new_shared(addr.clone(), server_name, tls_id)?;
             let client = Arc::new(dataplane::DataClient::new(dp_cfg)?);
             let leases = Some(crate::lease::LeaseManager::new(Arc::clone(&client)));
             let mut data_store = dataplane::DataStore::new(

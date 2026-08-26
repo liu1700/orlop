@@ -37,7 +37,7 @@ func RequiredSchema() []RequiredTable {
 	return []RequiredTable{
 		{Name: "tenants"},
 		{Name: "users"},
-		{Name: "disk_allocations"},
+		{Name: "disk_allocations", Columns: []string{"mount_lease_token_hash"}},
 		{Name: "agent_enrollments"},
 		// consumed_at was folded into the squashed baseline after v0.1.0; a
 		// pre-squash database that skipped the baseline lacks it, which broke

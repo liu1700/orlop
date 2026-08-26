@@ -71,18 +71,19 @@ type DgCaSecret struct {
 }
 
 type DiskAllocation struct {
-	ID             pgtype.UUID
-	UserID         pgtype.UUID
-	SizeBytes      int64
-	CreatedAt      pgtype.Timestamptz
-	RevokedAt      pgtype.Timestamptz
-	BoundAgentID   pgtype.UUID
-	BoundAt        pgtype.Timestamptz
-	LeaseExpiresAt pgtype.Timestamptz
-	ExpiresAt      pgtype.Timestamptz
-	AgentID        pgtype.Text
-	PurgedAt       pgtype.Timestamptz
-	TenantID       pgtype.Text
+	ID                  pgtype.UUID
+	UserID              pgtype.UUID
+	SizeBytes           int64
+	CreatedAt           pgtype.Timestamptz
+	RevokedAt           pgtype.Timestamptz
+	BoundAgentID        pgtype.UUID
+	BoundAt             pgtype.Timestamptz
+	LeaseExpiresAt      pgtype.Timestamptz
+	ExpiresAt           pgtype.Timestamptz
+	AgentID             pgtype.Text
+	PurgedAt            pgtype.Timestamptz
+	TenantID            pgtype.Text
+	MountLeaseTokenHash pgtype.Text
 }
 
 type OwnerCapacityReservation struct {

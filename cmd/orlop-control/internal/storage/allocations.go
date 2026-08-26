@@ -100,9 +100,9 @@ type AllocationOps interface {
 	// Mount leases. AcquireMountLease with force=false refuses to take over a
 	// live lease held by a different enrollment (zero rows → ErrNotFound, the
 	// caller classifies); force=true is the explicit takeover assertion.
-	AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, force bool) (Allocation, error)
-	RefreshMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (Allocation, error)
-	ReleaseMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID) (Allocation, error)
+	AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, force bool, leaseTokenHash string) (Allocation, error)
+	RefreshMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, leaseTokenHash, newLeaseTokenHash string) (Allocation, error)
+	ReleaseMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, leaseTokenHash string) (Allocation, error)
 	ForceReleaseMountLease(ctx context.Context, allocID, userID uuid.UUID) error
 
 	// Enrollments + revocation (the lease-release kill switch).

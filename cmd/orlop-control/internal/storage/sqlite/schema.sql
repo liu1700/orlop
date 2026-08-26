@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS disk_allocations (
     bound_agent_id   TEXT REFERENCES agent_enrollments(id) ON DELETE SET NULL,
     bound_at         INTEGER,
     lease_expires_at INTEGER,
+    mount_lease_token_hash TEXT,
     expires_at       INTEGER,
     agent_id         TEXT,
     purged_at        INTEGER,

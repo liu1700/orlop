@@ -119,48 +119,62 @@ func TestMountLease(t *testing.T) {
 	u := seedUser(t, s, "acme", "a@acme.test")
 	a, _ := s.InsertAllocation(ctx, u.ID, 1000)
 	agent1 := seedEnrollment(t, s, u.ID, "AGENT1")
+	agent1Renewed := seedEnrollment(t, s, u.ID, "AGENT1-RENEWED")
 	agent2 := seedEnrollment(t, s, u.ID, "AGENT2")
 	ttl := time.Minute
 
-	acq, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl, false)
+	acq, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl, false, "token-1")
 	if err != nil || acq.BoundAgentID == nil || *acq.BoundAgentID != agent1 || acq.LeaseExpiresAt == nil {
 		t.Fatalf("acquire = %+v, err %v", acq, err)
 	}
+	// A token-aware holder cannot bypass the capability check by omitting it
+	// and falling back to the legacy enrollment-id guard.
+	if _, err := s.RefreshMountLease(ctx, a.ID, agent1, ttl, "", ""); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("token omission refresh = %v, want ErrNotFound", err)
+	}
+	if _, err := s.ReleaseMountLease(ctx, a.ID, agent1, ""); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("token omission release = %v, want ErrNotFound", err)
+	}
 	boundAt := acq.BoundAt
 	// Same-agent re-acquire preserves bound_at.
-	reacq, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl, false)
+	reacq, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl, false, "token-1")
 	if err != nil || reacq.BoundAt == nil || boundAt == nil || !reacq.BoundAt.Equal(*boundAt) {
 		t.Fatalf("re-acquire bound_at changed: %+v vs %+v (err %v)", reacq.BoundAt, boundAt, err)
 	}
 	// Refresh extends the lease.
-	if _, err := s.RefreshMountLease(ctx, a.ID, agent1, ttl); err != nil {
+	if _, err := s.RefreshMountLease(ctx, a.ID, agent1, ttl, "token-1", ""); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
+	// The acquire token bridges a cert renewal to its new enrollment row.
+	if renewed, err := s.RefreshMountLease(ctx, a.ID, agent1Renewed, ttl, "token-1", ""); err != nil || renewed.BoundAgentID == nil || *renewed.BoundAgentID != agent1Renewed {
+		t.Fatalf("renewal refresh = %+v, err %v", renewed, err)
+	}
 	// A different agent cannot take over the live lease without force (#93)...
-	if _, err := s.AcquireMountLease(ctx, a.ID, agent2, ttl, false); !errors.Is(err, storage.ErrNotFound) {
+	if _, err := s.AcquireMountLease(ctx, a.ID, agent2, ttl, false, "token-2"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("live takeover without force = %v, want ErrNotFound (zero rows)", err)
 	}
 	// ...and the incumbent is untouched by the refused attempt.
-	if cur, err := s.GetAllocation(ctx, a.ID); err != nil || cur.BoundAgentID == nil || *cur.BoundAgentID != agent1 {
-		t.Fatalf("after refused takeover = %+v, err %v (want still agent1)", cur, err)
+	if cur, err := s.GetAllocation(ctx, a.ID); err != nil || cur.BoundAgentID == nil || *cur.BoundAgentID != agent1Renewed {
+		t.Fatalf("after refused takeover = %+v, err %v (want still renewed agent1)", cur, err)
 	}
 	// Forced takeover by a different agent succeeds and resets bound_at.
-	if to, err := s.AcquireMountLease(ctx, a.ID, agent2, ttl, true); err != nil || to.BoundAgentID == nil || *to.BoundAgentID != agent2 {
+	if to, err := s.AcquireMountLease(ctx, a.ID, agent2, ttl, true, "token-2"); err != nil || to.BoundAgentID == nil || *to.BoundAgentID != agent2 {
 		t.Fatalf("takeover = %+v, err %v", to, err)
 	}
-	// The displaced agent can no longer refresh.
-	if _, err := s.RefreshMountLease(ctx, a.ID, agent1, ttl); !errors.Is(err, storage.ErrNotFound) {
+	// The displaced mount's old token can no longer refresh, even through its
+	// renewed enrollment.
+	if _, err := s.RefreshMountLease(ctx, a.ID, agent1Renewed, ttl, "token-1", ""); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("displaced refresh = %v, want ErrNotFound", err)
 	}
 	// Release, then refresh fails (lease gone).
-	if _, err := s.ReleaseMountLease(ctx, a.ID, agent2); err != nil {
+	if _, err := s.ReleaseMountLease(ctx, a.ID, agent2, "token-2"); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if _, err := s.RefreshMountLease(ctx, a.ID, agent2, ttl); !errors.Is(err, storage.ErrNotFound) {
+	if _, err := s.RefreshMountLease(ctx, a.ID, agent2, ttl, "token-2", ""); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("refresh after release = %v, want ErrNotFound", err)
 	}
 	// A released lease is claimable by a different agent without force.
-	if _, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl, false); err != nil {
+	if _, err := s.AcquireMountLease(ctx, a.ID, agent1, ttl, false, "token-3"); err != nil {
 		t.Fatalf("re-acquire: %v", err)
 	}
 	if err := s.ForceReleaseMountLease(ctx, a.ID, uuid.New()); !errors.Is(err, storage.ErrNotFound) {

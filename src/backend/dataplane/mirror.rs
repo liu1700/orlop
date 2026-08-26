@@ -939,7 +939,7 @@ fn unpack_chunks(blob: &[u8]) -> Option<Vec<ChunkRef>> {
         return None;
     }
     let mut out = Vec::with_capacity(blob.len() / CHUNK_REF_SIZE);
-    for c in blob.chunks_exact(CHUNK_REF_SIZE) {
+    for c in blob.as_chunks::<CHUNK_REF_SIZE>().0 {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&c[..32]);
         out.push(ChunkRef {

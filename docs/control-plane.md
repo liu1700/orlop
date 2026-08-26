@@ -59,7 +59,7 @@ Successful responses are JSON with `Content-Type: application/json`.
 | `201 Created` | success, resource created (`POST /v1/tokens`) |
 | `204 No Content` | success, no body (`POST /auth/logout`, `DELETE /v1/entities/...`) |
 | `400 Bad Request` | malformed request |
-| `401 Unauthorized` | missing/invalid/expired credential (`invalid_token`, `invalid_client`) |
+| `401 Unauthorized` | missing/invalid/expired credential (`invalid_token`, `invalid_client`, `expired_client`). An expired enrolled certificate is reported as `expired_client`, so a renewing mount can retry while a genuinely unknown certificate remains terminal |
 | `403 Forbidden` | authenticated but not allowed (`access_denied`: suspended tenant/user, tenant not allowed, missing agent scope) |
 | `404 Not Found` | unknown resource |
 | `409 Conflict` | mount or capacity conflict (`wrong_agent`, `already_mounted`, `lease_live`, `insufficient_capacity`). `lease_live` means the acquire would displace a mount lease that is still live for a different enrollment; its body carries the incumbent's `bound_at` and `lease_expires_at`, and the caller may retry with `{"force": true}` to take over |
@@ -146,9 +146,9 @@ The set of mounted routes depends on configuration:
 | GET | `/allocations` | admin session cookie | dashboard: list the user's disk allocations |
 | GET | `/allocations/{id}/usage` | admin session cookie | dashboard: per-allocation usage |
 | POST | `/allocations/{id}/revoke` | admin session cookie | revoke an allocation |
-| POST | `/allocations/{id}/mount` | agent identity | acquire the exclusive mount lease. Refuses to displace a live lease held by a different enrollment with `409 lease_live` unless the body sets `"force": true` |
-| POST | `/allocations/{id}/mount/refresh` | agent identity | extend the mount lease |
-| DELETE | `/allocations/{id}/mount` | agent identity | release the mount lease |
+| POST | `/allocations/{id}/mount` | agent identity | acquire the exclusive mount lease and, when `X-Orlop-Mount-Lease-Token: 1` is advertised, return its opaque `lease_token`. Refuses to displace a live lease held by a different enrollment with `409 lease_live` unless the body sets `"force": true` |
+| POST | `/allocations/{id}/mount/refresh` | agent identity | extend the mount lease. Clients echo `lease_token`; this permits the same mount to rebind to its renewed certificate without weakening takeover isolation |
+| DELETE | `/allocations/{id}/mount` | agent identity | release the mount lease, echoing `lease_token` when the server issued one |
 | POST | `/allocations/{id}/unmount` | admin session cookie | owner-forced unmount |
 | POST | `/v1/tokens` | admin session cookie | mint a long-lived `orlop_…` API token (shown once; `201`) |
 | GET | `/v1/tokens` | admin session cookie | list API tokens |
@@ -321,7 +321,13 @@ bootstrap to `ORLOP_CA_TENANT_ALLOWLIST` only.
 Mount leases, credentials, and keys have separate lifecycles. The mount lease
 above is a continuously renewed liveness heartbeat. Agent enroll tokens last
 about 10 minutes and are single-use; agent mTLS leaf certificates last one hour,
-and the mount client renews them before expiry. `orlop_…` API tokens do not
+and the mount client renews them before expiry. Each acquired mount also holds an
+opaque lease token: only its SHA-256 digest is stored by the control plane, it
+survives certificate renewal, and a takeover replaces it so the displaced mount
+cannot regain the lease with another certificate. v0.6.5 clients advertise token
+support with `X-Orlop-Mount-Lease-Token: 1`, a header older servers safely ignore.
+Tokenless older clients remain accepted only while both their certificate
+enrollment matches and the lease has no token. `orlop_…` API tokens do not
 expire by default unless `ORLOP_API_TOKEN_TTL` is configured. A client cannot
 extend the server's mount-lease policy, but it automatically follows whichever
 TTL the server returns.

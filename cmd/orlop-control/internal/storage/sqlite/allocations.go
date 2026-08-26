@@ -142,7 +142,7 @@ func (s *Store) ListPurgePendingAllocations(ctx context.Context, limit int32) ([
 
 // --- mount leases ---
 
-func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, force bool) (storage.Allocation, error) {
+func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, force bool, leaseTokenHash string) (storage.Allocation, error) {
 	now := time.Now()
 	// bound_at is preserved for a same-agent re-mount, reset otherwise. The
 	// CASE sees the pre-update bound_agent_id. Without force, a live lease
@@ -153,41 +153,50 @@ func (s *Store) AcquireMountLease(ctx context.Context, allocID, agentEnrollmentI
 		`UPDATE disk_allocations
 		    SET bound_agent_id   = ?,
 		        bound_at         = CASE WHEN bound_agent_id = ? THEN bound_at ELSE ? END,
-		        lease_expires_at = ?
+		        lease_expires_at = ?,
+		        mount_lease_token_hash = ?
 		  WHERE id = ? AND revoked_at IS NULL
 		    AND (? OR bound_agent_id IS NULL OR bound_agent_id = ?
 		         OR lease_expires_at IS NULL OR lease_expires_at <= ?)
 		  RETURNING `+allocationColumns,
-		agentEnrollmentID, agentEnrollmentID, micros(now), micros(now.Add(ttl)), allocID,
+		agentEnrollmentID, agentEnrollmentID, micros(now), micros(now.Add(ttl)), leaseTokenHash, allocID,
 		force, agentEnrollmentID, micros(now)))
 }
 
-func (s *Store) RefreshMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration) (storage.Allocation, error) {
+func (s *Store) RefreshMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, ttl time.Duration, leaseTokenHash, newLeaseTokenHash string) (storage.Allocation, error) {
 	now := time.Now()
-	// Expiry is a hard boundary (issue #95): a late holder must re-acquire so
-	// it follows the same takeover rules as every other claimant. Without the
-	// expiry guard a stale refresh can beat a waiter and resurrect ownership
-	// after its promised deadline.
+	// A non-empty token proves continuity across enrollment/cert rotation. A
+	// takeover replaces it, so the displaced process cannot reclaim the lease.
+	// Empty-token clients retain the enrollment guard for rolling upgrades.
 	return scanAllocation(s.db.QueryRowContext(ctx,
-		`UPDATE disk_allocations SET lease_expires_at = ?
-		  WHERE id = ? AND bound_agent_id = ? AND revoked_at IS NULL
+		`UPDATE disk_allocations SET bound_agent_id = ?, lease_expires_at = ?,
+		    mount_lease_token_hash = CASE WHEN ? <> '' THEN ? ELSE mount_lease_token_hash END
+		  WHERE id = ? AND revoked_at IS NULL
 		    AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+		    AND ((? <> '' AND mount_lease_token_hash = ?)
+		         OR (? = '' AND mount_lease_token_hash IS NULL AND bound_agent_id = ?))
 		  RETURNING `+allocationColumns,
-		micros(now.Add(ttl)), allocID, agentEnrollmentID, micros(now)))
+		agentEnrollmentID, micros(now.Add(ttl)), newLeaseTokenHash, newLeaseTokenHash, allocID, micros(now),
+		leaseTokenHash, leaseTokenHash, leaseTokenHash, agentEnrollmentID))
 }
 
-func (s *Store) ReleaseMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID) (storage.Allocation, error) {
+func (s *Store) ReleaseMountLease(ctx context.Context, allocID, agentEnrollmentID uuid.UUID, leaseTokenHash string) (storage.Allocation, error) {
 	return scanAllocation(s.db.QueryRowContext(ctx,
-		`UPDATE disk_allocations SET bound_agent_id = NULL, bound_at = NULL, lease_expires_at = NULL
-		  WHERE id = ? AND (bound_agent_id = ? OR bound_agent_id IS NULL)
+		`UPDATE disk_allocations
+		    SET bound_agent_id = NULL, bound_at = NULL, lease_expires_at = NULL,
+		        mount_lease_token_hash = NULL
+		  WHERE id = ? AND (bound_agent_id IS NULL
+		    OR (? <> '' AND mount_lease_token_hash = ?)
+		    OR (? = '' AND mount_lease_token_hash IS NULL AND bound_agent_id = ?))
 		  RETURNING `+allocationColumns,
-		allocID, agentEnrollmentID))
+		allocID, leaseTokenHash, leaseTokenHash, leaseTokenHash, agentEnrollmentID))
 }
 
 func (s *Store) ForceReleaseMountLease(ctx context.Context, allocID, userID uuid.UUID) error {
 	var id uuid.UUID
 	err := s.db.QueryRowContext(ctx,
-		`UPDATE disk_allocations SET bound_agent_id = NULL, bound_at = NULL, lease_expires_at = NULL
+		`UPDATE disk_allocations SET bound_agent_id = NULL, bound_at = NULL, lease_expires_at = NULL,
+		                              mount_lease_token_hash = NULL
 		  WHERE id = ? AND user_id = ? AND revoked_at IS NULL RETURNING id`,
 		allocID, userID).Scan(&id)
 	return mapErr(err)

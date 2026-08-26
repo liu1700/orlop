@@ -12,6 +12,10 @@ ORDER BY enrolled_at DESC;
 SELECT * FROM agent_enrollments
 WHERE lower(cert_serial) = lower($1) AND cert_not_after > now();
 
+-- name: GetEnrollmentByFingerprint :one
+SELECT * FROM agent_enrollments
+WHERE lower(cert_serial) = lower($1);
+
 -- name: GetAgentEnrollment :one
 -- Resolve a single enrollment by its id (a disk_allocations.bound_agent_id FK),
 -- used to revoke the bound leaf's serial on lease release (issue #5).

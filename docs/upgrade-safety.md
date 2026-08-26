@@ -89,8 +89,17 @@ deployment, `migrate up` stops with an unresolved-owner count if placement
 cannot be inferred; restore those `server_vms` rows (or create the matching
 owner reservation explicitly) and rerun the idempotent migration.
 
-v0.5.4 through v0.6.4 ship **no control-plane migration**, so unlike the two upgrades
-above they roll back with a plain image revert and need no backup step.
+v0.5.4 through v0.6.4 ship **no control-plane migration**, so unlike the two
+upgrades above they roll back with a plain image revert and need no backup step.
+
+v0.6.5 adds nullable `disk_allocations.mount_lease_token_hash` in
+`0013_mount_lease_tokens.sql`. Run `orlop-control migrate up` before starting the
+new control plane. The column has no backfill: existing tokenless clients keep
+using their enrollment binding, while v0.6.5 clients advertise token support in
+an HTTP header and install a token on their first successful refresh. Because an
+older control plane does not understand renewal continuity tokens, roll out the
+v0.6.5 control plane before v0.6.5 mount clients. The migration is additive and
+nullable, so a database rollback is unnecessary if the binary must be reverted.
 
 v0.6.4 extends the same capacity path for JuiceFS-backed deployments: a full
 directory quota that stalls the backing write/`fsync` instead of returning an

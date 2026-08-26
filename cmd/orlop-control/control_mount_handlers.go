@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +29,7 @@ import (
 // ownership check and fence path need. *postgres.Store satisfies it.
 type mountLeaseStore interface {
 	GetActiveEnrollmentByFingerprint(ctx context.Context, fingerprint string) (storage.AgentEnrollment, error)
+	GetEnrollmentByFingerprint(ctx context.Context, fingerprint string) (storage.AgentEnrollment, error)
 	GetAllocation(ctx context.Context, id uuid.UUID) (storage.Allocation, error)
 	GetUser(ctx context.Context, id uuid.UUID) (storage.User, error)
 }
@@ -56,6 +60,10 @@ func mountLeaseRoutes(r chi.Router, h *mountLeaseHandlers) {
 
 type mountLeaseRequest struct {
 	AgentFingerprint string `json:"agent_fingerprint"`
+	// LeaseToken is an opaque per-acquire capability. New clients preserve it
+	// across certificate renewal; legacy clients omit it and continue to bind
+	// refresh/release to one enrollment row during rolling upgrades.
+	LeaseToken string `json:"lease_token"`
 	// Force opts in to taking over a lease that is still live for a different
 	// enrollment (issue #93): the caller asserts the incumbent's host is gone
 	// (crash recovery, dashboard take-over). Without it such an acquire is
@@ -63,12 +71,24 @@ type mountLeaseRequest struct {
 	Force bool `json:"force"`
 }
 
+const mountLeaseTokenHeader = "X-Orlop-Mount-Lease-Token"
+
 func (h *mountLeaseHandlers) handleAcquireMount(w http.ResponseWriter, r *http.Request) {
-	allocID, agentID, force, ok := h.resolveMountRequest(w, r)
+	allocID, agentID, force, _, supportsLeaseToken, ok := h.resolveMountRequest(w, r)
 	if !ok {
 		return
 	}
-	a, err := h.alloc.AcquireMountLease(r.Context(), allocID, agentID, h.leaseTTL, force)
+	leaseToken, leaseTokenHash := "", ""
+	if supportsLeaseToken {
+		var err error
+		leaseToken, leaseTokenHash, err = newMountLeaseToken()
+		if err != nil {
+			h.logger.Error("mount_lease_token_failed", "error", err, "allocation_id", uuidString(allocID))
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
+			return
+		}
+	}
+	a, err := h.alloc.AcquireMountLeaseWithToken(r.Context(), allocID, agentID, h.leaseTTL, force, leaseTokenHash)
 	if errors.Is(err, allocations.ErrLeaseLive) && !force {
 		// The row says someone holds this mount, but a mount lease is a timed
 		// reservation and outlives a holder that crashed. Refusing on the row
@@ -77,7 +97,7 @@ func (h *mountLeaseHandlers) handleAcquireMount(w http.ResponseWriter, r *http.R
 		// (issue #114). Ask the data plane, which knows whether anything is
 		// actually mounted, and reclaim only when the answer is a definite no.
 		if h.deadHolder(r.Context(), allocID) {
-			a, err = h.alloc.AcquireMountLease(r.Context(), allocID, agentID, h.leaseTTL, true)
+			a, err = h.alloc.AcquireMountLeaseWithToken(r.Context(), allocID, agentID, h.leaseTTL, true, leaseTokenHash)
 			if err == nil {
 				h.logger.Info("mount_lease_reclaimed_from_dead_holder",
 					"allocation_id", uuidString(allocID), "agent_id", uuidString(agentID))
@@ -95,10 +115,14 @@ func (h *mountLeaseHandlers) handleAcquireMount(w http.ResponseWriter, r *http.R
 	// it with "session fenced". Without it, the DB-lease takeover would still be blocked
 	// at the data plane. Best-effort, like the release path.
 	fenceAllocationBestEffort(r.Context(), h.logger, h.store, h.fencer, allocID, "acquire")
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"lease_id":   uuidString(a.ID),
 		"expires_at": a.LeaseExpiresAt.UTC().Format(time.RFC3339Nano),
-	})
+	}
+	if leaseToken != "" {
+		body["lease_token"] = leaseToken
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // deadHolder reports whether the allocation's incumbent mount is provably gone,
@@ -133,26 +157,42 @@ func (h *mountLeaseHandlers) deadHolder(ctx context.Context, allocID pgtype.UUID
 }
 
 func (h *mountLeaseHandlers) handleRefreshMount(w http.ResponseWriter, r *http.Request) {
-	allocID, agentID, _, ok := h.resolveMountRequest(w, r)
+	allocID, agentID, _, leaseToken, supportsLeaseToken, ok := h.resolveMountRequest(w, r)
 	if !ok {
 		return
 	}
-	a, err := h.alloc.RefreshMountLease(r.Context(), allocID, agentID, h.leaseTTL)
+	issuedToken, issuedHash := "", ""
+	if supportsLeaseToken && leaseToken == "" {
+		var err error
+		issuedToken, issuedHash, err = newMountLeaseToken()
+		if err != nil {
+			h.logger.Error("mount_lease_token_failed", "error", err, "allocation_id", uuidString(allocID))
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
+			return
+		}
+	}
+	a, err := h.alloc.RefreshMountLeaseWithToken(
+		r.Context(), allocID, agentID, h.leaseTTL,
+		hashMountLeaseToken(leaseToken), issuedHash)
 	if err != nil {
 		h.writeLeaseError(w, r, "refresh", allocID, agentID, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"expires_at": a.LeaseExpiresAt.UTC().Format(time.RFC3339Nano),
-	})
+	}
+	if issuedToken != "" {
+		body["lease_token"] = issuedToken
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (h *mountLeaseHandlers) handleReleaseMount(w http.ResponseWriter, r *http.Request) {
-	allocID, agentID, _, ok := h.resolveMountRequest(w, r)
+	allocID, agentID, _, leaseToken, _, ok := h.resolveMountRequest(w, r)
 	if !ok {
 		return
 	}
-	if err := h.alloc.ReleaseMountLease(r.Context(), allocID, agentID); err != nil {
+	if err := h.alloc.ReleaseMountLeaseWithToken(r.Context(), allocID, agentID, hashMountLeaseToken(leaseToken)); err != nil {
 		switch {
 		case errors.Is(err, allocations.ErrNotFound):
 			writeOAuthError(w, http.StatusNotFound, "not_found", "")
@@ -182,30 +222,42 @@ func (h *mountLeaseHandlers) handleReleaseMount(w http.ResponseWriter, r *http.R
 // once it is released or expired (or, with force, even while live — issue #93).
 // Cross-tenant access is denied here; cross-agent access is enforced at the data plane by
 // the agent-scoped cert.
-func (h *mountLeaseHandlers) resolveMountRequest(w http.ResponseWriter, r *http.Request) (pgtype.UUID, pgtype.UUID, bool, bool) {
+func (h *mountLeaseHandlers) resolveMountRequest(w http.ResponseWriter, r *http.Request) (pgtype.UUID, pgtype.UUID, bool, string, bool, bool) {
 	allocID, err := parseUUIDParam(chi.URLParam(r, "id"))
 	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "id must be a uuid")
-		return pgtype.UUID{}, pgtype.UUID{}, false, false
+		return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
 	}
-	fingerprint, force, err := agentFingerprintFromRequest(r)
+	fingerprint, force, leaseToken, supportsLeaseToken, err := agentFingerprintFromRequest(r)
 	if err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return pgtype.UUID{}, pgtype.UUID{}, false, false
+		return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
 	}
 	if fingerprint == "" {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "agent certificate or agent_fingerprint is required")
-		return pgtype.UUID{}, pgtype.UUID{}, false, false
+		return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
 	}
 	agent, err := h.store.GetActiveEnrollmentByFingerprint(r.Context(), fingerprint)
 	if errors.Is(err, storage.ErrNotFound) {
+		_, anyErr := h.store.GetEnrollmentByFingerprint(r.Context(), fingerprint)
+		if anyErr == nil {
+			// The renewal loop may recover after this request. Keep this distinct
+			// from an unknown/deleted enrollment, which remains terminal client-side.
+			writeOAuthError(w, http.StatusUnauthorized, "expired_client", "")
+			return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
+		}
+		if !errors.Is(anyErr, storage.ErrNotFound) {
+			h.logger.Error("mount_agent_lookup_failed", "error", anyErr, "allocation_id", uuidString(allocID))
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
+			return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
+		}
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "")
-		return pgtype.UUID{}, pgtype.UUID{}, false, false
+		return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
 	}
 	if err != nil {
 		h.logger.Error("mount_agent_lookup_failed", "error", err, "allocation_id", uuidString(allocID))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
-		return pgtype.UUID{}, pgtype.UUID{}, false, false
+		return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
 	}
 	// Resolve the stable lease identity from the allocation's bound agent. Require the
 	// authenticated cert's user to own the allocation, and the allocation to be bound to
@@ -214,44 +266,65 @@ func (h *mountLeaseHandlers) resolveMountRequest(w http.ResponseWriter, r *http.
 	alloc, err := h.store.GetAllocation(r.Context(), toUUID(allocID))
 	if errors.Is(err, storage.ErrNotFound) {
 		writeOAuthError(w, http.StatusNotFound, "not_found", "")
-		return pgtype.UUID{}, pgtype.UUID{}, false, false
+		return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
 	}
 	if err != nil {
 		h.logger.Error("mount_allocation_lookup_failed", "error", err, "allocation_id", uuidString(allocID))
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
-		return pgtype.UUID{}, pgtype.UUID{}, false, false
+		return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
 	}
 	if alloc.UserID != agent.UserID || alloc.AgentID == "" {
 		writeOAuthError(w, http.StatusForbidden, "access_denied", "")
-		return pgtype.UUID{}, pgtype.UUID{}, false, false
+		return pgtype.UUID{}, pgtype.UUID{}, false, "", false, false
 	}
-	// bound_agent_id is an FK into agent_enrollments, so the lease binds to the
-	// authenticated enrollment; the takeover (below) is what bridges across the
-	// per-turn enrollment churn.
-	return allocID, fromUUID(agent.ID), force, true
+	// The authenticated enrollment is the current binding. A continuity token
+	// may authorize refresh/release after certificate renewal changes that row.
+	return allocID, fromUUID(agent.ID), force, leaseToken, supportsLeaseToken, true
 }
 
-func agentFingerprintFromRequest(r *http.Request) (string, bool, error) {
+func agentFingerprintFromRequest(r *http.Request) (string, bool, string, bool, error) {
 	var body mountLeaseRequest
 	if r.Body != nil {
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, http.ErrBodyNotAllowed) {
-			return "", false, fmt.Errorf("invalid json body")
+			return "", false, "", false, fmt.Errorf("invalid json body")
 		}
 	}
+	leaseToken := strings.TrimSpace(body.LeaseToken)
+	if len(leaseToken) > 256 {
+		return "", false, "", false, fmt.Errorf("lease_token is too long")
+	}
+	supportsLeaseToken := r.Header.Get(mountLeaseTokenHeader) == "1" || leaseToken != ""
 	bodyFP := strings.TrimSpace(body.AgentFingerprint)
 	certFP := ""
 	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 		certFP = strings.ToUpper(r.TLS.PeerCertificates[0].SerialNumber.Text(16))
 	}
 	if bodyFP != "" && certFP != "" && !strings.EqualFold(bodyFP, certFP) {
-		return "", false, fmt.Errorf("agent_fingerprint does not match client certificate")
+		return "", false, "", false, fmt.Errorf("agent_fingerprint does not match client certificate")
 	}
 	if certFP != "" {
-		return certFP, body.Force, nil
+		return certFP, body.Force, leaseToken, supportsLeaseToken, nil
 	}
-	return bodyFP, body.Force, nil
+	return bodyFP, body.Force, leaseToken, supportsLeaseToken, nil
+}
+
+func newMountLeaseToken() (token, hash string, err error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("generate lease token: %w", err)
+	}
+	token = base64.RawURLEncoding.EncodeToString(raw)
+	return token, hashMountLeaseToken(token), nil
+}
+
+func hashMountLeaseToken(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func (h *mountLeaseHandlers) handleOwnerUnmount(w http.ResponseWriter, r *http.Request) {

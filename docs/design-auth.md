@@ -235,7 +235,7 @@ orlop uses no CRL or OCSP. Two mechanisms cover the gap:
 
 | Cert | TTL | Rotation |
 |---|---|---|
-| Agent leaf | 1h | re-minted on the next `/agent/enroll` |
+| Agent leaf | 1h | the mount renews it before expiry; the control-plane lease client and every subsequent data-plane dial atomically pick up the new identity |
 | Server leaf | ~90d | server self-re-signs in place (~⅔ of remaining life); new connections pick it up with no restart |
 | Tenant intermediate | 1y | rotated by the operator; rotating it invalidates **every** outstanding leaf for that tenant, the blunt, tenant-wide instrument |
 | Org root | 10y | offline; the deployment-wide anchor |
@@ -257,3 +257,12 @@ next session presenting that serial ─► dropped at the door
 The reconcile loop also re-pushes the full active set on every tick, so a server
 that restarts repopulates its deny-list within one interval. Entries age out once
 the underlying cert would have expired anyway.
+
+Certificate rotation does not change ownership of a live mount lease. Acquire
+returns a high-entropy opaque lease token whose digest is stored with the
+allocation. Refresh and release prove continuity with that token, allowing the
+control plane to rebind the lease from the old enrollment row to the renewed
+certificate. A forced takeover mints a different token, so a displaced process
+cannot refresh its way back in even if it enrolls again. Existing data-plane TLS
+sessions keep the identity negotiated at connection setup; reconnects snapshot
+the latest renewed cert and key.
