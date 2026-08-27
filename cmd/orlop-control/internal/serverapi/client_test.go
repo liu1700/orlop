@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -623,5 +624,31 @@ func TestQueryJournalAfterSeqForwardsCursor(t *testing.T) {
 	}
 	if len(res.Entries) != 0 {
 		t.Fatalf("entries=%d, want 0", len(res.Entries))
+	}
+}
+
+func TestRegisterTenantDiskQuotaExceeded(t *testing.T) {
+	ca := newTestCA(t)
+	srv := startMTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInsufficientStorage)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"code":    "disk_quota_exceeded",
+				"message": "account disk quota exceeded: mkdir /jfs/tenants/u_o/a_t: disk quota exceeded",
+			},
+		})
+	}), ca)
+
+	host := srv.Listener.Addr().String()
+	client := newClient(t, ca.pool)
+
+	_, err := client.RegisterTenant(context.Background(), host, "t1", "u_t1", "T", 1<<30)
+	var quotaFull serverapi.ErrDiskQuotaExceeded
+	if !errors.As(err, &quotaFull) {
+		t.Fatalf("err type = %T, want ErrDiskQuotaExceeded; err = %v", err, err)
+	}
+	if !strings.Contains(quotaFull.Detail, "disk quota exceeded") {
+		t.Fatalf("detail = %q, want the server message carried through", quotaFull.Detail)
 	}
 }

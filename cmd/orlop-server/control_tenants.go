@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"syscall"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/liu1700/orlop/cmd/orlop-server/internal/quota"
@@ -21,7 +22,25 @@ const (
 	errCodeRegistrationDisabled = "registration_disabled"
 	errCodeInvalidRequest       = "invalid_request"
 	errCodeFSQuotaUnavailable   = "fs_quota_unavailable"
+	errCodeDiskQuotaExceeded    = "disk_quota_exceeded"
 )
+
+// writeMkdirError classifies a tenant-dir MkdirAll failure. EDQUOT means the
+// account's shared owner-dir quota is full — an account-storage condition the
+// caller must surface to the user — so it gets 507 + its own code instead of
+// the opaque 500 mkdir_failed that reads as a server fault. The literal
+// "disk quota exceeded" prefix is deliberate: downstream layers (orlop-control's
+// enroll error, the mount client's stderr, host-side detectors) key on that
+// exact phrase, and the OS strerror alone is not portable (macOS spells it
+// "disc quota exceeded").
+func writeMkdirError(w http.ResponseWriter, err error) {
+	if errors.Is(err, syscall.EDQUOT) {
+		writeJSONError(w, http.StatusInsufficientStorage, errCodeDiskQuotaExceeded,
+			"account disk quota exceeded: "+err.Error())
+		return
+	}
+	writeJSONError(w, http.StatusInternalServerError, "mkdir_failed", err.Error())
+}
 
 type registerTenantRequest struct {
 	TenantID string `json:"tenant_id"`
@@ -164,11 +183,11 @@ func (s *serverState) registerTenant(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := os.MkdirAll(storeRoot, 0o750); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "mkdir_failed", err.Error())
+		writeMkdirError(w, err)
 		return
 	}
 	if err := os.MkdirAll(metaTenantDir, 0o750); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "mkdir_failed", err.Error())
+		writeMkdirError(w, err)
 		return
 	}
 
@@ -401,7 +420,7 @@ func (s *serverState) setAccountQuota(w http.ResponseWriter, r *http.Request) {
 	// would only stall unrelated tenant lookups and registrations (#119).
 	ownerDir := filepath.Join(s.adminCfg.TenantsRoot, owner)
 	if err := os.MkdirAll(ownerDir, 0o750); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "mkdir_failed", err.Error())
+		writeMkdirError(w, err)
 		return
 	}
 	// Async path: hand the (re)assertion to the background applier so a slow first

@@ -48,6 +48,8 @@ enum Behaviour {
     RetryThenSuccess,
     /// Always 503.
     AlwaysUnavailable,
+    /// 507 account_disk_full — the account's shared disk quota is exhausted.
+    DiskFull,
     /// Workload-identity mint endpoint returns a fresh one-shot token.
     MintSuccess,
 }
@@ -167,6 +169,11 @@ fn start(behaviour: Behaviour) -> Server {
                 "503 Service Unavailable",
                 "Retry-After: 1\r\n",
                 String::new(),
+            ),
+            Behaviour::DiskFull => (
+                "507 Insufficient Storage",
+                "",
+                r#"{"error":"account_disk_full","error_description":"account disk quota exceeded: the account's shared disk is full; free up space or add storage"}"#.to_string(),
             ),
             Behaviour::MintSuccess => (
                 "200 OK",
@@ -314,4 +321,20 @@ fn shred_after_enroll_leaves_no_cert_files() {
     assert!(!dir.0.join("cert.pem").exists());
     assert!(!dir.0.join("key.pem").exists());
     assert!(!dir.0.join("ca.pem").exists());
+}
+
+#[test]
+fn enroll_disk_full_is_terminal_with_quota_marker() {
+    let srv = start(Behaviour::DiskFull);
+    let dir = Tmp::new();
+    let err = enroll::enroll(&creds(&srv.addr), &dir.0).unwrap_err();
+    let msg = err.to_string();
+    // Hosts watching our stderr classify on this exact phrase — keep it stable.
+    assert!(
+        msg.contains("disk quota exceeded"),
+        "error must carry the quota marker, got: {msg}"
+    );
+    assert!(msg.contains("507"), "error should name the status, got: {msg}");
+    // A hard quota condition must not be retried by the enroll client.
+    assert_eq!(srv.request_count.load(Ordering::SeqCst), 1);
 }

@@ -23,6 +23,7 @@ const defaultTimeout = 10 * time.Second
 // Server-side codes from cmd/orlop-server/control_tenants.go. Keep in sync.
 const (
 	codeSizeMismatch       = "size_mismatch"
+	codeDiskQuotaExceeded  = "disk_quota_exceeded"
 	codeFSQuotaUnavailable = "fs_quota_unavailable"
 )
 
@@ -115,6 +116,18 @@ type ErrQuotaUnavailable struct {
 
 func (e ErrQuotaUnavailable) Error() string {
 	return fmt.Sprintf("serverapi: quota unavailable: %s", e.Detail)
+}
+
+// ErrDiskQuotaExceeded is returned when orlop-server reports a 507 with
+// code=disk_quota_exceeded: the account's shared owner-dir quota is full, so
+// the tenant dir cannot be created. A hard account-storage condition — not a
+// server fault and not retryable until the account frees or buys space.
+type ErrDiskQuotaExceeded struct {
+	Detail string
+}
+
+func (e ErrDiskQuotaExceeded) Error() string {
+	return fmt.Sprintf("serverapi: account disk quota exceeded: %s", e.Detail)
 }
 
 // ErrAdmin is returned for any other non-2xx response.
@@ -213,6 +226,8 @@ func (c *Client) RegisterTenant(ctx context.Context, opsAddr, tenantID, ownerTen
 		return 0, ErrSizeMismatch{Existing: e.ExistingSizeBytes}
 	case status == http.StatusInternalServerError && e.Code == codeFSQuotaUnavailable:
 		return 0, ErrQuotaUnavailable{Detail: e.Detail}
+	case status == http.StatusInsufficientStorage && e.Code == codeDiskQuotaExceeded:
+		return 0, ErrDiskQuotaExceeded{Detail: e.Message}
 	default:
 		return 0, ErrAdmin{Status: status, Code: e.Code, Message: e.Message}
 	}

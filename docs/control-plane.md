@@ -66,6 +66,7 @@ Successful responses are JSON with `Content-Type: application/json`.
 | `410 Gone` | revoked allocation or lost lease (`revoked`, `lease_lost`) |
 | `429 Too Many Requests` | rate limited (`rate_limited`) |
 | `503 Service Unavailable` | transient; retry. `POST /agent/enroll` adds `Retry-After: 60` when CA material or server placement is not yet ready |
+| `507 Insufficient Storage` | the account's shared disk quota is full (`account_disk_full`); terminal for the mount — the account must free space or add storage before enroll can place the tenant |
 | `500 Internal Server Error` | `server_error` |
 
 ### Error shape
@@ -236,6 +237,11 @@ return `503` with `Retry-After: 60` so a sidecar can retry without burning the
 (still-unspent) enroll token. Pool exhaustion uses the wire error
 `no_capacity`; other placement failures use `server_vm_unavailable`, so an
 operator is not sent to debug a healthy data-plane VM when the pool is full.
+A placement blocked by the account's own shared disk quota (the data plane
+cannot create the tenant dir under the full owner dir) is not retryable and
+returns `507` with `account_disk_full`; the `error_description` carries the
+literal "disk quota exceeded" phrase, which the mount client preserves in its
+error output so a supervising host can classify the failure from stderr.
 Because the data plane enforces one shared owner-directory quota, placement
 debits that account budget once per hosting server. Additional agents on the
 same account/server reuse the durable reservation; the last purge releases it.
