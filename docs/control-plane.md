@@ -59,7 +59,7 @@ Successful responses are JSON with `Content-Type: application/json`.
 | `201 Created` | success, resource created (`POST /v1/tokens`) |
 | `204 No Content` | success, no body (`POST /auth/logout`, `DELETE /v1/entities/...`) |
 | `400 Bad Request` | malformed request |
-| `401 Unauthorized` | missing/invalid/expired credential (`invalid_token`, `invalid_client`, `expired_client`). An expired enrolled certificate is reported as `expired_client`, so a renewing mount can retry while a genuinely unknown certificate remains terminal |
+| `401 Unauthorized` | missing/invalid/expired credential (`invalid_token`, `invalid_client`, `expired_client`). An expired enrolled certificate is reported as `expired_client`, so a renewing mount can retry while a genuinely unknown certificate remains terminal. That retry is bounded client-side: a mount whose own certificate renewal has failed terminally, or whose lease window has already closed, fences itself instead of retrying |
 | `403 Forbidden` | authenticated but not allowed (`access_denied`: suspended tenant/user, tenant not allowed, missing agent scope) |
 | `404 Not Found` | unknown resource |
 | `409 Conflict` | mount or capacity conflict (`wrong_agent`, `already_mounted`, `lease_live`, `insufficient_capacity`). `lease_live` means the acquire would displace a mount lease that is still live for a different enrollment; its body carries the incumbent's `bound_at` and `lease_expires_at`, and the caller may retry with `{"force": true}` to take over |
