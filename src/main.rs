@@ -959,6 +959,19 @@ impl CertRotationTargets {
         *self.data_plane_identity.write() = tls;
         Ok(())
     }
+
+    /// Publish a terminal renewal failure to the lease loop.
+    ///
+    /// Without it the two loops make locally reasonable but globally
+    /// inconsistent decisions: this loop exits knowing no new certificate is
+    /// ever coming, while the lease loop keeps reading `expired_client` as
+    /// "renewal will fix it" and retries at its floor forever, leaving a mount
+    /// serving past its last valid certificate and lease (#143).
+    fn mark_renewal_terminal(&self) {
+        if let Some(client) = &self.mount_lease {
+            client.mark_renewal_terminal();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -971,6 +984,11 @@ struct MountLeaseClient {
     /// a different enrollment (the control plane otherwise answers 409
     /// lease_live). Only affects acquire; refresh/release never send it.
     takeover: bool,
+    /// Set once by `cert_renewal_loop` when certificate renewal has hit an
+    /// authentication failure no retry can fix — the enroll identity behind
+    /// this process is gone. The refresh loop reads it to tell a recoverable
+    /// `expired_client` 401 from one that can never recover (#143).
+    renewal_terminal: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -998,6 +1016,14 @@ struct MountLeaseManager {
 // of the control plane). The server rejects unsafe TTLs that do not leave
 // several of these intervals for refresh and retry.
 const MIN_MOUNT_LEASE_REFRESH_WAIT: Duration = Duration::from_secs(1);
+// Retry ceiling once the lease window has closed. Without it the wait sits at
+// MIN_MOUNT_LEASE_REFRESH_WAIT forever, which is what turned a stuck identity
+// into a 1 Hz 401 storm against the control plane (#143).
+const MAX_MOUNT_LEASE_RETRY_WAIT: Duration = Duration::from_secs(30);
+/// Stable marker inside the `401 expired_client` error message. The refresh
+/// loop matches on it to recognise "our own certificate is stale" as a class
+/// distinct from an unclassified transport or server failure.
+const LEASE_STALE_IDENTITY: &str = "waiting for certificate renewal";
 const MOUNT_LEASE_TOKEN_HEADER: &str = "X-Orlop-Mount-Lease-Token";
 
 impl MountLeaseManager {
@@ -1170,6 +1196,7 @@ impl MountLeaseClient {
             base_url: control_plane_url.trim_end_matches('/').to_string(),
             allocation_id,
             takeover,
+            renewal_terminal: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1277,6 +1304,17 @@ impl MountLeaseClient {
         self.lease_token.read().clone()
     }
 
+    /// Record that certificate renewal has reached a terminal authentication
+    /// failure. One-way: nothing clears it, because nothing in this process
+    /// can mint a new identity once the renewal loop has given up.
+    fn mark_renewal_terminal(&self) {
+        self.renewal_terminal.store(true, Ordering::Relaxed);
+    }
+
+    fn renewal_is_terminal(&self) -> bool {
+        self.renewal_terminal.load(Ordering::Relaxed)
+    }
+
     fn build_auth(agent_fingerprint: String, tls: &TlsIdentity) -> anyhow::Result<MountLeaseAuth> {
         let identity =
             reqwest::Identity::from_pem(&tls.pem_bundle()).context("parse client TLS identity")?;
@@ -1295,7 +1333,7 @@ impl MountLeaseClient {
 /// Maps a non-2xx lease response onto an `anyhow::Error` whose message the
 /// refresh loop classifies as either retryable (warn and continue) or
 /// terminal ("revoked" / "lease lost" / "already mounted by another agent"
-/// → unmount). See `mount_lease_refresh_loop` for the matching strings.
+/// → unmount). See [`classify_refresh_failure`] for the matching strings.
 fn classify_lease_error(status: StatusCode, body: &str, op: &str) -> anyhow::Error {
     if status == StatusCode::CONFLICT && body.contains("lease_live") {
         // Acquire-time refusal (issue #93): the incumbent's lease is still
@@ -1324,13 +1362,82 @@ fn classify_lease_error(status: StatusCode, body: &str, op: &str) -> anyhow::Err
     if status == StatusCode::UNAUTHORIZED && body.contains("invalid_client") {
         return anyhow::anyhow!("mount lease lost");
     }
-    // An expired enrollment is recoverable: the certificate-renewal loop may
-    // publish a fresh identity after this request. Keep it off the terminal
-    // eviction substrings so the healthy filesystem is not aborted meanwhile.
+    // An expired enrollment MAY be recoverable: the certificate-renewal loop
+    // may publish a fresh identity after this request. Keep it off the terminal
+    // eviction substrings so the healthy filesystem is not aborted meanwhile —
+    // [`classify_refresh_failure`] owns the decision about when waiting for a
+    // renewal that is never coming becomes terminal instead.
     if status == StatusCode::UNAUTHORIZED && body.contains("expired_client") {
-        return anyhow::anyhow!("{op} mount lease waiting for certificate renewal: {status}");
+        return anyhow::anyhow!("{op} mount lease {LEASE_STALE_IDENTITY}: {status}");
     }
     anyhow::anyhow!("{op} mount lease failed: {status} {body}")
+}
+
+/// What the refresh loop does about a failed `/mount/refresh`.
+enum RefreshFailure {
+    /// Warn and try again: the mount can still prove it holds the lease, or
+    /// the failure says nothing about whether it does.
+    Retry,
+    /// Stop serving. The mount can no longer prove it holds the lease and no
+    /// future request from this process will change that.
+    Evict(String),
+}
+
+/// Decide whether a failed lease refresh is survivable.
+///
+/// The terminal substrings ("revoked" / "lease lost" / "already mounted by
+/// another agent") mean the control plane has already taken the lease away.
+///
+/// A `401 expired_client` is genuinely ambiguous: the certificate-renewal loop
+/// may be about to publish a fresh identity, so it stays retryable — but only
+/// while that is still possible. It stops being possible when
+///
+/// - renewal has hit a terminal authentication failure, e.g. the Pod-bound
+///   enroll identity was deleted while this mount survived, so no request from
+///   this process can ever succeed again; or
+/// - the last server-authoritative lease window has closed, so this process is
+///   no longer the holder of record and the allocation is free for another
+///   holder to take.
+///
+/// In both cases the mount has outlived its last valid certificate and lease
+/// and must converge to a fenced state instead of serving a filesystem it
+/// cannot prove it owns (#143). This only gives a lease up — it never takes
+/// one, so the exclusive-holder and continuity-token rules are untouched.
+fn classify_refresh_failure(
+    msg: &str,
+    renewal_terminal: bool,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RefreshFailure {
+    // "already mounted by another agent" comes from a Take over — the
+    // dashboard handed our lease to a different device. Same fatal treatment
+    // as a revoke: stop serving a filesystem we no longer own instead of
+    // spinning warnings forever (#155).
+    if msg.contains("revoked")
+        || msg.contains("lease lost")
+        || msg.contains("already mounted by another agent")
+    {
+        return RefreshFailure::Evict(msg.to_string());
+    }
+    if !msg.contains(LEASE_STALE_IDENTITY) {
+        // Transport errors, 5xx, anything unclassified: the control plane may
+        // simply be unreachable, which says nothing about who holds the lease.
+        return RefreshFailure::Retry;
+    }
+    if renewal_terminal {
+        return RefreshFailure::Evict(format!(
+            "mount lease lost: certificate renewal failed terminally and this \
+             certificate has expired, so the mount can never re-authenticate ({msg})"
+        ));
+    }
+    if now >= expires_at {
+        return RefreshFailure::Evict(format!(
+            "mount lease lost: the lease expired at {} and the client identity is \
+             still unusable ({msg})",
+            expires_at.to_rfc3339()
+        ));
+    }
+    RefreshFailure::Retry
 }
 
 fn mount_lease_refresh_loop(
@@ -1341,27 +1448,27 @@ fn mount_lease_refresh_loop(
     on_eviction: EvictionAction,
     mut expires_at: chrono::DateTime<chrono::Utc>,
 ) {
+    let mut failures = 0u32;
     loop {
-        let wait = mount_lease_refresh_wait(expires_at, chrono::Utc::now());
+        let wait = mount_lease_refresh_wait(expires_at, chrono::Utc::now(), failures);
         match stop.recv_timeout(wait) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         match client.refresh() {
             Ok(lease) => {
+                failures = 0;
                 expires_at = lease.expires_at;
                 eprintln!("refreshed mount lease until {}", expires_at.to_rfc3339());
             }
             Err(err) => {
-                let msg = err.to_string();
-                // "already mounted by another agent" comes from a Take over —
-                // the dashboard handed our lease to a different device. Same
-                // fatal treatment as a revoke: stop serving a filesystem we no
-                // longer own instead of spinning warnings forever (#155).
-                if msg.contains("revoked")
-                    || msg.contains("lease lost")
-                    || msg.contains("already mounted by another agent")
-                {
+                failures = failures.saturating_add(1);
+                if let RefreshFailure::Evict(reason) = classify_refresh_failure(
+                    &err.to_string(),
+                    client.renewal_is_terminal(),
+                    expires_at,
+                    chrono::Utc::now(),
+                ) {
                     revoked.store(true, Ordering::Relaxed);
                     match on_eviction {
                         // This is an INVOLUNTARY eviction: a clean unmount
@@ -1372,7 +1479,7 @@ fn mount_lease_refresh_loop(
                         // running Drop, so all I/O fails with ENOTCONN.
                         EvictionAction::Abort => {
                             eprintln!(
-                                "{msg}; aborting mount at {} so workload I/O fails instead of \
+                                "{reason}; aborting mount at {} so workload I/O fails instead of \
                                  landing in the directory underneath (--on-eviction=unmount \
                                  restores the previous behavior)",
                                 mountpoint.display()
@@ -1381,7 +1488,7 @@ fn mount_lease_refresh_loop(
                         }
                         EvictionAction::Unmount => {
                             eprintln!(
-                                "{msg}; signaling daemon to unmount {}",
+                                "{reason}; signaling daemon to unmount {}",
                                 mountpoint.display()
                             );
                             // Signal ourselves — MountedFs's signal handler runs Drop which
@@ -1393,6 +1500,9 @@ fn mount_lease_refresh_loop(
                         }
                     }
                 }
+                // Rate-limited by the backoff in mount_lease_refresh_wait: a
+                // refresh that keeps failing past expiry logs on the backoff
+                // schedule, not once a second.
                 eprintln!("warning: mount lease refresh failed: {err:#}");
             }
         }
@@ -1402,14 +1512,33 @@ fn mount_lease_refresh_loop(
 /// Schedule at half the remaining server-authoritative lease window. Reusing
 /// expires_at from every response removes the unsafe shared 60s/30s constants:
 /// a control plane configured with a shorter or longer TTL automatically moves
-/// the client cadence with it. Near/past expiry, retry no faster than once per
+/// the client cadence with it. Near expiry, retry no faster than once per
 /// second rather than spinning.
+///
+/// Past expiry the halving has nothing left to give, so consecutive failures
+/// back the retry off from one second to [`MAX_MOUNT_LEASE_RETRY_WAIT`]. The
+/// backoff deliberately starts only after the window closes: inside it, every
+/// scheduled attempt is a real chance to keep the lease and must not be
+/// skipped (#143).
 fn mount_lease_refresh_wait(
     expires_at: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
+    failures: u32,
 ) -> Duration {
     let remaining = (expires_at - now).to_std().unwrap_or(Duration::ZERO);
-    std::cmp::max(remaining / 2, MIN_MOUNT_LEASE_REFRESH_WAIT)
+    if remaining > Duration::ZERO {
+        return std::cmp::max(remaining / 2, MIN_MOUNT_LEASE_REFRESH_WAIT);
+    }
+    mount_lease_retry_floor(failures)
+}
+
+/// 1s, 1s, 2s, 4s, 8s, 16s, then [`MAX_MOUNT_LEASE_RETRY_WAIT`].
+fn mount_lease_retry_floor(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(5);
+    std::cmp::min(
+        MIN_MOUNT_LEASE_REFRESH_WAIT * (1u32 << shift),
+        MAX_MOUNT_LEASE_RETRY_WAIT,
+    )
 }
 
 impl CertManager {
@@ -1538,6 +1667,10 @@ fn cert_renewal_loop(
                 failure_count = failure_count.saturating_add(1);
                 eprintln!("warning: hosted client certificate renewal failed: {err:#}");
                 if auth_state_invalid(&err) {
+                    // Fence the mount: this process can never authenticate
+                    // again, so the lease loop has to stop serving once the
+                    // current certificate and lease lapse (#143).
+                    rotation_targets.mark_renewal_terminal();
                     eprintln!(
                         "hosted session is invalid; the host must re-enroll the agent \
                          (mint a fresh enroll token and re-run `orlop mount --from-env`)"
@@ -2681,7 +2814,20 @@ mod mount_lease_auth_rotation {
             base_url: "http://127.0.0.1".into(),
             allocation_id: "alloc".into(),
             takeover: false,
+            renewal_terminal: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The cert-renewal loop only ever holds a CLONE of this client (via
+    /// CertRotationTargets), so the terminal flag has to be shared state — a
+    /// plain bool would leave the refresh loop none the wiser (#143).
+    #[test]
+    fn terminal_renewal_is_visible_through_a_clone() {
+        let client = client();
+        let held_by_cert_loop = client.clone();
+        assert!(!client.renewal_is_terminal());
+        held_by_cert_loop.mark_renewal_terminal();
+        assert!(client.renewal_is_terminal());
     }
 
     #[test]
@@ -2722,11 +2868,11 @@ mod mount_lease_refresh_timing {
     fn uses_half_of_each_authoritative_window() {
         let now = at(0);
         assert_eq!(
-            mount_lease_refresh_wait(at(20), now),
+            mount_lease_refresh_wait(at(20), now, 0),
             Duration::from_secs(10)
         );
         assert_eq!(
-            mount_lease_refresh_wait(at(40), now),
+            mount_lease_refresh_wait(at(40), now, 0),
             Duration::from_secs(20)
         );
     }
@@ -2735,10 +2881,193 @@ mod mount_lease_refresh_timing {
     fn floors_near_or_past_expiry_at_one_second() {
         let now = at(10);
         assert_eq!(
-            mount_lease_refresh_wait(at(11), now),
+            mount_lease_refresh_wait(at(11), now, 0),
             Duration::from_secs(1)
         );
-        assert_eq!(mount_lease_refresh_wait(at(9), now), Duration::from_secs(1));
+        assert_eq!(
+            mount_lease_refresh_wait(at(9), now, 0),
+            Duration::from_secs(1)
+        );
+    }
+
+    /// Inside the window every scheduled attempt is a real chance to keep the
+    /// lease, so failures must not push one past the deadline.
+    #[test]
+    fn failures_do_not_delay_attempts_while_the_lease_is_live() {
+        let now = at(0);
+        for failures in 0..8 {
+            assert_eq!(
+                mount_lease_refresh_wait(at(4), now, failures),
+                Duration::from_secs(2),
+                "failures={failures}"
+            );
+        }
+    }
+
+    /// The 1 Hz 401 storm of #143: past expiry the halving is exhausted, so
+    /// the retry floor has to grow instead.
+    #[test]
+    fn past_expiry_failures_back_off_to_the_ceiling() {
+        let now = at(30);
+        let waits: Vec<u64> = (0..9)
+            .map(|f| mount_lease_refresh_wait(at(10), now, f).as_secs())
+            .collect();
+        assert_eq!(waits, vec![1, 1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(
+            mount_lease_refresh_wait(at(10), now, u32::MAX),
+            MAX_MOUNT_LEASE_RETRY_WAIT
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_renewal_fencing {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(minute: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 8, 26, 21, minute, 0)
+            .unwrap()
+    }
+
+    fn expired_client() -> String {
+        classify_lease_error(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"expired_client"}"#,
+            "refresh",
+        )
+        .to_string()
+    }
+
+    fn evicts(outcome: RefreshFailure) -> Option<String> {
+        match outcome {
+            RefreshFailure::Evict(reason) => Some(reason),
+            RefreshFailure::Retry => None,
+        }
+    }
+
+    /// The path #143 must not break: renewal is still working on it and the
+    /// lease is still live, so the healthy filesystem keeps serving.
+    #[test]
+    fn expired_client_is_retryable_while_renewal_can_still_recover() {
+        assert!(evicts(classify_refresh_failure(
+            &expired_client(),
+            false,
+            at(43),
+            at(38),
+        ))
+        .is_none());
+    }
+
+    /// A deleted Pod-bound identity: renewal has already given up, so the
+    /// first 401 after the certificate expires is the end of the line.
+    #[test]
+    fn expired_client_is_terminal_once_renewal_is_terminal() {
+        let reason = evicts(classify_refresh_failure(
+            &expired_client(),
+            true,
+            at(43),
+            at(38),
+        ))
+        .expect("terminal renewal must fence the mount");
+        assert!(reason.contains("mount lease lost"), "{reason}");
+        assert!(reason.contains("can never re-authenticate"), "{reason}");
+    }
+
+    /// Backstop for the modes with no renewal loop to report terminality
+    /// (pre-enrolled sidecar): once the server-authoritative window has closed
+    /// this process is not the holder any more, so it must stop serving.
+    #[test]
+    fn expired_client_is_terminal_once_the_lease_window_has_closed() {
+        let reason = evicts(classify_refresh_failure(
+            &expired_client(),
+            false,
+            at(43),
+            at(43),
+        ))
+        .expect("an expired lease with an unusable identity must fence the mount");
+        assert!(reason.contains("mount lease lost"), "{reason}");
+        assert!(reason.contains("21:43:00"), "{reason}");
+    }
+
+    /// An unreachable control plane says nothing about who holds the lease;
+    /// treating it as terminal would turn every blip into a dead mount.
+    #[test]
+    fn unclassified_failures_stay_retryable_even_past_expiry() {
+        let transient =
+            classify_lease_error(StatusCode::BAD_GATEWAY, "upstream timeout", "refresh")
+                .to_string();
+        assert!(evicts(classify_refresh_failure(&transient, false, at(43), at(50))).is_none());
+        assert!(evicts(classify_refresh_failure(&transient, true, at(43), at(50))).is_none());
+    }
+
+    #[test]
+    fn control_plane_takeaways_remain_terminal() {
+        for body in [
+            r#"{"error":"revoked"}"#,
+            r#"{"error":"lease_lost"}"#,
+            r#"{"error":"invalid_client"}"#,
+        ] {
+            let status = if body.contains("invalid_client") {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::GONE
+            };
+            let msg = classify_lease_error(status, body, "refresh").to_string();
+            assert!(
+                evicts(classify_refresh_failure(&msg, false, at(59), at(38))).is_some(),
+                "{body} must stay terminal"
+            );
+        }
+    }
+
+    /// Accelerated replay of the production incident, driving the same
+    /// decision and scheduling functions the refresh loop uses.
+    ///
+    /// Mount at 21:38 holding a lease to 21:43 whose certificate has just
+    /// expired, so every refresh answers 401 expired_client. Returns the
+    /// simulated minute the mount fenced itself, plus the number of refresh
+    /// attempts (== warning lines) it took to get there.
+    fn replay(renewal_terminal: bool) -> (i64, usize) {
+        let expires_at = at(43);
+        let mut now = at(38);
+        // Every attempt fails here, so the consecutive-failure count the loop
+        // feeds the backoff is just the attempt number.
+        for attempts in 0..10_000 {
+            now += chrono::Duration::from_std(mount_lease_refresh_wait(expires_at, now, attempts))
+                .unwrap();
+            if evicts(classify_refresh_failure(
+                &expired_client(),
+                renewal_terminal,
+                expires_at,
+                now,
+            ))
+            .is_some()
+            {
+                return ((now - at(38)).num_minutes(), attempts as usize + 1);
+            }
+        }
+        panic!("mount never converged; it would retry 401s forever (#143)");
+    }
+
+    #[test]
+    fn a_terminally_unrenewable_mount_fences_itself_on_the_next_refresh() {
+        let (minutes, attempts) = replay(true);
+        assert_eq!(attempts, 1, "must fence on the first 401, not retry it");
+        // That first 401 lands on the next scheduled refresh — half of what is
+        // left of the lease window — so the mount never outlives the window.
+        assert!(minutes <= 3, "converged after {minutes} min");
+    }
+
+    #[test]
+    fn without_the_terminal_signal_the_lease_deadline_still_bounds_it() {
+        let (minutes, attempts) = replay(false);
+        // Bounded by the lease window (5 min here), not the 96 minutes the
+        // production mount spent retrying before it was removed by hand.
+        assert!((5..=6).contains(&minutes), "converged after {minutes} min");
+        // And bounded in noise: a handful of warnings, not one per second.
+        assert!(attempts < 20, "{attempts} attempts before fencing");
     }
 }
 
