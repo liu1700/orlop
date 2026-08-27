@@ -27,6 +27,9 @@ check the control plane runs at boot.
 | v0.6.0 | HEAD | Postgres, SQLite |
 | v0.6.1 | HEAD | Postgres, SQLite |
 | v0.6.2 | HEAD | Postgres, SQLite |
+| v0.6.3 | HEAD | Postgres, SQLite |
+| v0.6.4 | HEAD | Postgres, SQLite |
+| v0.6.5 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -91,6 +94,20 @@ owner reservation explicitly) and rerun the idempotent migration.
 
 v0.5.4 through v0.6.4 ship **no control-plane migration**, so unlike the two
 upgrades above they roll back with a plain image revert and need no backup step.
+
+v0.6.6 is a mount-client-only change and ships **no control-plane migration**,
+so orlop-control and orlop-server roll independently and revert with a plain
+image swap. It closes the case where a mount outlives the identity that renews
+it: when a Pod API object is force-deleted while its sandbox and mount process
+survive, the Pod-bound token stops verifying, certificate renewal fails
+terminally, and before this release the mount-lease loop never learned that — it
+read `401 expired_client` as "renewal will fix this" and retried once a second
+indefinitely. Terminal renewal state now reaches that loop, so `expired_client`
+becomes terminal once renewal has given up or the last lease window has closed,
+taking the existing eviction path (aborted FUSE connection, exit 69 under
+`--from-env`). Retries past lease expiry back off from one second to thirty.
+Transport and 5xx failures stay retryable, and no lease is ever taken from
+another holder — only given up (#143).
 
 v0.6.5 adds nullable `disk_allocations.mount_lease_token_hash` in
 `0013_mount_lease_tokens.sql`. Run `orlop-control migrate up` before starting the
