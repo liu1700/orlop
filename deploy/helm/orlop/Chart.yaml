@@ -7,9 +7,9 @@ description: >-
   from the published GHCR images, parameterized by image, database URL, and the
   shared token.
 type: application
-version: 0.1.13
+version: 0.1.14
 # Tracks the orlop release whose images this chart targets by default.
-appVersion: "v0.6.6"
+appVersion: "v0.6.7"
 home: https://orlop.dev
 sources:
   - https://github.com/liu1700/orlop

@@ -30,6 +30,7 @@ check the control plane runs at boot.
 | v0.6.3 | HEAD | Postgres, SQLite |
 | v0.6.4 | HEAD | Postgres, SQLite |
 | v0.6.5 | HEAD | Postgres, SQLite |
+| v0.6.6 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -108,6 +109,14 @@ taking the existing eviction path (aborted FUSE connection, exit 69 under
 `--from-env`). Retries past lease expiry back off from one second to thirty.
 Transport and 5xx failures stay retryable, and no lease is ever taken from
 another holder — only given up (#143).
+
+v0.6.7 ships **no control-plane migration** either — it only changes error
+classification: a tenant registration blocked by the account's full shared
+disk quota now surfaces as a typed `507` (`disk_quota_exceeded` from
+orlop-server, `account_disk_full` from the enroll route) instead of a generic
+`500 server_error`, and the mount client treats it as terminal instead of
+retrying (#146). All three components roll independently and revert with a
+plain image swap.
 
 v0.6.5 adds nullable `disk_allocations.mount_lease_token_hash` in
 `0013_mount_lease_tokens.sql`. Run `orlop-control migrate up` before starting the
