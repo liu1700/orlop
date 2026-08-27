@@ -13,7 +13,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -582,5 +584,49 @@ func TestRegisterTenantConcurrentSameTenantNoLeak(t *testing.T) {
 		if r.projectID != firstPID {
 			t.Errorf("result[%d] project_id = %d, want %d", i, r.projectID, firstPID)
 		}
+	}
+}
+
+func TestWriteMkdirErrorClassifiesQuotaExceeded(t *testing.T) {
+	// EDQUOT from the JuiceFS owner dir: an account-storage condition, not a
+	// server fault — must surface as 507 disk_quota_exceeded with the OS
+	// "disk quota exceeded" text preserved (downstream classifiers key on it).
+	rec := httptest.NewRecorder()
+	writeMkdirError(rec, &os.PathError{
+		Op:   "mkdir",
+		Path: "/jfs/tenants/u_owner/a_agent",
+		Err:  syscall.EDQUOT,
+	})
+	if rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want 507", rec.Code)
+	}
+	var body struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error.Code != "disk_quota_exceeded" {
+		t.Fatalf("code = %q, want disk_quota_exceeded", body.Error.Code)
+	}
+	// The stable literal marker, not the OS strerror (macOS says "disc").
+	if !strings.HasPrefix(body.Error.Message, "account disk quota exceeded: ") {
+		t.Fatalf("message = %q, want the stable disk-quota prefix", body.Error.Message)
+	}
+
+	// Any other mkdir failure keeps the existing 500 mkdir_failed shape.
+	rec = httptest.NewRecorder()
+	writeMkdirError(rec, &os.PathError{Op: "mkdir", Path: "/jfs/tenants/x", Err: syscall.EACCES})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("non-quota status = %d, want 500", rec.Code)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error.Code != "mkdir_failed" {
+		t.Fatalf("non-quota code = %q, want mkdir_failed", body.Error.Code)
 	}
 }

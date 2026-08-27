@@ -17,6 +17,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 )
@@ -182,6 +183,19 @@ func (h *agentEnrollHandlers) handleEnroll(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			if placementErr != nil {
+				// A full account quota is a hard, user-actionable condition: the
+				// owner-dir cap blocks the tenant mkdir, and no amount of enroll
+				// retrying changes that. Surface it typed (507) with the
+				// "disk quota exceeded" marker in the description so the mount
+				// client — and any host watching its stderr — can classify it,
+				// instead of scrubbing it into a retryable-looking server_error.
+				var quotaFull serverapi.ErrDiskQuotaExceeded
+				if errors.As(placementErr, &quotaFull) {
+					h.logger.Warn("agent_enroll_account_disk_full", "tenant_id", ident.TenantID)
+					writeOAuthError(w, http.StatusInsufficientStorage, "account_disk_full",
+						"account disk quota exceeded: the account's shared disk is full; free up space or add storage")
+					return
+				}
 				h.logger.Error("agent_enroll_placement_failed", "error", placementErr, "tenant_id", ident.TenantID)
 				writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 				return

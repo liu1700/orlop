@@ -156,6 +156,16 @@ pub fn enroll(creds: &Credentials, cert_dir: &Path) -> anyhow::Result<EnrolledCe
         let body: EnrollResp = retry.json().context("decode enroll retry response")?;
         return persist(cert_dir, body);
     }
+    if status == reqwest::StatusCode::INSUFFICIENT_STORAGE {
+        // orlop-control returns 507 `account_disk_full` when the account's
+        // shared owner-dir quota blocks tenant provisioning. Hard condition:
+        // nothing this process can retry fixes it — the account must free or
+        // buy storage. Keep the literal "disk quota exceeded" in the message:
+        // hosts watching our stderr classify the failure on that marker.
+        let desc = read_oauth_error_description(resp)
+            .unwrap_or_else(|| "the account's shared disk is full".to_string());
+        bail!("/agent/enroll returned 507 — account disk quota exceeded: {desc}");
+    }
     if !status.is_success() {
         let body = resp.text().unwrap_or_default();
         bail!("/agent/enroll failed: {status} {body}");

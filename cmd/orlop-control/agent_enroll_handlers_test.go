@@ -22,6 +22,7 @@ import (
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/allocations"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/ca"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/devauth"
+	"github.com/liu1700/orlop/cmd/orlop-control/internal/serverapi"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/secrets"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres"
 	"github.com/liu1700/orlop/cmd/orlop-control/internal/storage/postgres/db/sqlcdb"
@@ -649,5 +650,81 @@ func TestEnrollPlacesTenantWhenServerVMMissing(t *testing.T) {
 	}
 	if updatedPool.FreeBytes != 10*int64(1<<30)-allocSize {
 		t.Fatalf("free_bytes = %d, want %d", updatedPool.FreeBytes, 10*int64(1<<30)-allocSize)
+	}
+}
+
+// enrollQuotaFullAdmin fails placement the way a full account quota does on
+// orlop-server: RegisterTenant returns the typed serverapi error.
+type enrollQuotaFullAdmin struct{ enrollFakeAdmin }
+
+func (f *enrollQuotaFullAdmin) RegisterTenant(context.Context, string, string, string, string, int64) (uint32, error) {
+	return 0, serverapi.ErrDiskQuotaExceeded{Detail: "account disk quota exceeded: mkdir /jfs/tenants/u_o/a_t: disk quota exceeded"}
+}
+
+func TestAgentEnrollReportsAccountDiskFull(t *testing.T) {
+	pool := httpOpenTestPool(t)
+	q := sqlcdb.New(pool)
+	ctx := context.Background()
+
+	tenantID := "acme-quota-full"
+	if _, err := q.CreateTenant(ctx, sqlcdb.CreateTenantParams{ID: tenantID, Name: "Acme Quota Full"}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := q.CreateUser(ctx, sqlcdb.CreateUserParams{Email: "alice@" + tenantID + ".example", TenantID: tenantID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.UpsertServerPool(ctx, sqlcdb.UpsertServerPoolParams{
+		DataAddr:   "data-srv-quota.orlop.example.com",
+		OpsAddr:    "ops-srv-quota.orlop.example.com",
+		TotalBytes: 10 * int64(1<<30),
+		FreeBytes:  10 * int64(1<<30),
+		Status:     "available",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alloc, err := q.UpsertAgentAllocation(ctx, sqlcdb.UpsertAgentAllocationParams{
+		UserID:    user.ID,
+		AgentID:   pgtype.Text{String: "agent-" + tenantID, Valid: true},
+		TenantID:  pgtype.Text{String: tenantID, Valid: true},
+		SizeBytes: int64(2 * (1 << 30)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "quota-full-token"
+	if _, err := q.CreateAccessToken(ctx, sqlcdb.CreateAccessTokenParams{
+		TokenHash:    sha256Hex(token),
+		Purpose:      devauth.PurposeAgentEnroll,
+		UserID:       user.ID,
+		TenantID:     tenantID,
+		ExpiresAt:    pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+		AllocationID: alloc.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := startEnrollServerWithAdmin(t, pool, newEnrollCA(t, tenantID), nil, &enrollQuotaFullAdmin{})
+
+	resp := postEnroll(t, srv.URL, token)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 507; body = %s", resp.StatusCode, body)
+	}
+	var body struct {
+		Error string `json:"error"`
+		Desc  string `json:"error_description"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error != "account_disk_full" {
+		t.Fatalf("error = %q, want account_disk_full", body.Error)
+	}
+	// The description carries the stable classification marker for the mount
+	// client's stderr and any host watching it.
+	if !strings.Contains(body.Desc, "disk quota exceeded") {
+		t.Fatalf("error_description = %q, want it to contain \"disk quota exceeded\"", body.Desc)
 	}
 }
