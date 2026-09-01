@@ -32,6 +32,7 @@ check the control plane runs at boot.
 | v0.6.5 | HEAD | Postgres, SQLite |
 | v0.6.6 | HEAD | Postgres, SQLite |
 | v0.6.7 | HEAD | Postgres, SQLite |
+| v0.6.8 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -125,6 +126,13 @@ Postgres uses a transaction-scoped advisory lock; the memory and filesystem
 backends use process-local locks. Concurrent control-plane replicas therefore
 converge on one root and intermediate chain instead of minting different CAs.
 The stored key format is unchanged, so rollback is a plain image swap.
+
+v0.6.9 also has **no control-plane migration**. It replaces the per-tenant usage
+walk (an O(files) `filepath.WalkDir` over the chunk store) with a bounded sum of
+the local chunk index, so a storage-meter request stays within the caller's
+budget under concurrent mount/quota load, and it isolates a single tenant's
+remote failure so it no longer discards the whole owner's usage pass. Reported
+bytes are unchanged (the sum equals the walk), and rollback is a plain image swap.
 
 v0.6.5 adds nullable `disk_allocations.mount_lease_token_hash` in
 `0013_mount_lease_tokens.sql`. Run `orlop-control migrate up` before starting the
