@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -208,4 +209,31 @@ func (t *TenantDB) Close() error {
 // share the same handle rather than opening duplicate ones.
 func (t *TenantDB) DB() *sql.DB {
 	return t.db
+}
+
+// UsedBytes returns the tenant's on-disk chunk usage — the total physical bytes
+// of every stored chunk (sum of the chunks.size column) — plus the chunk count.
+//
+// It sums ALL chunk rows, not only refcount>0 ones: a chunk row is deleted only
+// when its physical object file is (GC and per-agent purge both run
+// `delete from chunks where ... refcount = 0` alongside the file unlink), so the
+// row set matches exactly the objects present under <storeRoot>/objects. Chunks
+// are stored raw — ChunkStore.Put writes len(data) bytes with no compression —
+// so SUM(size) equals a du-style walk of the store byte for byte (the reconcile
+// test asserts this), and it is the same total the JuiceFS directory quota
+// enforces. Transient .chunk-* temp files created mid-write are the only thing a
+// walk would count that this sum does not; they are immaterial for a meter.
+//
+// This is an indexed O(rows) scalar aggregate on the local metadata SQLite
+// (the fast MetadataRoot disk), replacing the previous O(files) filepath.WalkDir
+// over the networked JuiceFS chunk store. The walk could consume the caller's
+// whole budget under a concurrent mount/quota burst that starves the filesystem
+// and time the usage request out to a 502 (PLO-292); this stays bounded
+// regardless of file count or filesystem contention.
+func (t *TenantDB) UsedBytes(ctx context.Context) (usedBytes int64, chunkCount int64, err error) {
+	row := t.db.QueryRowContext(ctx, `select coalesce(sum(size), 0), count(*) from chunks`)
+	if err := row.Scan(&usedBytes, &chunkCount); err != nil {
+		return 0, 0, err
+	}
+	return usedBytes, chunkCount, nil
 }

@@ -652,3 +652,46 @@ func TestRegisterTenantDiskQuotaExceeded(t *testing.T) {
 		t.Fatalf("detail = %q, want the server message carried through", quotaFull.Detail)
 	}
 }
+
+// TestGetTenantUsage_CallerTimeoutBoundsSlowServer reproduces PLO-292's failure
+// mechanism deterministically and sub-second: a usage request that outlasts the
+// caller's budget returns a timeout error rather than hanging. In prod the budget
+// is 10s and a slow filesystem walk blew past it; here the budget is 50ms and the
+// server blocks 200ms, exercising the same http.Client.Timeout path. The rollup
+// handler's isolation (tenant_usage_handlers_test.go) then proves this error no
+// longer discards the whole owner's storage-meter pass.
+func TestGetTenantUsage_CallerTimeoutBoundsSlowServer(t *testing.T) {
+	ca := newTestCA(t)
+	release := make(chan struct{})
+	srv := startMTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-release:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"tenant_id": "t1", "used_bytes": 1, "size_bytes": 1})
+	}), ca)
+	// Registered after startMTLSServer's srv.Close cleanup, so LIFO runs this
+	// first: unblock any still-waiting handler before the server waits on it.
+	t.Cleanup(func() { close(release) })
+
+	certPEM, keyPEM := clientCreds(t)
+	client, err := serverapi.New(serverapi.Config{
+		ClientCertPEM: certPEM,
+		ClientKeyPEM:  keyPEM,
+		ServerCAPool:  ca.pool,
+		Timeout:       50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err = client.GetTenantUsage(context.Background(), srv.Listener.Addr().String(), "t1")
+	if err == nil {
+		t.Fatal("expected a timeout error when the server outlasts the caller budget, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Fatalf("call took %s; the 50ms caller timeout did not bound the slow server", elapsed)
+	}
+}

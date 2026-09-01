@@ -79,6 +79,12 @@ func mountControlTenantUsage(r chi.Router, svc func(http.Handler) http.Handler, 
 type tenantUsageDTO struct {
 	OwnerID   string `json:"owner_id"`
 	UsedBytes int64  `json:"used_bytes"`
+	// Partial is true when at least one of the owner's placed tenants could not
+	// be metered (a remote usage call failed) but others were, so used_bytes is a
+	// lower bound rather than the complete total. Additive and omitempty, so
+	// existing SDK consumers that only read used_bytes are unaffected; a future
+	// biller can refuse to charge on a partial pass instead of underbilling.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // handleTenantUsage resolves owner → per-user tenant → placed server → remote
@@ -128,27 +134,50 @@ func (h *controlTenantUsageHandlers) handleTenantUsage(w http.ResponseWriter, r 
 		tenants[t] = struct{}{}
 	}
 
+	// One slow or unreachable tenant must not discard the entire owner's
+	// storage-meter pass (PLO-292): a single remote timeout used to abort the
+	// whole rollup with a 502, dropping every other tenant's usage. We instead
+	// isolate a remote GetTenantUsage failure — record it durably and keep
+	// summing the tenants that answered — and only fail the whole request when
+	// EVERY placed tenant failed (so a consumer never reads "0 bytes, complete"
+	// while the data plane is down). resolveTenantOpsAddr errors are a local DB
+	// fault that hits all tenants equally, so those still abort.
 	var total int64
+	var placed, failed int
 	for tenant := range tenants {
-		opsAddr, placed, err := resolveTenantOpsAddr(r.Context(), h.queries, tenant)
+		opsAddr, isPlaced, err := resolveTenantOpsAddr(r.Context(), h.queries, tenant)
 		if err != nil {
 			h.logger.Error("control_usage_resolve_ops_addr_failed", "error", err, "tenant_id", tenant)
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "")
 			return
 		}
-		if !placed {
+		if !isPlaced {
 			continue // tenant never placed (no mount yet) → contributes no usage
 		}
+		placed++
 		tu, err := h.usage.GetTenantUsage(r.Context(), opsAddr, tenant)
 		if err != nil {
-			h.logger.Error("control_usage_remote_failed", "error", err, "ops_addr", opsAddr, "tenant_id", tenant)
-			writeOAuthError(w, http.StatusBadGateway, "usage_failed", "")
-			return
+			failed++
+			// Durable per-tenant failure record: which tenant, on which server, why.
+			h.logger.Error("control_usage_tenant_failed", "error", err, "ops_addr", opsAddr, "tenant_id", tenant)
+			continue
 		}
 		total += tu.UsedBytes
 	}
 
-	writeJSON(w, http.StatusOK, tenantUsageDTO{OwnerID: uuidString(ownerID), UsedBytes: total})
+	// Every placed tenant failed → no real number to report; preserve the
+	// pre-PLO-292 502 rather than pass a spurious zero off as a complete total.
+	if placed > 0 && failed == placed {
+		h.logger.Error("control_usage_all_tenants_failed", "owner_id", uuidString(ownerID), "placed", placed)
+		writeOAuthError(w, http.StatusBadGateway, "usage_failed", "")
+		return
+	}
+	partial := failed > 0
+	if partial {
+		h.logger.Warn("control_usage_partial", "owner_id", uuidString(ownerID), "placed", placed, "failed", failed, "used_bytes", total)
+	}
+
+	writeJSON(w, http.StatusOK, tenantUsageDTO{OwnerID: uuidString(ownerID), UsedBytes: total, Partial: partial})
 }
 
 // ensure *postgres.Store satisfies controlTenantUsageQuerier at compile time.
