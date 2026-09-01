@@ -164,3 +164,78 @@ func TestTenantUsage_NoUsageClientReturns503(t *testing.T) {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
+
+// perTenantUsage returns a distinct result (or error) per tenant id, so a test
+// can fail one of an owner's tenants while another succeeds. The rollup loop is
+// sequential, so no synchronization is needed.
+type perTenantUsage struct {
+	resp  map[string]serverapi.TenantUsage
+	err   map[string]error
+	calls map[string]int
+}
+
+func (p *perTenantUsage) GetTenantUsage(_ context.Context, _, tenantID string) (serverapi.TenantUsage, error) {
+	if p.calls == nil {
+		p.calls = map[string]int{}
+	}
+	p.calls[tenantID]++
+	if err := p.err[tenantID]; err != nil {
+		return serverapi.TenantUsage{}, err
+	}
+	return p.resp[tenantID], nil
+}
+
+// TestTenantUsage_OneTenantFailsReturnsPartial is the PLO-292 isolation guarantee:
+// an owner with two placed tenants, one of which fails its remote usage call, must
+// still return 200 with the other tenant's bytes and partial=true — never a 502
+// that discards the whole pass. It also asserts BOTH tenants were attempted, so a
+// failure never short-circuits the loop.
+func TestTenantUsage_OneTenantFailsReturnsPartial(t *testing.T) {
+	q := stubTenantUsageQuerier{
+		user:   storage.User{TenantID: "u_" + tenantUsageOwner},
+		allocs: []storage.Allocation{{TenantID: "t_ok"}, {TenantID: "t_bad"}},
+		vm:     storage.ServerVM{DataAddr: "data-srv-1:6363"},
+		pool:   storage.Server{OpsAddr: "ops-srv-1:6443"},
+	}
+	usage := &perTenantUsage{
+		resp: map[string]serverapi.TenantUsage{"t_ok": {UsedBytes: 4096}},
+		err:  map[string]error{"t_bad": errors.New("deadline exceeded")},
+	}
+	rec := doTenantUsage(t, tenantUsageRouter(q, usage, "svc"), tenantUsageOwner, "Bearer svc")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (partial), body=%s", rec.Code, rec.Body.String())
+	}
+	var body tenantUsageDTO
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.UsedBytes != 4096 {
+		t.Fatalf("used_bytes = %d, want 4096 (healthy tenant only)", body.UsedBytes)
+	}
+	if !body.Partial {
+		t.Fatal("partial = false, want true (one tenant was not metered)")
+	}
+	if usage.calls["t_ok"] != 1 || usage.calls["t_bad"] != 1 {
+		t.Fatalf("both tenants must be attempted; calls = %v", usage.calls)
+	}
+}
+
+// TestTenantUsage_AllTenantsFailReturns502 preserves the pre-PLO-292 worst-case:
+// when EVERY placed tenant fails there is no real total, so the request 502s
+// rather than passing a spurious zero off as a complete usage figure.
+func TestTenantUsage_AllTenantsFailReturns502(t *testing.T) {
+	q := stubTenantUsageQuerier{
+		user:   storage.User{TenantID: "u_" + tenantUsageOwner},
+		allocs: []storage.Allocation{{TenantID: "t_a"}, {TenantID: "t_b"}},
+		vm:     storage.ServerVM{DataAddr: "data-srv-1:6363"},
+		pool:   storage.Server{OpsAddr: "ops-srv-1:6443"},
+	}
+	usage := &perTenantUsage{
+		err: map[string]error{"t_a": errors.New("boom"), "t_b": errors.New("boom")},
+	}
+	rec := doTenantUsage(t, tenantUsageRouter(q, usage, "svc"), tenantUsageOwner, "Bearer svc")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+}

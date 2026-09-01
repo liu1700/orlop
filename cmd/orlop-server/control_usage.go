@@ -2,10 +2,9 @@ package main
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
-
-	"github.com/liu1700/orlop/cmd/orlop-server/internal/usage"
 )
 
 type tenantUsageResponse struct {
@@ -16,9 +15,15 @@ type tenantUsageResponse struct {
 
 // tenantUsage returns on-disk usage for a tenant. Control-plane only.
 //
-// Used bytes are computed by walking the tenant's storeRoot. SizeBytes is
-// the registered quota (from quota.Manager.Lookup). When the tenant has no
-// registered quota record (static tenant), size_bytes is reported as 0.
+// Used bytes are the sum of the tenant's stored chunk sizes, read from the local
+// metadata SQLite (TenantDB.UsedBytes) — an indexed scalar aggregate on the fast
+// MetadataRoot disk, NOT an O(files) filepath.WalkDir over the networked JuiceFS
+// chunk store. The walk could consume the caller's whole 10s budget under a
+// concurrent mount/quota burst that starves the filesystem and time the request
+// out to a 502 (PLO-292); the metadata sum stays bounded regardless of file
+// count or filesystem contention, and equals the walk byte for byte (chunks are
+// stored raw). SizeBytes is the registered quota (quota.Manager.Lookup); 0 when
+// the tenant has no quota record (static tenant).
 func (s *serverState) tenantUsage(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if !tenantIDRe.MatchString(id) {
@@ -30,12 +35,28 @@ func (s *serverState) tenantUsage(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "tenant_not_found", "")
 		return
 	}
-	used, err := usage.DirSize(ts.storeRoot)
+
+	started := time.Now()
+	used, chunkCount, err := ts.db.UsedBytes(r.Context())
+	s.metrics.observeDuration("usage", started)
 	if err != nil {
-		s.logger.Error("tenant_usage_walk_failed", "error", err, "tenant_id", id)
+		s.logger.Error("tenant_usage_failed",
+			"tenant_id", id,
+			"duration_ms", time.Since(started).Milliseconds(),
+			"error", err)
 		writeJSONError(w, http.StatusInternalServerError, "usage_failed", err.Error())
 		return
 	}
+	// Seam telemetry (PLO-292): duration + a bounded work indicator (chunk_count)
+	// + tenant identity, carrying no paths or user content, so a future slow-usage
+	// investigation reads server-side start/end evidence instead of only the
+	// caller's timeout.
+	s.logger.Info("tenant_usage",
+		"tenant_id", id,
+		"used_bytes", used,
+		"chunk_count", chunkCount,
+		"duration_ms", time.Since(started).Milliseconds())
+
 	var size int64
 	if _, sz, ok := s.quota.Lookup(id); ok {
 		size = sz
