@@ -23,14 +23,26 @@ type Backend interface {
 	List(ctx context.Context, prefix string) (keys []string, err error)
 }
 
+// LockedBackend extends Backend with a named critical section. The callback's
+// Backend is bound to the lock's transaction or connection when the
+// implementation has one, so a read-check followed by multiple writes is
+// atomic across control-plane replicas. Callers must use the callback backend,
+// not the outer value.
+type LockedBackend interface {
+	Backend
+	WithLock(ctx context.Context, name string, fn func(Backend) error) error
+}
+
 // Memory is an in-process Backend, intended for tests.
 type Memory struct {
-	mu sync.Mutex
-	m  map[string][]byte
+	mu      sync.Mutex
+	m       map[string][]byte
+	locksMu sync.Mutex
+	locks   map[string]*sync.Mutex
 }
 
 func NewMemory() *Memory {
-	return &Memory{m: map[string][]byte{}}
+	return &Memory{m: map[string][]byte{}, locks: map[string]*sync.Mutex{}}
 }
 
 func (m *Memory) Get(_ context.Context, key string) ([]byte, bool, error) {
@@ -63,16 +75,32 @@ func (m *Memory) List(_ context.Context, prefix string) ([]string, error) {
 	return out, nil
 }
 
+func (m *Memory) WithLock(_ context.Context, name string, fn func(Backend) error) error {
+	m.locksMu.Lock()
+	lock := m.locks[name]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.locks[name] = lock
+	}
+	m.locksMu.Unlock()
+
+	lock.Lock()
+	defer lock.Unlock()
+	return fn(m)
+}
+
 // Filesystem stores values under a root directory. Files are mode 0600,
 // directories 0700. Used both by the offline operator workflow
 // (`orlop-control ca init --root`) and by deploy targets that materialize
 // secrets as files at boot.
 type Filesystem struct {
-	root string
+	root    string
+	locksMu sync.Mutex
+	locks   map[string]*sync.Mutex
 }
 
 func NewFilesystem(root string) *Filesystem {
-	return &Filesystem{root: root}
+	return &Filesystem{root: root, locks: map[string]*sync.Mutex{}}
 }
 
 func (f *Filesystem) path(key string) string {
@@ -138,4 +166,21 @@ func (f *Filesystem) List(_ context.Context, prefix string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// WithLock serializes callers in this process. Filesystem CA storage is backed
+// by a ReadWriteOnce volume and intentionally supports only one control-plane
+// replica; multi-replica deployments must use the Postgres backend.
+func (f *Filesystem) WithLock(_ context.Context, name string, fn func(Backend) error) error {
+	f.locksMu.Lock()
+	lock := f.locks[name]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		f.locks[name] = lock
+	}
+	f.locksMu.Unlock()
+
+	lock.Lock()
+	defer lock.Unlock()
+	return fn(f)
 }

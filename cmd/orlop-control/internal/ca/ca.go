@@ -99,7 +99,7 @@ type tenantCA struct {
 // CA is a loaded, ready-to-use private CA. Safe for concurrent use.
 type CA struct {
 	env     Env
-	backend secrets.Backend
+	backend secrets.LockedBackend
 
 	mu       sync.RWMutex
 	rootCert *x509.Certificate
@@ -120,7 +120,11 @@ func LoadOrInit(ctx context.Context, backend secrets.Backend, env Env) (*CA, err
 	if env.OrgName == "" {
 		env.OrgName = "ORL"
 	}
-	c := &CA{env: env, backend: backend, tenants: map[string]*tenantCA{}}
+	lockedBackend, ok := backend.(secrets.LockedBackend)
+	if !ok {
+		return nil, errors.New("ca: secrets backend must support locked mutations")
+	}
+	c := &CA{env: env, backend: lockedBackend, tenants: map[string]*tenantCA{}}
 	if err := c.loadOrBootstrapRoot(ctx); err != nil {
 		return nil, err
 	}
@@ -131,16 +135,23 @@ func LoadOrInit(ctx context.Context, backend secrets.Backend, env Env) (*CA, err
 }
 
 func (c *CA) loadOrBootstrapRoot(ctx context.Context) error {
-	certPEM, hasCert, err := c.backend.Get(ctx, rootCertKey)
-	if err != nil {
-		return fmt.Errorf("read root cert: %w", err)
-	}
-	keyPEM, hasKey, err := c.backend.Get(ctx, rootKeyKey)
-	if err != nil {
-		return fmt.Errorf("read root key: %w", err)
-	}
+	var certPEM, keyPEM []byte
+	var hasKey bool
+	err := c.backend.WithLock(ctx, "ca/root", func(backend secrets.Backend) error {
+		var hasCert bool
+		var err error
+		certPEM, hasCert, err = backend.Get(ctx, rootCertKey)
+		if err != nil {
+			return fmt.Errorf("read root cert: %w", err)
+		}
+		keyPEM, hasKey, err = backend.Get(ctx, rootKeyKey)
+		if err != nil {
+			return fmt.Errorf("read root key: %w", err)
+		}
+		if hasCert {
+			return nil
+		}
 
-	if !hasCert {
 		cert, key, err := c.generateRoot()
 		if err != nil {
 			return err
@@ -150,16 +161,17 @@ func (c *CA) loadOrBootstrapRoot(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := c.backend.Put(ctx, rootCertKey, certPEM); err != nil {
+		if err := backend.Put(ctx, rootCertKey, certPEM); err != nil {
 			return fmt.Errorf("write root cert: %w", err)
 		}
-		if err := c.backend.Put(ctx, rootKeyKey, keyPEM); err != nil {
+		if err := backend.Put(ctx, rootKeyKey, keyPEM); err != nil {
 			return fmt.Errorf("write root key: %w", err)
 		}
-		c.rootCert = cert
-		c.rootKey = key
-		c.rootPEM = certPEM
+		hasKey = true
 		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	cert, err := DecodeCertPEM(certPEM)
@@ -203,33 +215,41 @@ func (c *CA) loadTenants(ctx context.Context) error {
 }
 
 func (c *CA) loadTenant(ctx context.Context, id string) error {
-	certPEM, hasCert, err := c.backend.Get(ctx, tenantCertKey(id))
+	tenant, err := c.readTenant(ctx, c.backend, id)
 	if err != nil {
 		return err
+	}
+	c.tenants[id] = tenant
+	return nil
+}
+
+func (c *CA) readTenant(ctx context.Context, backend secrets.Backend, id string) (*tenantCA, error) {
+	certPEM, hasCert, err := backend.Get(ctx, tenantCertKey(id))
+	if err != nil {
+		return nil, err
 	}
 	if !hasCert {
-		return errors.New("intermediate cert missing")
+		return nil, errors.New("intermediate cert missing")
 	}
-	keyPEM, hasKey, err := c.backend.Get(ctx, tenantKeyKey(id))
+	keyPEM, hasKey, err := backend.Get(ctx, tenantKeyKey(id))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !hasKey {
-		return errors.New("intermediate key missing")
+		return nil, errors.New("intermediate key missing")
 	}
 	cert, err := DecodeCertPEM(certPEM)
 	if err != nil {
-		return fmt.Errorf("parse cert: %w", err)
+		return nil, fmt.Errorf("parse cert: %w", err)
 	}
 	key, err := decodeEd25519KeyPEM(keyPEM)
 	if err != nil {
-		return fmt.Errorf("parse key: %w", err)
+		return nil, fmt.Errorf("parse key: %w", err)
 	}
 	chain := make([]byte, 0, len(certPEM)+len(c.rootPEM))
 	chain = append(chain, certPEM...)
 	chain = append(chain, c.rootPEM...)
-	c.tenants[id] = &tenantCA{cert: cert, key: key, chainPEM: chain}
-	return nil
+	return &tenantCA{cert: cert, key: key, chainPEM: chain}, nil
 }
 
 // BootstrapTenant generates a new intermediate for tenantID and persists
@@ -246,35 +266,58 @@ func (c *CA) BootstrapTenant(ctx context.Context, tenantID string) error {
 	if _, ok := c.tenants[tenantID]; ok {
 		return nil
 	}
-	// Operator allowlist gate (issue #8): refuse to mint CA material for a
-	// tenant the operator has not permitted. Checked after the idempotent
-	// "already loaded" return so an already-provisioned tenant is never broken;
-	// it only blocks creating a NEW intermediate for an unrecognized tenant.
-	if c.env.AllowBootstrap != nil && !c.env.AllowBootstrap(tenantID) {
-		return fmt.Errorf("%w: %q", ErrTenantNotAllowed, tenantID)
-	}
-	if c.rootKey == nil {
-		return errors.New("ca: root key not loaded; cannot sign tenant intermediate")
-	}
-	cert, key, err := c.generateIntermediate(tenantID)
+	var tenant *tenantCA
+	err := c.backend.WithLock(ctx, "ca/tenant/"+tenantID, func(backend secrets.Backend) error {
+		certPEM, hasCert, err := backend.Get(ctx, tenantCertKey(tenantID))
+		if err != nil {
+			return fmt.Errorf("read intermediate cert: %w", err)
+		}
+		_, hasKey, err := backend.Get(ctx, tenantKeyKey(tenantID))
+		if err != nil {
+			return fmt.Errorf("read intermediate key: %w", err)
+		}
+		if hasCert != hasKey {
+			return errors.New("ca: incomplete tenant intermediate cert/key pair")
+		}
+		if hasCert {
+			tenant, err = c.readTenant(ctx, backend, tenantID)
+			return err
+		}
+
+		// Operator allowlist gate (issue #8): refuse to mint CA material for a
+		// tenant the operator has not permitted. It runs after the shared-store
+		// idempotency check, so another replica's winner is always accepted.
+		if c.env.AllowBootstrap != nil && !c.env.AllowBootstrap(tenantID) {
+			return fmt.Errorf("%w: %q", ErrTenantNotAllowed, tenantID)
+		}
+		if c.rootKey == nil {
+			return errors.New("ca: root key not loaded; cannot sign tenant intermediate")
+		}
+		cert, key, err := c.generateIntermediate(tenantID)
+		if err != nil {
+			return err
+		}
+		certPEM = encodeCertPEM(cert)
+		keyPEM, err := encodeEd25519KeyPEM(key)
+		if err != nil {
+			return err
+		}
+		if err := backend.Put(ctx, tenantCertKey(tenantID), certPEM); err != nil {
+			return fmt.Errorf("write intermediate cert: %w", err)
+		}
+		if err := backend.Put(ctx, tenantKeyKey(tenantID), keyPEM); err != nil {
+			return fmt.Errorf("write intermediate key: %w", err)
+		}
+		chain := make([]byte, 0, len(certPEM)+len(c.rootPEM))
+		chain = append(chain, certPEM...)
+		chain = append(chain, c.rootPEM...)
+		tenant = &tenantCA{cert: cert, key: key, chainPEM: chain}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	certPEM := encodeCertPEM(cert)
-	keyPEM, err := encodeEd25519KeyPEM(key)
-	if err != nil {
-		return err
-	}
-	if err := c.backend.Put(ctx, tenantCertKey(tenantID), certPEM); err != nil {
-		return fmt.Errorf("write intermediate cert: %w", err)
-	}
-	if err := c.backend.Put(ctx, tenantKeyKey(tenantID), keyPEM); err != nil {
-		return fmt.Errorf("write intermediate key: %w", err)
-	}
-	chain := make([]byte, 0, len(certPEM)+len(c.rootPEM))
-	chain = append(chain, certPEM...)
-	chain = append(chain, c.rootPEM...)
-	c.tenants[tenantID] = &tenantCA{cert: cert, key: key, chainPEM: chain}
+	c.tenants[tenantID] = tenant
 	return nil
 }
 

@@ -67,6 +67,19 @@ func (e *Encrypted) List(ctx context.Context, prefix string) ([]string, error) {
 	return e.inner.List(ctx, prefix)
 }
 
+// WithLock preserves the underlying backend's transaction or lock while
+// wrapping the callback backend with the same AEAD. This keeps the CA package
+// unaware of whether its atomic values are encrypted at rest.
+func (e *Encrypted) WithLock(ctx context.Context, name string, fn func(Backend) error) error {
+	locked, ok := e.inner.(LockedBackend)
+	if !ok {
+		return errors.New("secrets: inner backend does not support locked mutations")
+	}
+	return locked.WithLock(ctx, name, func(inner Backend) error {
+		return fn(&Encrypted{inner: inner, aead: e.aead})
+	})
+}
+
 func (e *Encrypted) seal(pt []byte) ([]byte, error) {
 	nonce := make([]byte, e.aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
