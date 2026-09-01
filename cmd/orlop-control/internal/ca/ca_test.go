@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -337,6 +338,81 @@ func TestLoadOrInitIdempotent(t *testing.T) {
 	}
 	if !bytes.Equal(chain1, acmeChain(c2)) {
 		t.Fatal("BootstrapTenant on existing tenant rotated the cert")
+	}
+}
+
+// Two live control-plane replicas may both start against an empty Postgres CA
+// store and then receive the first enrollment for the same tenant. They must
+// load one shared root and one shared intermediate, never retain two local
+// winners or a mismatched cert/key pair.
+func TestConcurrentReplicasShareRootAndTenantIntermediate(t *testing.T) {
+	ctx := context.Background()
+	backend := secrets.NewMemory()
+	env := Env{TrustDomain: "test.example", OrgName: "Test"}
+
+	var cas [2]*CA
+	var errs [2]error
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range cas {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			cas[i], errs[i] = LoadOrInit(ctx, backend, env)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("replica %d LoadOrInit: %v", i, err)
+		}
+	}
+	if !bytes.Equal(cas[0].RootPEM(), cas[1].RootPEM()) {
+		t.Fatal("concurrent replicas retained different root CAs")
+	}
+
+	start = make(chan struct{})
+	for i := range cas {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = cas[i].BootstrapTenant(ctx, "acme")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("replica %d BootstrapTenant: %v", i, err)
+		}
+	}
+
+	chains := make([][]byte, len(cas))
+	for i, c := range cas {
+		certPEM, _, chainPEM, _, err := c.MintAgentCert("acme", "user", "agent", time.Hour)
+		if err != nil {
+			t.Fatalf("replica %d mint: %v", i, err)
+		}
+		chains[i] = chainPEM
+		leaf := parseAllCertsPEM(t, certPEM)[0]
+		chain := parseAllCertsPEM(t, chainPEM)
+		roots := x509.NewCertPool()
+		roots.AddCert(chain[1])
+		intermediates := x509.NewCertPool()
+		intermediates.AddCert(chain[0])
+		if _, err := leaf.Verify(x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		}); err != nil {
+			t.Fatalf("replica %d minted mismatched chain: %v", i, err)
+		}
+	}
+	if !bytes.Equal(chains[0], chains[1]) {
+		t.Fatal("concurrent replicas retained different tenant intermediates")
 	}
 }
 
