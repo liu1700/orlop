@@ -31,6 +31,7 @@ check the control plane runs at boot.
 | v0.6.4 | HEAD | Postgres, SQLite |
 | v0.6.5 | HEAD | Postgres, SQLite |
 | v0.6.6 | HEAD | Postgres, SQLite |
+| v0.6.7 | HEAD | Postgres, SQLite |
 
 v0.1.0 predates the embedded SQLite backend, so only its Postgres path is a
 supported source.
@@ -117,6 +118,13 @@ orlop-server, `account_disk_full` from the enroll route) instead of a generic
 `500 server_error`, and the mount client treats it as terminal instead of
 retrying (#146). All three components roll independently and revert with a
 plain image swap.
+
+v0.6.8 also has **no control-plane migration**. It serializes root and tenant CA
+bootstrap in the configured secrets backend, then rereads the winning keypair.
+Postgres uses a transaction-scoped advisory lock; the memory and filesystem
+backends use process-local locks. Concurrent control-plane replicas therefore
+converge on one root and intermediate chain instead of minting different CAs.
+The stored key format is unchanged, so rollback is a plain image swap.
 
 v0.6.5 adds nullable `disk_allocations.mount_lease_token_hash` in
 `0013_mount_lease_tokens.sql`. Run `orlop-control migrate up` before starting the
