@@ -1241,12 +1241,17 @@ type DirChild struct {
 	// questions without a per-file manifest fetch (issue #122).
 	Mtime   int64
 	Version uint64
+	// Target is the link destination, non-empty only when Kind == "symlink".
+	// It comes from the same joined symlinks row that decided Kind and Size,
+	// so a listed symlink can never disagree with itself about its target and
+	// costs no extra query (PLO-547).
+	Target string
 }
 
 // ListChildren returns the children of `parent` from dir_entries, joined with
-// manifests and symlinks to derive (kind, size, mode). A child is a file when a
-// manifest row exists, a symlink when a symlinks row exists, otherwise a
-// directory. Children are sorted by name.
+// manifests and symlinks to derive (kind, size, mode, target). A child is a
+// file when a manifest row exists, a symlink when a symlinks row exists,
+// otherwise a directory. Children are sorted by name.
 func (m *ManifestStore) ListChildren(parent string) ([]DirChild, error) {
 	rows, err := m.db.Query(`
 		SELECT d.name,
@@ -1263,7 +1268,8 @@ func (m *ManifestStore) ListChildren(parent string) ([]DirChild, error) {
 		            ELSE (select count(*) from manifests links where links.inode_id = mf.inode_id)
 		       END AS nlink,
 		       COALESCE(mf.mtime, sl.mtime, d.mtime, 0) AS mtime,
-		       COALESCE(mf.version, 0) AS version
+		       COALESCE(mf.version, 0) AS version,
+		       COALESCE(sl.target, '') AS target
 		FROM dir_entries d
 		LEFT JOIN manifests mf
 		  ON mf.path = CASE WHEN d.parent = '/' THEN '/' || d.name
@@ -1282,7 +1288,7 @@ func (m *ManifestStore) ListChildren(parent string) ([]DirChild, error) {
 	var out []DirChild
 	for rows.Next() {
 		var c DirChild
-		if err := rows.Scan(&c.Name, &c.Kind, &c.Size, &c.Mode, &c.Uid, &c.Gid, &c.Atime, &c.InodeID, &c.Nlink, &c.Mtime, &c.Version); err != nil {
+		if err := rows.Scan(&c.Name, &c.Kind, &c.Size, &c.Mode, &c.Uid, &c.Gid, &c.Atime, &c.InodeID, &c.Nlink, &c.Mtime, &c.Version, &c.Target); err != nil {
 			return nil, err
 		}
 		c.IsDir = c.Kind == "dir"

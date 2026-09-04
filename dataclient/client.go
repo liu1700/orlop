@@ -308,7 +308,9 @@ type WriteOpts struct {
 // ---- High-level file operations --------------------------------------------
 
 // ListDir lists the immediate children of a directory. path is agent-relative
-// ("/" for the agent root). Symlinks are returned as opaque entries.
+// ("/" for the agent root). A symlink child carries its Target, so reading a
+// tree of links needs no follow-up call (server v0.6.10 and later; an older
+// server omits the field and Target comes back empty).
 func (c *Client) ListDir(ctx context.Context, dir string) ([]DirEntry, error) {
 	var resp wire.ListResponse
 	if err := c.call(ctx, wire.OpList, wire.ListRequest{Path: c.scope(dir)}, &resp); err != nil {

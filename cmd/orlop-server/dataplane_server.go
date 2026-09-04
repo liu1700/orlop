@@ -412,7 +412,11 @@ func handleList(s *serverState, tenant *tenantState, ident Identity, w *frameWri
 		if !s.policy.Permits(policyPath(child)) {
 			continue
 		}
-		e := dataplane.EntryWire{Name: c.Name, Kind: c.Kind, Size: c.Size, Mode: c.Mode, Uid: c.Uid, Gid: c.Gid, Atime: c.Atime, InodeID: c.InodeID, Nlink: c.Nlink, Mtime: c.Mtime, Version: c.Version}
+		// Target is empty for every kind but "symlink": it is the joined
+		// symlinks row's own column, so a listing answers readlink without a
+		// second round trip and without a per-child lookup that could race the
+		// row that classified the child (PLO-547).
+		e := dataplane.EntryWire{Name: c.Name, Kind: c.Kind, Size: c.Size, Mode: c.Mode, Uid: c.Uid, Gid: c.Gid, Atime: c.Atime, InodeID: c.InodeID, Nlink: c.Nlink, Mtime: c.Mtime, Version: c.Version, Target: c.Target}
 		// Best-effort: ListChildren's JOIN does not cover special_nodes, so a
 		// special node lands here as "dir". Reclassify it (and carry rdev) with a
 		// targeted lookup. On error or absence we leave the "dir" default — a
