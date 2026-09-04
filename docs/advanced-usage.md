@@ -30,7 +30,7 @@ The installer drops three binaries — `orlop`, `orlop-control`, and
 `orlop-server` next to the `orlop` binary or on your `PATH`.
 
 - Override the target dir with `ORLOP_BIN_DIR`.
-- Pin a release with `ORLOP_VERSION=v0.6.9`.
+- Pin a release with `ORLOP_VERSION=v0.6.10`.
 - If the install dir isn't on your `PATH`, the script prints the line to add.
 
 ### Build from source
