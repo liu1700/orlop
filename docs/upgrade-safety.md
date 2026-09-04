@@ -134,6 +134,13 @@ budget under concurrent mount/quota load, and it isolates a single tenant's
 remote failure so it no longer discards the whole owner's usage pass. Reported
 bytes are unchanged (the sum equals the walk), and rollback is a plain image swap.
 
+v0.6.10 also has **no control-plane migration**. A directory listing now carries
+each symlink child's target, read from the same joined `symlinks` row that
+already decided the child's kind and size, so a client that only issues `LIST`
+can read a link without a follow-up `READLINK`. The wire field is unchanged
+(`EntryWire.target`, present since the field was added and populated by `STAT`
+all along), so an older client ignores it and rollback is a plain image swap.
+
 v0.6.5 adds nullable `disk_allocations.mount_lease_token_hash` in
 `0013_mount_lease_tokens.sql`. Run `orlop-control migrate up` before starting the
 new control plane. The column has no backfill: existing tokenless clients keep
